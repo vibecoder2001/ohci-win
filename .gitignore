@@ -27,5 +27,17 @@ compile_commands.json
 *.swp
 .vscode/
 
-# Internal planning notes
-docs/superpowers/
+# Additional build outputs (cross-build / non-MSVC toolchains)
+*.o
+*.a
+
+# Driver signing artifacts (test certs must never be committed)
+*.cer
+*.pfx
+*.spc
+
+# QEMU / VM disk images
+*.iso
+*.qcow2
+*.vhd
+*.vhdx
