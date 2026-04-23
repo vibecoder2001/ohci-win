@@ -149,6 +149,16 @@ itself never sees the type.
   result, because we learn whether UCX gates on anything it can check at
   this call site (caller context, driver binding metadata, I/O target,
   etc.).
+- **Known unknown — post-`UcxControllerCreate` callbacks:** if
+  `UcxControllerCreate` succeeds, UCX may immediately (or shortly after
+  the device enters the started state) invoke subsequent event callbacks
+  such as `EvtControllerUsbDeviceAdd` or `EvtControllerQueryUsbCapability`.
+  The spike stubs for those return `STATUS_NOT_IMPLEMENTED`. Whether UCX
+  treats that as a fatal condition (bugcheck / device removal) or as a
+  graceful per-callback failure is a secondary unknown. Task 7's runbook
+  should attach WinDbg *before* unloading the driver so that any
+  `DRIVER_VERIFIER_DETECTED_VIOLATION` or unexpected callback invocation
+  is captured in the live debugger rather than post-mortem.
 
 ## Build notes
 
@@ -166,17 +176,16 @@ Deviations from the plan's vcxproj template, encountered during the build:
 2. Replaced `DriverVer = ; stampinf will fill` in the INX with a concrete
    `01/01/2026,1.0.0.0` placeholder — stampinf rewrites it anyway.
 3. Added `TargetOSVersion` decorations (`.10.0...16299`) to the INX's
-   `[Manufacturer]`/`[Standard.NTamd64]`/`[Standard.NTarm64]` sections.
-   Required because `DestinationDirs = 13` (DIRID 13 = driver package
-   directory) needs the install to target 10.0.16299 or later — InfVerif
-   error 1199 without it.
-3. Added `<DisableSpecificWarnings>4201</DisableSpecificWarnings>` to
+   `[Manufacturer]`/`[Standard.NTamd64]` sections. Required because
+   `DestinationDirs = 13` (DIRID 13 = driver package directory) needs the
+   install to target 10.0.16299 or later — InfVerif error 1199 without it.
+4. Added `<DisableSpecificWarnings>4201</DisableSpecificWarnings>` to
    `<ClCompile>`. The UCX 1.6 headers use nameless structs/unions, which
    the default `/W4 /WX` would reject.
-4. Do **not** add `_KERNEL_MODE` to `<PreprocessorDefinitions>` — the
+5. Do **not** add `_KERNEL_MODE` to `<PreprocessorDefinitions>` — the
    `WindowsKernelModeDriver10.0` toolset already defines it, and adding
    it again trips C4117 (reserved macro name), which `/WX` escalates.
-5. Added a small `AddDriverBinaryToPackage` target that injects
+6. Added a small `AddDriverBinaryToPackage` target that injects
    `$(TargetPath)` into `@(FilesToPackage)`. The default
    `GetPackageFiles` only auto-adds the INF; without this, inf2cat runs
    against a package dir that contains only the `.inf` and emits

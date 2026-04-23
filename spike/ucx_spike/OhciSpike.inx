@@ -18,12 +18,10 @@ DefaultDestDir = 13
 OhciSpike.sys = 1
 
 [Manufacturer]
-%MfgName% = Standard,NTamd64.10.0...16299,NTarm64.10.0...16299
+%MfgName% = Standard,NTamd64.10.0...16299
 
 [Standard.NTamd64.10.0...16299]
 %DeviceDesc% = OhciSpike_Device, PCI\VEN_106B&DEV_003F&CC_0C0310
-
-[Standard.NTarm64.10.0...16299]
 
 [OhciSpike_Device.NT]
 CopyFiles = OhciSpike_CopyFiles

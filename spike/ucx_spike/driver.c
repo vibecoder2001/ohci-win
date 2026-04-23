@@ -85,9 +85,11 @@ DriverEntry(
 //----------------------------------------------------------------------------
 // EvtDriverDeviceAdd
 //
-// Wire up UCX, create the WDFDEVICE, call UcxControllerCreate. Return
-// STATUS_SUCCESS regardless of what UcxControllerCreate returned so the
-// device stays started and the log line is preserved for inspection.
+// Wire up UCX, create the WDFDEVICE, call UcxControllerCreate. Returns
+// failure status if UcxInitializeDeviceInit or WdfDeviceCreate fail (WDF
+// contract: EvtDriverDeviceAdd must not return STATUS_SUCCESS unless a
+// WDFDEVICE was created). Returns STATUS_SUCCESS after UcxControllerCreate
+// regardless of its outcome so the device object persists for inspection.
 //----------------------------------------------------------------------------
 NTSTATUS
 EvtDriverDeviceAdd(
@@ -117,10 +119,11 @@ EvtDriverDeviceAdd(
     OHCI_SPIKE_LOG("UcxInitializeDeviceInit -> 0x%08X", status);
     if (!NT_SUCCESS(status)) {
         //
-        // UCX refused us before we even had a device. That is itself a
-        // useful gate result -- return SUCCESS so the log line is kept.
+        // UCX refused us before we even had a device. No WDFDEVICE exists,
+        // so WDF's contract requires we return failure here. The log line
+        // above preserves the diagnostic.
         //
-        return STATUS_SUCCESS;
+        return status;
     }
 
     //
@@ -129,7 +132,12 @@ EvtDriverDeviceAdd(
     status = WdfDeviceCreate(&DeviceInit, WDF_NO_OBJECT_ATTRIBUTES, &device);
     OHCI_SPIKE_LOG("WdfDeviceCreate -> 0x%08X", status);
     if (!NT_SUCCESS(status)) {
-        return STATUS_SUCCESS;
+        //
+        // No WDFDEVICE was created; returning STATUS_SUCCESS here would
+        // violate WDF's contract and bugcheck under Driver Verifier. The
+        // log line above preserves the diagnostic.
+        //
+        return status;
     }
 
     //
