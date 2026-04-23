@@ -27,6 +27,18 @@ int main(void) {
         return 1;
     }
 
+    /* Barrier should increment the counter on every call */
+    if (hc.barrier_calls != 0) {
+        fprintf(stderr, "FAIL: initial barrier_calls = %u, expected 0\n", hc.barrier_calls);
+        return 1;
+    }
+    ops.barrier(ops.context);
+    ops.barrier(ops.context);
+    if (hc.barrier_calls != 2) {
+        fprintf(stderr, "FAIL: barrier_calls after 2 calls = %u, expected 2\n", hc.barrier_calls);
+        return 1;
+    }
+
     printf("PASS: fake_hc reset and readback\n");
     return 0;
 }
