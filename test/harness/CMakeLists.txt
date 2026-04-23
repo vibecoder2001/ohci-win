@@ -1,3 +1,7 @@
+add_library(fake_hc STATIC fake_hc.c)
+target_link_libraries(fake_hc PUBLIC ohci_core)
+target_include_directories(fake_hc PUBLIC .)
+
 add_executable(test_smoke test_smoke.c)
 target_link_libraries(test_smoke PRIVATE ohci_core)
 add_test(NAME smoke COMMAND test_smoke)
@@ -5,3 +9,7 @@ add_test(NAME smoke COMMAND test_smoke)
 add_executable(test_layout test_layout.c)
 target_link_libraries(test_layout PRIVATE ohci_core)
 add_test(NAME layout COMMAND test_layout)
+
+add_executable(test_fake_hc test_fake_hc.c)
+target_link_libraries(test_fake_hc PRIVATE fake_hc)
+add_test(NAME fake_hc COMMAND test_fake_hc)
