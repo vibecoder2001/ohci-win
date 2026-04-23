@@ -14,6 +14,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+if (-not (Test-Path $Project)) {
+    throw "Project not found: $Project"
+}
+
 $envScript = & (Join-Path $PSScriptRoot 'ewdk_env.ps1')
 Write-Host "Using build env: $envScript"
 
@@ -22,6 +26,7 @@ $projectFull = (Resolve-Path $Project).Path
 # If we landed on VsDevCmd.bat, tell it which host/target arch to configure.
 # For EWDK scripts (SetupBuildEnv.cmd / LaunchBuildEnv.cmd) we pass no args;
 # msbuild's /p:Platform drives the output arch.
+# host_arch is the build machine's arch, not the target arch. Assume x64 host.
 $envInvoke = if ($envScript -like '*VsDevCmd.bat') {
     "call `"$envScript`" -arch=$Arch -host_arch=x64 -no_logo"
 } else {
