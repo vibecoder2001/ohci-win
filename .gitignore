@@ -1,0 +1,31 @@
+# Windows driver build outputs
+*.obj
+*.sys
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.cat
+*.dll
+*.exe
+[Bb]uild/
+[Xx]64/
+[Aa][Rr][Mm]64/
+[Dd]ebug/
+[Rr]elease/
+.vs/
+*.user
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Editor
+*.swp
+.vscode/
+
+# Internal planning notes
+docs/superpowers/
