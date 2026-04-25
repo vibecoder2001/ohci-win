@@ -73,3 +73,7 @@ add_test(NAME interrupt COMMAND test_interrupt)
 add_executable(test_teardown test_teardown.c)
 target_link_libraries(test_teardown PRIVATE fake_hc)
 add_test(NAME teardown COMMAND test_teardown)
+
+add_executable(test_multi_endpoint_e2e test_multi_endpoint_e2e.c)
+target_link_libraries(test_multi_endpoint_e2e PRIVATE fake_hc)
+add_test(NAME multi_endpoint_e2e COMMAND test_multi_endpoint_e2e)
