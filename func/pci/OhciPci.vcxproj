@@ -69,7 +69,7 @@
     <ClCompile Include="mmio.c" />
     <ClCompile Include="dma.c" />
     <ClCompile Include="interrupt.c" />
-    <!-- <ClCompile Include="ucx_glue.c" /> -->
+    <ClCompile Include="ucx_glue.c" />
     <ClCompile Include="..\..\core\src\ohci_core.c" />
     <ClCompile Include="..\..\core\src\ohci_dma.c" />
     <ClCompile Include="..\..\core\src\ohci_hc.c" />

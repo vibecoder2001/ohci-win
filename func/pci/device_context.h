@@ -45,4 +45,8 @@ NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc);
 /* Defined in interrupt.c — creates WDFINTERRUPT with ISR + DPC. */
 NTSTATUS OhciPci_CreateInterrupt(PDEVICE_CONTEXT dc);
 
+/* Defined in ucx_glue.c — UCX 1.6 controller registration helpers. */
+NTSTATUS OhciPci_UcxInitDeviceInit(PWDFDEVICE_INIT DeviceInit);
+NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
+
 #endif /* OHCIPCI_DEVICE_CONTEXT_H */

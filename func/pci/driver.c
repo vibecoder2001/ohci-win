@@ -31,6 +31,10 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     pnp.EvtDeviceReleaseHardware = EvtDeviceReleaseHardware;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
+    /* UCX requires UcxInitializeDeviceInit is called BEFORE WdfDeviceCreate. */
+    NTSTATUS ucxInitStatus = OhciPci_UcxInitDeviceInit(DeviceInit);
+    if (!NT_SUCCESS(ucxInitStatus)) return ucxInitStatus;
+
     WDF_OBJECT_ATTRIBUTES attrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DEVICE_CONTEXT);
 
@@ -133,6 +137,12 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     if (!NT_SUCCESS(isStatus)) {
         LOG("Interrupt setup failed; refusing to start");
         return isStatus;
+    }
+
+    NTSTATUS ucxCtrlStatus = OhciPci_UcxControllerCreate(dc);
+    if (!NT_SUCCESS(ucxCtrlStatus)) {
+        LOG("UcxControllerCreate failed; returning failure to refuse start");
+        return ucxCtrlStatus;
     }
 
     return STATUS_SUCCESS;
