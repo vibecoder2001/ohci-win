@@ -48,8 +48,13 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
                       (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus));
 
     if (istat & OHCI_INT_WDH) {
-        /* ohci_drain_done processes retired TDs; WDH is W1C inside the core. */
+        /* ohci_drain_done processes retired TDs; WDH is W1C inside the core.
+         * CoreLock serialises against the per-EP queue submit path which
+         * mutates hc->in_flight and the bounce-pool bitmap from PASSIVE/
+         * DISPATCH context. */
+        WdfSpinLockAcquire(dc->CoreLock);
         ohci_drain_done(&dc->Hc);
+        WdfSpinLockRelease(dc->CoreLock);
     }
 
     if ((istat & OHCI_INT_RHSC) && dc->RootHub) {
