@@ -13,3 +13,7 @@ add_test(NAME layout COMMAND test_layout)
 add_executable(test_fake_hc test_fake_hc.c)
 target_link_libraries(test_fake_hc PRIVATE fake_hc)
 add_test(NAME fake_hc COMMAND test_fake_hc)
+
+add_executable(test_edtd_layout test_edtd_layout.c)
+target_link_libraries(test_edtd_layout PRIVATE ohci_core)
+add_test(NAME edtd_layout COMMAND test_edtd_layout)
