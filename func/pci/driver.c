@@ -51,17 +51,70 @@ _Use_decl_annotations_
 NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
                                   WDFCMRESLIST ResourcesRaw,
                                   WDFCMRESLIST ResourcesTranslated) {
-    UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(ResourcesRaw);
-    UNREFERENCED_PARAMETER(ResourcesTranslated);
-    LOG("EvtDevicePrepareHardware (skeleton)");
+    PDEVICE_CONTEXT dc = DeviceContextGet(Device);
+    LOG("EvtDevicePrepareHardware entered");
+
+    BOOLEAN haveMemory = FALSE;
+    BOOLEAN haveInterrupt = FALSE;
+    ULONG count = WdfCmResourceListGetCount(ResourcesTranslated);
+
+    for (ULONG i = 0; i < count; i++) {
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
+            WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+        if (!desc) continue;
+
+        if (desc->Type == CmResourceTypeMemory && !haveMemory) {
+            dc->MmioLength = desc->u.Memory.Length;
+            dc->MmioBase   = MmMapIoSpaceEx(desc->u.Memory.Start,
+                                            dc->MmioLength,
+                                            PAGE_READWRITE | PAGE_NOCACHE);
+            if (!dc->MmioBase) {
+                LOG("MmMapIoSpaceEx failed for BAR at 0x%llX (len 0x%lX)",
+                    desc->u.Memory.Start.QuadPart, (ULONG)dc->MmioLength);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            LOG("MMIO base 0x%p, length 0x%lX",
+                dc->MmioBase, (ULONG)dc->MmioLength);
+            haveMemory = TRUE;
+        } else if (desc->Type == CmResourceTypeInterrupt && !haveInterrupt) {
+            dc->InterruptVector = desc->u.Interrupt.Vector;
+            dc->InterruptIrql   = (KIRQL)desc->u.Interrupt.Level;
+            dc->InterruptMode   = (desc->Flags & CM_RESOURCE_INTERRUPT_LATCHED)
+                                  ? Latched : LevelSensitive;
+            LOG("Interrupt vector %u, IRQL %u, mode %d",
+                dc->InterruptVector, dc->InterruptIrql, dc->InterruptMode);
+            haveInterrupt = TRUE;
+        }
+    }
+
+    if (!haveMemory) {
+        LOG("No memory BAR found");
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    if (!haveInterrupt) {
+        LOG("No interrupt resource found");
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    /* Read HcRevision to confirm we can talk to the controller. OHCI 1.0a
+     * registers reads return 0x10 in the low byte. */
+    ULONG revision = READ_REGISTER_ULONG((PULONG)dc->MmioBase);
+    LOG("HcRevision = 0x%08X (low byte 0x10 means OHCI 1.0)", revision);
+
     return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_
 NTSTATUS EvtDeviceReleaseHardware(WDFDEVICE Device, WDFCMRESLIST ResourcesTranslated) {
-    UNREFERENCED_PARAMETER(Device);
     UNREFERENCED_PARAMETER(ResourcesTranslated);
+    PDEVICE_CONTEXT dc = DeviceContextGet(Device);
     LOG("EvtDeviceReleaseHardware");
+
+    if (dc->MmioBase) {
+        MmUnmapIoSpace(dc->MmioBase, dc->MmioLength);
+        dc->MmioBase = NULL;
+        dc->MmioLength = 0;
+    }
     return STATUS_SUCCESS;
 }
