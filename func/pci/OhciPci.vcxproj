@@ -67,8 +67,9 @@
   <ItemGroup>
     <ClCompile Include="driver.c" />
     <ClCompile Include="mmio.c" />
+    <ClCompile Include="dma.c" />
+    <ClCompile Include="..\..\core\src\ohci_dma.c" />
     <!-- Re-enabled in subsequent tasks as files are added -->
-    <!-- <ClCompile Include="dma.c" /> -->
     <!-- <ClCompile Include="interrupt.c" /> -->
     <!-- <ClCompile Include="ucx_glue.c" /> -->
     <!--
@@ -78,7 +79,6 @@
       compilation (or wrapped in a KM-compatible shim).
     -->
     <!-- <ClCompile Include="..\..\core\src\ohci_core.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_dma.c" /> -->
     <!-- <ClCompile Include="..\..\core\src\ohci_hc.c" /> -->
     <!-- <ClCompile Include="..\..\core\src\ohci_pool.c" /> -->
     <!-- <ClCompile Include="..\..\core\src\ohci_control.c" /> -->

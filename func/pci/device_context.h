@@ -39,4 +39,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
 /* Defined in mmio.c — installs kernel read32/write32/barrier into dc->MmioOps. */
 void OhciPci_InitMmioOps(PDEVICE_CONTEXT dc);
 
+/* Defined in dma.c — allocates WDFCOMMONBUFFER and wraps it in dc->DmaRegion. */
+NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc);
+
 #endif /* OHCIPCI_DEVICE_CONTEXT_H */
