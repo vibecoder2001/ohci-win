@@ -7,6 +7,15 @@
 
 #define OHCI_MAX_TD_BYTES 4096u  /* one 4 KB page per TD: safe, simple */
 
+/* See ohci_control.c — bounded wait for one HcFmNumber tick. */
+static void wait_one_frame(struct ohci_hc *hc) {
+    uint32_t f0 = hc->ops.read32(hc->ops.context, 0x3C /* HcFmNumber */);
+    for (int i = 0; i < 10000; i++) {
+        uint32_t f = hc->ops.read32(hc->ops.context, 0x3C);
+        if (f != f0) return;
+    }
+}
+
 static void ed_set_bulk(struct ohci_ed *ed,
                         const struct ohci_bulk_endpoint_config *cfg) {
     uint32_t c = 0;
@@ -41,14 +50,23 @@ int ohci_bulk_endpoint_create(struct ohci_hc *hc,
     ep->tail_placeholder_phys = ph_phys;
     ep->direction             = cfg->direction;
 
-    /* Splice onto Bulk list head.
-     *
-     * TODO(Plan 4): pause BLE around this sequence when a real HC may
-     * be mid-list-walk (OHCI §5.2.5). Safe in Tier-1 harness. */
+    /* Splice onto Bulk list head. Per OHCI §6.2.1 pause BLE around the
+     * link-edit so the HC isn't mid-walk when we update head/NextED. */
+    uint32_t hc_ctrl = hc->ops.read32(hc->ops.context, 0x04 /* HcControl */);
+    int was_enabled  = (hc_ctrl & OHCI_CTRL_BLE) != 0;
+    if (was_enabled) {
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl & ~OHCI_CTRL_BLE);
+        hc->ops.barrier(hc->ops.context);
+        wait_one_frame(hc);
+    }
     uint32_t old_head = hc->ops.read32(hc->ops.context, 0x28 /* HcBulkHeadED */);
     ed->NextED = old_head;
     hc->ops.barrier(hc->ops.context);
     hc->ops.write32(hc->ops.context, 0x28, ed_phys);
+    if (was_enabled) {
+        hc->ops.barrier(hc->ops.context);
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl | OHCI_CTRL_BLE);
+    }
 
     ep->next = hc->bulk_head;
     hc->bulk_head = ep;

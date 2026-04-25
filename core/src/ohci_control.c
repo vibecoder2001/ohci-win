@@ -4,6 +4,18 @@
 #include "ohci_regs.h"
 #include "ohci_dma.h"
 
+/* Wait until at least one SOF has elapsed by polling HcFmNumber. The HC
+ * advances the frame counter every 1ms; one transition is enough to
+ * guarantee any in-progress list walk has completed (OHCI §5.2.7). The
+ * spin is bounded so a wedged controller can't hang the host. */
+static void wait_one_frame(struct ohci_hc *hc) {
+    uint32_t f0 = hc->ops.read32(hc->ops.context, 0x3C /* HcFmNumber */);
+    for (int i = 0; i < 10000; i++) {
+        uint32_t f = hc->ops.read32(hc->ops.context, 0x3C);
+        if (f != f0) return;
+    }
+}
+
 /* Build a General TD representing one stage of a Control transfer. */
 static void fill_td(struct ohci_td *td,
                     uint32_t dp,
@@ -125,15 +137,25 @@ int ohci_control_endpoint_create(struct ohci_hc *hc,
     ep->tail_placeholder      = ph;
     ep->tail_placeholder_phys = ph_phys;
 
-    /* Splice onto Control list head.
-     *
-     * TODO(Plan 4): pause CLE (HcControl.CLE=0) around this sequence
-     * when a real HC may be mid-list-walk (OHCI §5.2.3). Safe in
-     * Tier-1 harness where no HC is actively walking. */
+    /* Splice onto Control list head. Per OHCI §6.2.1 we must pause the
+     * Control list (clear HcControl.CLE), wait for the HC to drain the
+     * current SOF window, link the ED, then re-enable. Skip the pause
+     * if CLE is already off (e.g. Tier-1 fake HC). */
+    uint32_t hc_ctrl = hc->ops.read32(hc->ops.context, 0x04 /* HcControl */);
+    int was_enabled  = (hc_ctrl & OHCI_CTRL_CLE) != 0;
+    if (was_enabled) {
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
+        hc->ops.barrier(hc->ops.context);
+        wait_one_frame(hc);
+    }
     uint32_t old_head = hc->ops.read32(hc->ops.context, 0x20);
     ed->NextED = old_head;
     hc->ops.barrier(hc->ops.context);
     hc->ops.write32(hc->ops.context, 0x20, ed_phys);
+    if (was_enabled) {
+        hc->ops.barrier(hc->ops.context);
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
+    }
 
     /* SW-side list for iteration in done-queue handling. */
     ep->next = hc->control_head;
