@@ -255,8 +255,23 @@ OhciPci_HandleBulkUrb(
     if (!isIn && length >= 8 && bufMdl != NULL) {
         PUCHAR sys = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl, NormalPagePriority | MdlMappingNoExecute);
         if (sys) {
-            LOG("  OUT[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X",
+            LOG("  OUT-VA[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X",
                 sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], sys[6], sys[7]);
+        }
+        /* Verify VA == phys content. If MDL has been re-pointed (partial
+         * MDL with different PFNs), the HC will DMA garbage. */
+        PPFN_NUMBER pfns0 = MmGetMdlPfnArray(bufMdl);
+        ULONG bo = MmGetMdlByteOffset(bufMdl);
+        PHYSICAL_ADDRESS pa;
+        pa.QuadPart = ((ULONGLONG)pfns0[0] << PAGE_SHIFT) + bo;
+        PUCHAR phys = (PUCHAR)MmMapIoSpaceEx(pa, 8, PAGE_READWRITE | PAGE_NOCACHE);
+        if (phys) {
+            LOG("  OUT-PHYS[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X (pa=0x%llX)",
+                phys[0], phys[1], phys[2], phys[3], phys[4], phys[5], phys[6], phys[7],
+                pa.QuadPart);
+            MmUnmapIoSpace(phys, 8);
+        } else {
+            LOG("  OUT-PHYS: MmMapIoSpaceEx failed (pa=0x%llX)", pa.QuadPart);
         }
     }
 
@@ -292,20 +307,76 @@ OhciPci_HandleBulkUrb(
         return;
     }
 
-    struct ohci_bulk_sg_page sg[OHCI_BULK_MAX_SG_PAGES];
+    /* OHCI is a 32-bit DMA controller. Modern Windows freely allocates user
+     * MDLs above 4 GB; we'd silently truncate the high bits and DMA from a
+     * random low-memory page, which qemu's usb-msd reports as
+     * "Bad signature 00000000". Detect any high PFN and bounce through our
+     * 32-bit-DMA-safe slab pool. */
     PPFN_NUMBER pfns = MmGetMdlPfnArray(bufMdl);
-    ULONG offInPage = byteOffset & (PAGE_SIZE - 1);
-    ULONG remaining = length;
-    ULONG urbOff    = 0;
+    BOOLEAN needsBounce = FALSE;
     for (ULONG i = 0; i < pageCount; i++) {
-        ULONG bytesThisPage = PAGE_SIZE - offInPage;
-        if (bytesThisPage > remaining) bytesThisPage = remaining;
-        sg[i].phys   = (uint32_t)((ULONGLONG)pfns[i] << PAGE_SHIFT) + offInPage;
-        sg[i].length = bytesThisPage;
-        sg[i].off    = urbOff;
-        urbOff      += bytesThisPage;
-        remaining   -= bytesThisPage;
-        offInPage    = 0;
+        if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
+            needsBounce = TRUE;
+            break;
+        }
+    }
+
+    struct ohci_bulk_sg_page sg[OHCI_BULK_MAX_SG_PAGES];
+    void   *bounceVa   = NULL;
+    uint32_t bouncePhys = 0;
+
+    if (needsBounce) {
+        if (length > OHCIPCI_BOUNCE_SLAB_BYTES) {
+            LOG("  rejected: high-mem MDL with length=%lu exceeds bounce slab=%u",
+                length, OHCIPCI_BOUNCE_SLAB_BYTES);
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+            return;
+        }
+        WdfSpinLockAcquire(dc->CoreLock);
+        bounceVa = OhciPci_BounceAlloc(dc, &bouncePhys);
+        WdfSpinLockRelease(dc->CoreLock);
+        if (bounceVa == NULL) {
+            LOG("  rejected: no bounce slab available");
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
+            WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+            return;
+        }
+        if (!isIn) {
+            PUCHAR sysVa = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl,
+                NormalPagePriority | MdlMappingNoExecute);
+            if (sysVa == NULL) {
+                WdfSpinLockAcquire(dc->CoreLock);
+                OhciPci_BounceFree(dc, bounceVa);
+                WdfSpinLockRelease(dc->CoreLock);
+                urb->TransferBufferLength = 0;
+                urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
+                WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+                return;
+            }
+            RtlCopyMemory(bounceVa, sysVa, length);
+        }
+        /* Single SG entry covering the whole bounced buffer. */
+        sg[0].phys   = bouncePhys;
+        sg[0].length = length;
+        sg[0].off    = 0;
+        pageCount    = 1;
+    } else {
+        ULONG offInPage = byteOffset & (PAGE_SIZE - 1);
+        ULONG remaining = length;
+        ULONG urbOff    = 0;
+        for (ULONG i = 0; i < pageCount; i++) {
+            ULONG bytesThisPage = PAGE_SIZE - offInPage;
+            if (bytesThisPage > remaining) bytesThisPage = remaining;
+            sg[i].phys   = (uint32_t)((ULONGLONG)pfns[i] << PAGE_SHIFT) + offInPage;
+            sg[i].length = bytesThisPage;
+            sg[i].off    = urbOff;
+            urbOff      += bytesThisPage;
+            remaining   -= bytesThisPage;
+            offInPage    = 0;
+        }
     }
 
     WDF_OBJECT_ATTRIBUTES reqAttrs;
@@ -322,8 +393,14 @@ OhciPci_HandleBulkUrb(
     uc->TransferUrb   = urb;
     uc->DataLength    = length;
     uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
-    /* No bounce — DataBounce stays NULL so OhciPci_UrbComplete skips
-     * the IN copy-back and the bounce-free entirely. */
+    if (bounceVa != NULL) {
+        /* Wire the bounce so OhciPci_UrbComplete copies IN bytes back
+         * to the user MDL and frees the slab. UserMdl drives the
+         * copy-back path. */
+        uc->DataBounce     = bounceVa;
+        uc->DataBouncePhys = bouncePhys;
+        uc->UserMdl        = bufMdl;
+    }
 
     /* buffer_phys = first chunk's phys minus its off, so the drain's
      * "CBP - (buffer_phys + chunk_off)" arithmetic resolves correctly
@@ -336,6 +413,15 @@ OhciPci_HandleBulkUrb(
 
     WdfSpinLockAcquire(dc->CoreLock);
     struct ohci_ed *bed = ep->Core.Bulk.ed;
+    uint32_t hc_ctrl_pre   = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
+    uint32_t hc_bulk_head  = dc->MmioOps.read32(dc->MmioOps.context, 0x28);
+    uint32_t hc_bulk_curr  = dc->MmioOps.read32(dc->MmioOps.context, 0x2C);
+    uint32_t hc_cmd_status = dc->MmioOps.read32(dc->MmioOps.context, 0x08);
+    LOG("  HC-pre:  HcControl=0x%08X (BLE=%u CLE=%u PLE=%u HCFS=%u) HcBulkHead=0x%08X HcBulkCurr=0x%08X HcCmdStat=0x%08X",
+        hc_ctrl_pre,
+        (hc_ctrl_pre >> 5) & 1, (hc_ctrl_pre >> 4) & 1, (hc_ctrl_pre >> 2) & 1,
+        (hc_ctrl_pre >> 6) & 3,
+        hc_bulk_head, hc_bulk_curr, hc_cmd_status);
     LOG("  ED-pre:  Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X NextED=0x%08X (sg[0].phys=0x%08X len=%lu)",
         bed->Control, bed->HeadP, bed->TailP, bed->NextED,
         sg[0].phys, sg[0].length);
