@@ -48,24 +48,6 @@ Environment:
  * -------------------------------------------------------------------------- */
 
 /*
- * StubUsbDeviceAdd — matches EVT_UCX_CONTROLLER_USBDEVICE_ADD.
- * Signature is identical to plan skeleton; spike confirms it.
- */
-static NTSTATUS
-StubUsbDeviceAdd(
-    _In_ UCXCONTROLLER      UcxController,
-    _In_ PUCXUSBDEVICE_INFO UcxUsbDeviceInfo,
-    _In_ PUCXUSBDEVICE_INIT UsbDeviceInit
-    )
-{
-    UNREFERENCED_PARAMETER(UcxController);
-    UNREFERENCED_PARAMETER(UcxUsbDeviceInfo);
-    UNREFERENCED_PARAMETER(UsbDeviceInit);
-    LOG("StubUsbDeviceAdd called (Plan 5 will implement)");
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-/*
  * StubReset — matches EVT_UCX_CONTROLLER_RESET (VOID return).
  * Signature identical to plan skeleton; spike confirms it.
  */
@@ -193,7 +175,7 @@ OhciPci_UcxControllerCreate(
     UCX_CONTROLLER_CONFIG cfg;
     UCX_CONTROLLER_CONFIG_INIT(&cfg, "OhciPci");
 
-    cfg.EvtControllerUsbDeviceAdd                                      = StubUsbDeviceAdd;
+    cfg.EvtControllerUsbDeviceAdd                                      = OhciPci_UsbDeviceAdd;
     cfg.EvtControllerQueryUsbCapability                                = StubQueryUsbCapability;
     cfg.EvtControllerGetCurrentFrameNumber                             = StubGetCurrentFrameNumber;
     cfg.EvtControllerReset                                             = StubReset;

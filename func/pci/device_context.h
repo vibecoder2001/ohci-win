@@ -74,6 +74,27 @@ NTSTATUS OhciPci_RootHubCreate(PDEVICE_CONTEXT dc, UCXCONTROLLER controller);
  * UcxClass.h dependency in that translation unit. */
 void OhciPci_NotifyPortChanged(PDEVICE_CONTEXT dc);
 
+/* Defined in ucx_usbdevice.c — EvtControllerUsbDeviceAdd and endpoint stubs.
+ *
+ * Note: info struct is UCXUSBDEVICE_INFO (confirmed from ucxusbdevice.h).
+ * OhciPci_DefaultEndpointAdd and OhciPci_EndpointAdd are temporary stubs;
+ * Task 6 moves real implementations to ucx_endpoint.c. */
+NTSTATUS OhciPci_UsbDeviceAdd(UCXCONTROLLER      Controller,
+                               PUCXUSBDEVICE_INFO UsbDeviceInfo,
+                               PUCXUSBDEVICE_INIT UsbDeviceInit);
+
+NTSTATUS OhciPci_DefaultEndpointAdd(UCXCONTROLLER     UcxController,
+                                     UCXUSBDEVICE      UcxUsbDevice,
+                                     ULONG             MaxPacketSize,
+                                     PUCXENDPOINT_INIT UcxEndpointInit);
+
+NTSTATUS OhciPci_EndpointAdd(UCXCONTROLLER                              UcxController,
+                              UCXUSBDEVICE                               UcxUsbDevice,
+                              PUSB_ENDPOINT_DESCRIPTOR                   UsbEndpointDescriptor,
+                              ULONG                                      UsbEndpointDescriptorBufferLength,
+                              PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR SuperSpeedEndpointCompanionDescriptor,
+                              PUCXENDPOINT_INIT                          UcxEndpointInit);
+
 /* Defined in bounce.c — per-URB bounce buffer slab pool. */
 NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);
 

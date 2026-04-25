@@ -72,6 +72,7 @@
     <ClCompile Include="ucx_glue.c" />
     <ClCompile Include="bounce.c" />
     <ClCompile Include="ucx_roothub.c" />
+    <ClCompile Include="ucx_usbdevice.c" />
     <ClCompile Include="..\..\core\src\ohci_core.c" />
     <ClCompile Include="..\..\core\src\ohci_dma.c" />
     <ClCompile Include="..\..\core\src\ohci_hc.c" />
