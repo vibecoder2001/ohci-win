@@ -119,7 +119,11 @@ int ohci_control_endpoint_create(struct ohci_hc *hc,
     ep->tail_placeholder      = ph;
     ep->tail_placeholder_phys = ph_phys;
 
-    /* Splice onto Control list head. */
+    /* Splice onto Control list head.
+     *
+     * TODO(Plan 3): pause CLE (HcControl.CLE=0) around this sequence
+     * when a real HC may be mid-list-walk (OHCI §5.2.3). Safe in
+     * Tier-1 harness where no HC is actively walking. */
     uint32_t old_head = hc->ops.read32(hc->ops.context, 0x20);
     ed->NextED = old_head;
     hc->ops.barrier(hc->ops.context);
@@ -159,6 +163,12 @@ int ohci_control_submit(struct ohci_hc *hc,
         return -1;
     }
 
+    /* Capture the old placeholder's phys BEFORE the swap — it's the
+     * physical address of what will become the head TD of this URB
+     * (the in-place overwrite below fills that slot with SETUP contents).
+     * ED.HeadP still points here because no HC has retired a TD yet. */
+    uint32_t head_td_phys = ep->tail_placeholder_phys;
+
     /* OHCI placeholder convention: fold chain_head's contents into the
      * existing placeholder (so ED.HeadP still points to a live TD), then
      * make chain_tail->NextTD point at the new placeholder. */
@@ -173,10 +183,7 @@ int ohci_control_submit(struct ohci_hc *hc,
     ep->tail_placeholder      = new_ph;
     ep->tail_placeholder_phys = new_ph_phys;
 
-    urb->head_td = (ep->ed->HeadP & OHCI_ED_HEADP_ADDR_MASK)
-        ? ohci_dma_virt_from_phys(hc->dma,
-              ep->ed->HeadP & OHCI_ED_HEADP_ADDR_MASK)
-        : NULL;
+    urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = chain_tail;
 
     /* Update ED.TailP — publishes the new chain to the HC. */
