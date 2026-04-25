@@ -35,6 +35,7 @@ void fake_hc_init(struct fake_hc *hc) {
     memcpy(hc->regs + 0x34, &fm_interval, sizeof(fm_interval));
     uint32_t ls_thresh = 0x0628;   /* 1576 */
     memcpy(hc->regs + 0x44, &ls_thresh, sizeof(ls_thresh));
+    /* OHCI boot state: HcControl.HCFS = RESET (00). Already zero-init. */
 }
 
 void fake_hc_get_ops(struct fake_hc *hc, struct ohci_mmio_ops *ops_out) {
