@@ -57,6 +57,14 @@ typedef struct _DEVICE_CONTEXT {
     USB_DEVICE_SPEED         PendingDeviceSpeed;
 
     struct ohcipci_bounce_pool BouncePool;
+
+    /* Coarse spinlock serialising every call into the OHCI core that
+     * touches hc->in_flight or the bounce-pool bitmap. Acquired by:
+     *   - EvtUrbDefault before ohci_*_submit / OhciPci_BounceAlloc
+     *   - The interrupt DPC before ohci_drain_done
+     *   - Endpoint create paths before splicing onto the HC list
+     * Created in EvtDriverDeviceAdd; tied to WDFDEVICE lifetime. */
+    WDFSPINLOCK              CoreLock;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
