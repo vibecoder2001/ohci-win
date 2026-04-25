@@ -73,6 +73,8 @@ Environment:
 #include <usbioctl.h>
 #include "device_context.h"
 #include "ohci_control.h"
+#include "ohci_bulk.h"
+#include "ohci_interrupt.h"
 #include "ohci_urb.h"
 #include "ohci_dma.h"
 #include "ohci_ed.h"
@@ -384,7 +386,49 @@ StubUsbDeviceEndpointsConfigure(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceEndpointsConfigure (stub)");
+
+    WDF_REQUEST_PARAMETERS params;
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+    PENDPOINTS_CONFIGURE ec = (PENDPOINTS_CONFIGURE)params.Parameters.Others.Arg1;
+
+    if (ec == NULL) {
+        LOG("UsbDeviceEndpointsConfigure: NULL params");
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+    }
+
+    LOG("UsbDeviceEndpointsConfigure: enable=%lu disable=%lu unchanged=%lu",
+        ec->EndpointsToEnableCount,
+        ec->EndpointsToDisableCount,
+        ec->EndpointsEnabledAndUnchangedCount);
+
+    /* Tear down EDs for endpoints UCX is removing from the active set.
+     * Without this, EndpointAdd for the same logical pipe (which UCX calls
+     * for the new altsetting before disabling the old one) leaves the old
+     * ED on hc->bulk_head / interrupt skeleton — the device sees two EDs
+     * polling its EP and qemu's MSD STALLs the resulting confusion. */
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    for (ULONG i = 0; i < ec->EndpointsToDisableCount; i++) {
+        UCXENDPOINT ucxEp = ec->EndpointsToDisable[i];
+        OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
+        if (ep == NULL) continue;
+        WdfSpinLockAcquire(dc->CoreLock);
+        switch (ep->Kind) {
+        case OhciPciEpKindBulk:
+            ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
+            break;
+        case OhciPciEpKindInterrupt:
+            ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
+            break;
+        case OhciPciEpKindControl:
+            ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
+            break;
+        }
+        WdfSpinLockRelease(dc->CoreLock);
+        LOG("  disabled EP kind=%d", ep->Kind);
+    }
+
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
