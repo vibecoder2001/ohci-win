@@ -126,7 +126,7 @@ Environment:
  * Safe for a single-instance PCI driver; a multi-instance driver would need
  * WDF context attached to the UCXROOTHUB object instead.
  */
-static PDEVICE_CONTEXT g_DeviceContext;
+PDEVICE_CONTEXT g_DeviceContext;  /* extern in device_context.h; shared across glue TUs */
 
 /* --------------------------------------------------------------------------
  * StubControlUrb — EVT_UCX_ROOTHUB_CONTROL_URB

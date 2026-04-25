@@ -12,9 +12,8 @@ Abstract:
     registered in ucx_glue.c. When UCX wants to enumerate a USB device it
     calls this; we allocate a UCXUSBDEVICE and supply per-device callbacks.
 
-    Temporary stubs for OhciPci_DefaultEndpointAdd and OhciPci_EndpointAdd
-    live at the bottom of this file. Task 6 deletes them and provides the
-    real implementations in ucx_endpoint.c.
+    OhciPci_DefaultEndpointAdd and OhciPci_EndpointAdd are implemented in
+    ucx_endpoint.c (added in Task 6). This file contains only UsbDeviceAdd.
 
 === UCX 1.6 USB-device API surface (WDK 10.0.26100.0, ucxusbdevice.h) ===
 
@@ -249,60 +248,6 @@ OhciPci_UsbDeviceAdd(
     return status;
 }
 
-/* --------------------------------------------------------------------------
- * Temporary endpoint-add placeholders.
- *
- * Task 6 deletes these stubs and provides real implementations in
- * ucx_endpoint.c. Until then they return STATUS_NOT_IMPLEMENTED so that
- * OhciPci compiles and links; UCX will fail enumeration on the endpoint-add
- * step, which is expected for Plan 5.
- *
- * Actual signatures confirmed from ucxusbdevice.h:
- *
- *   EVT_UCX_USBDEVICE_DEFAULT_ENDPOINT_ADD(
- *       UCXCONTROLLER, UCXUSBDEVICE, ULONG MaxPacketSize, PUCXENDPOINT_INIT)
- *
- *   EVT_UCX_USBDEVICE_ENDPOINT_ADD(
- *       UCXCONTROLLER, UCXUSBDEVICE,
- *       PUSB_ENDPOINT_DESCRIPTOR, ULONG BufLength,
- *       PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR,
- *       PUCXENDPOINT_INIT)
- * -------------------------------------------------------------------------- */
-
-_Use_decl_annotations_
-NTSTATUS
-OhciPci_DefaultEndpointAdd(
-    UCXCONTROLLER     UcxController,
-    UCXUSBDEVICE      UcxUsbDevice,
-    ULONG             MaxPacketSize,
-    PUCXENDPOINT_INIT UcxEndpointInit
-    )
-{
-    UNREFERENCED_PARAMETER(UcxController);
-    UNREFERENCED_PARAMETER(UcxUsbDevice);
-    UNREFERENCED_PARAMETER(MaxPacketSize);
-    UNREFERENCED_PARAMETER(UcxEndpointInit);
-    LOG("DefaultEndpointAdd (temporary stub — Task 6 implements)");
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-_Use_decl_annotations_
-NTSTATUS
-OhciPci_EndpointAdd(
-    UCXCONTROLLER                              UcxController,
-    UCXUSBDEVICE                               UcxUsbDevice,
-    PUSB_ENDPOINT_DESCRIPTOR                   UsbEndpointDescriptor,
-    ULONG                                      UsbEndpointDescriptorBufferLength,
-    PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR SuperSpeedEndpointCompanionDescriptor,
-    PUCXENDPOINT_INIT                          UcxEndpointInit
-    )
-{
-    UNREFERENCED_PARAMETER(UcxController);
-    UNREFERENCED_PARAMETER(UcxUsbDevice);
-    UNREFERENCED_PARAMETER(UsbEndpointDescriptor);
-    UNREFERENCED_PARAMETER(UsbEndpointDescriptorBufferLength);
-    UNREFERENCED_PARAMETER(SuperSpeedEndpointCompanionDescriptor);
-    UNREFERENCED_PARAMETER(UcxEndpointInit);
-    LOG("EndpointAdd (Plan 6 implements)");
-    return STATUS_NOT_IMPLEMENTED;
-}
+/* OhciPci_DefaultEndpointAdd and OhciPci_EndpointAdd were temporary stubs
+ * here in Task 5. Task 6 deleted them; real implementations are in
+ * ucx_endpoint.c. */
