@@ -77,6 +77,7 @@ Environment:
 #include "ohci_dma.h"
 #include "ohci_ed.h"
 #include "ohci_regs.h"
+#include "ohci_drain.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -136,11 +137,21 @@ OhciPci_SyncSetupOnly(PDEVICE_CONTEXT dc,
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    /* USB §9.2.6.3 gives the device 50 ms for SET_ADDRESS itself, but the
+     * end-to-end wall clock here also has to absorb workitem scheduling and
+     * the WDH DPC latency. 1 s is plenty and still bounded. */
     LARGE_INTEGER timeout;
-    timeout.QuadPart = -50LL * 1000LL * 10LL; /* 50 ms */
+    timeout.QuadPart = -1LL * 1000LL * 1000LL * 10LL; /* 1 s */
     NTSTATUS w = KeWaitForSingleObject(&s.done, Executive, KernelMode, FALSE, &timeout);
 
     WdfSpinLockAcquire(dc->CoreLock);
+    /* Critical: if the URB never retired (timeout), it is still on
+     * hc->in_flight pointing at our stack frame. Cancel for the EP's ED
+     * pulls it off (and halts the ED so the HC stops touching the TDs).
+     * Without this, the next walker of in_flight derefs freed stack memory. */
+    if (w != STATUS_SUCCESS) {
+        ohci_urb_cancel_for_ed(&dc->Hc, ep0->Core.Control.ed);
+    }
     OhciPci_BounceFree(dc, setupBounce);
     WdfSpinLockRelease(dc->CoreLock);
 
@@ -297,7 +308,6 @@ StubUsbDeviceAddress(
      * struct member; reach it through the typed pointer cast. */
     UCXUSBDEVICE usbDev = addrPkt->UsbDevice;
     OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(usbDev);
-    UCHAR newAddr = (UCHAR)(addrPkt->Address & 0x7F);
 
     if (udc == NULL || udc->Ep0 == NULL) {
         LOG("UsbDeviceAddress: per-device context or EP0 missing");
@@ -305,7 +315,15 @@ StubUsbDeviceAddress(
         return;
     }
 
-    LOG("UsbDeviceAddress: requested addr=%u (current=%u) — deferring to workitem",
+    /* USBDEVICE_ADDRESS.Address is OUT, not IN — UCX expects the driver
+     * to allocate a fresh USB address (1..127) and write it back into the
+     * struct before completion. dwusb does the same via USBPORT_AllocateUsbAddress.
+     * We use a simple monotonic allocator on the device context. */
+    LONG allocated = InterlockedIncrement(&g_DeviceContext->NextUsbAddress);
+    UCHAR newAddr = (UCHAR)(((allocated - 1) % 127) + 1);  /* 1..127 */
+    addrPkt->Address = newAddr;
+
+    LOG("UsbDeviceAddress: allocated addr=%u (current=%u) — deferring to workitem",
         newAddr, udc->FuncAddr);
 
     /* The actual SET_ADDRESS work (sync URB submit + KeWait + ED rewrite)

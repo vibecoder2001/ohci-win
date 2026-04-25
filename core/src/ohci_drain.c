@@ -5,6 +5,7 @@
 #include "ohci_urb.h"
 #include "ohci_dma.h"
 #include "ohci_pool.h"
+#include "ohci_ed.h"
 
 static int cc_to_urb_status(uint8_t cc) {
     switch (cc) {
@@ -119,5 +120,27 @@ void ohci_drain_done(struct ohci_hc *hc) {
 
         ohci_td_pool_free(&hc->td_pool, td);
         cur = next;
+    }
+}
+
+void ohci_urb_cancel_for_ed(struct ohci_hc *hc, struct ohci_ed *ed) {
+    if (!ed) return;
+    ed->Control |= OHCI_ED_K;
+    hc->ops.barrier(hc->ops.context);
+
+    struct ohci_urb *prev = NULL;
+    struct ohci_urb *u    = hc->in_flight;
+    while (u) {
+        struct ohci_urb *next = u->next_pending;
+        if (u->ed == ed) {
+            if (prev) prev->next_pending = next;
+            else      hc->in_flight       = next;
+            if (u->status == OHCI_URB_STATUS_PENDING)
+                u->status = OHCI_URB_STATUS_OTHER;
+            if (u->complete) u->complete(u);
+        } else {
+            prev = u;
+        }
+        u = next;
     }
 }

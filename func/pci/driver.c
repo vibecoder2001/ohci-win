@@ -59,6 +59,7 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
         if (!NT_SUCCESS(lockStatus)) return lockStatus;
     }
     InitializeListHead(&dc->DeferredCompletions);
+    dc->NextUsbAddress = 0;  /* InterlockedIncrement -> 1 for the first device. */
 
     /* Default WDFQUEUE that forwards URB IOCTLs (IOCTL_INTERNAL_USB_SUBMIT_URB
      * etc.) from UsbHub3 into UCX via UcxIoDeviceControl. Without this, UCX's

@@ -71,6 +71,13 @@ typedef struct _DEVICE_CONTEXT {
      * this list; EvtDpc drains the list and completes each request
      * AFTER releasing CoreLock. Protected by CoreLock. */
     LIST_ENTRY               DeferredCompletions;
+
+    /* USB address allocator. UCX expects the driver to assign each new
+     * device an address (USBDEVICE_ADDRESS.Address is OUT, not IN — see
+     * dwusb UsbDevice_UcxEvtAddress). Range is 1..127 per USB spec.
+     * Plan 7 doesn't free addresses on disconnect so this just monotonically
+     * increments; a future plan can do real allocation. */
+    volatile LONG            NextUsbAddress;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)

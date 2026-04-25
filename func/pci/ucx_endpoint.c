@@ -79,6 +79,8 @@ Environment:
 #include "ohci_interrupt.h"
 #include "ohci_urb.h"
 #include "ohci_dma.h"
+#include "ohci_drain.h"
+#include "ohci_ed.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -556,6 +558,70 @@ EvtUrbDefault(
 }
 
 /* --------------------------------------------------------------------------
+ * OhciPci_CancelEpInFlight
+ *
+ * Cancel any URBs sitting on the OHCI hc->in_flight list whose ED matches
+ * this EP. Used by purge/abort so UCX doesn't wait forever for a poll that
+ * will never come (Interrupt EP whose device just went away). The cancel
+ * stages completions onto dc->DeferredCompletions via OhciPci_UrbComplete;
+ * we drain the list under CoreLock then complete the WDFREQUESTs outside
+ * the lock — same pattern as EvtDpc.
+ * -------------------------------------------------------------------------- */
+static struct ohci_ed *
+OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep)
+{
+    switch (ep->Kind) {
+    case OhciPciEpKindControl:   return ep->Core.Control.ed;
+    case OhciPciEpKindBulk:      return ep->Core.Bulk.ed;
+    case OhciPciEpKindInterrupt: return ep->Core.Interrupt.ed;
+    }
+    return NULL;
+}
+
+/* Re-enable an EP whose ED was halted by a prior purge/abort. UCX will
+ * call Start after Purge — without clearing Skip, the HC ignores the
+ * ED and the next URB on it sits forever (HC never raises WDH → timeout). */
+static VOID
+OhciPci_StartEp(OHCIPCI_EP_CONTEXT *ep)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    struct ohci_ed *ed = OhciPci_EpEd(ep);
+    if (ed == NULL) return;
+    WdfSpinLockAcquire(dc->CoreLock);
+    ed->Control &= ~OHCI_ED_K;
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    WdfSpinLockRelease(dc->CoreLock);
+}
+
+static VOID
+OhciPci_CancelEpInFlight(OHCIPCI_EP_CONTEXT *ep)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    struct ohci_ed *ed = OhciPci_EpEd(ep);
+    if (ed == NULL) return;
+
+    LIST_ENTRY local;
+    InitializeListHead(&local);
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    ohci_urb_cancel_for_ed(&dc->Hc, ed);
+    while (!IsListEmpty(&dc->DeferredCompletions)) {
+        PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
+        InsertTailList(&local, le);
+    }
+    WdfSpinLockRelease(dc->CoreLock);
+
+    while (!IsListEmpty(&local)) {
+        PLIST_ENTRY le = RemoveHeadList(&local);
+        POHCIPCI_URB_CTX uc =
+            CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        WdfRequestCompleteWithInformation(uc->Request,
+                                          uc->DeferredStatus,
+                                          uc->DeferredInfo);
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Default endpoint lifecycle callbacks (required by UCX).
  * -------------------------------------------------------------------------- */
 _Use_decl_annotations_
@@ -571,6 +637,7 @@ EvtDefaultEpPurge(
     if (ep->UrbQueue != NULL) {
         WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
     }
+    OhciPci_CancelEpInFlight(ep);
     UcxEndpointPurgeComplete(UcxEndpoint);
 }
 
@@ -584,6 +651,7 @@ EvtDefaultEpStart(
     UNREFERENCED_PARAMETER(UcxController);
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
     LOG("DefaultEp Start");
+    OhciPci_StartEp(ep);
     if (ep->UrbQueue != NULL) {
         WdfIoQueueStart(ep->UrbQueue);
     }
@@ -602,6 +670,7 @@ EvtDefaultEpAbort(
     if (ep->UrbQueue != NULL) {
         WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
     }
+    OhciPci_CancelEpInFlight(ep);
     UcxEndpointAbortComplete(UcxEndpoint);
 }
 
@@ -779,6 +848,7 @@ EvtNonDefaultEpPurge(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
     LOG("NonDefaultEp Purge (kind=%d)", ep->Kind);
     if (ep->UrbQueue) WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
+    OhciPci_CancelEpInFlight(ep);
     UcxEndpointPurgeComplete(UcxEndpoint);
 }
 
@@ -789,6 +859,7 @@ EvtNonDefaultEpStart(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
     UNREFERENCED_PARAMETER(UcxController);
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
     LOG("NonDefaultEp Start (kind=%d)", ep->Kind);
+    OhciPci_StartEp(ep);
     if (ep->UrbQueue) WdfIoQueueStart(ep->UrbQueue);
 }
 
@@ -800,6 +871,7 @@ EvtNonDefaultEpAbort(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
     LOG("NonDefaultEp Abort (kind=%d)", ep->Kind);
     if (ep->UrbQueue) WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
+    OhciPci_CancelEpInFlight(ep);
     UcxEndpointAbortComplete(UcxEndpoint);
 }
 
