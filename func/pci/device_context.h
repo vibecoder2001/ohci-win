@@ -120,15 +120,16 @@ typedef struct _OHCIPCI_URB_CTX {
     struct ohci_urb              CoreUrb;        /* must be first (CONTAINING_RECORD) */
     void                        *SetupBounce;    /* 8-byte SETUP packet bounce buffer */
     uint32_t                     SetupBouncePhys;
-    void                        *DataBounce;     /* Data-stage bounce buffer (or NULL) */
+    void                        *DataBounce;     /* Control data-stage bounce (or NULL) */
     uint32_t                     DataBouncePhys;
-    ULONG                        DataBounceSlabs; /* >1 → AllocBig, free via FreeBig */
     uint32_t                     DataLength;     /* 0 if no data stage */
     uint8_t                      DataDirection;  /* OHCI_URB_DIR_IN / _OUT */
     PMDL                         UserMdl;        /* caller's MDL (may be NULL) */
     PVOID                        UserVa;         /* caller's KVA if no MDL    */
     WDFREQUEST                   Request;        /* the owning WDFREQUEST      */
     POHCIPCI_EP_CONTEXT          EpCtx;         /* owning endpoint context    */
+    WDFDMATRANSACTION            DmaTransaction; /* Bulk path; NULL for Control */
+    PMDL                         OurMdl;         /* MDL we built from a flat KVA URB; free in completion */
     PVOID                        TransferUrb;    /* TRANSFER_URB; UCX reads back
                                                    * TransferBufferLength + Hdr.Status
                                                    * after the request completes. */
@@ -221,9 +222,6 @@ NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);
 /* Allocate one slab. Returns NULL on exhaustion. *phys_out gets the
  * physical address. Buffer size is OHCIPCI_BOUNCE_SLAB_BYTES. */
 void *OhciPci_BounceAlloc(PDEVICE_CONTEXT dc, uint32_t *phys_out);
-void *OhciPci_BounceAllocBig(PDEVICE_CONTEXT dc, ULONG n_slabs, uint32_t *phys_out);
-void  OhciPci_BounceFreeBig(PDEVICE_CONTEXT dc, void *ptr, ULONG n_slabs);
-
 void  OhciPci_BounceFree(PDEVICE_CONTEXT dc, void *ptr);
 
 #endif /* OHCIPCI_DEVICE_CONTEXT_H */

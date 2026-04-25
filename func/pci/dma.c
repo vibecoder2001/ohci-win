@@ -5,6 +5,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "device_context.h"
+#include "ohci_bulk.h"
 
 /* Sized for ohci_hc_init's overhead (HCCA + 4 ED pools + TD pool + 63-ED
  * interrupt skeleton ≈ 6 KB) PLUS the 256 KB bounce buffer pool (Plan 5
@@ -21,6 +22,14 @@ NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc) {
     status = WdfDmaEnablerCreate(dc->Device, &dmaCfg,
                                  WDF_NO_OBJECT_ATTRIBUTES, &dc->DmaEnabler);
     if (!NT_SUCCESS(status)) return status;
+
+    /* Cap HAL SG fragments at half the OHCI core's per-URB TD limit. Each
+     * SG element gets split to ≤ PAGE_SIZE chunks in BulkProgramDma so a
+     * worst-case 2-page-contiguous element becomes 2 TDs; the /2 keeps the
+     * post-split chunk count within OHCI_BULK_MAX_SG_PAGES even when every
+     * HAL element straddles a page boundary. */
+    WdfDmaEnablerSetMaximumScatterGatherElements(dc->DmaEnabler,
+                                                 OHCI_BULK_MAX_SG_PAGES / 2);
 
     status = WdfCommonBufferCreate(dc->DmaEnabler, OHCIPCI_DMA_BUFFER_SIZE,
                                    WDF_NO_OBJECT_ATTRIBUTES, &dc->DmaBuffer);

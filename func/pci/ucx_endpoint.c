@@ -213,17 +213,30 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         }
     }
 
-    /* Return bounce buffers to pool before completing the request. */
+    /* Release the WdfDmaTransaction (Bulk path) before completing the
+     * request — frees map registers + (if HAL bounced) the low-mem buffer
+     * the SG list pointed at. Per WDF docs we must signal completion with
+     * the actual byte count before deleting the transaction. */
+    if (uc->DmaTransaction) {
+        NTSTATUS dmaSt;
+        (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction,
+                                                 (size_t)u->transferred,
+                                                 &dmaSt);
+        WdfObjectDelete(uc->DmaTransaction);
+        uc->DmaTransaction = NULL;
+    }
+    if (uc->OurMdl) {
+        IoFreeMdl(uc->OurMdl);
+        uc->OurMdl = NULL;
+    }
+
+    /* Return Control bounce buffers to pool before completing the request. */
     if (uc->SetupBounce) {
         OhciPci_BounceFree(uc->EpCtx->Dc, uc->SetupBounce);
         uc->SetupBounce = NULL;
     }
     if (uc->DataBounce) {
-        if (uc->DataBounceSlabs > 1) {
-            OhciPci_BounceFreeBig(uc->EpCtx->Dc, uc->DataBounce, uc->DataBounceSlabs);
-        } else {
-            OhciPci_BounceFree(uc->EpCtx->Dc, uc->DataBounce);
-        }
+        OhciPci_BounceFree(uc->EpCtx->Dc, uc->DataBounce);
         uc->DataBounce = NULL;
     }
 
@@ -237,11 +250,99 @@ OhciPci_UrbComplete(struct ohci_urb *u)
 }
 
 /* --------------------------------------------------------------------------
- * OhciPci_HandleBulkOrInterruptUrb
+ * OhciPci_BulkProgramDma
  *
- * Handles URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER for non-default endpoints.
- * Allocates one bounce slab, copies OUT data in, submits via the matching
- * core entrypoint, completes asynchronously through OhciPci_UrbComplete.
+ * EVT_WDF_PROGRAM_DMA — invoked by HAL once map registers are reserved and
+ * the SCATTER_GATHER_LIST is built. Every SgList->Elements[i].Address is
+ * guaranteed within our 32-bit DMA mask (HAL bounces high-mem pages into
+ * map registers transparently). Walk the SG list, build one OHCI TD per
+ * element via ohci_bulk_submit_sg, and return TRUE.
+ *
+ * Runs at IRQL <= DISPATCH_LEVEL.
+ * -------------------------------------------------------------------------- */
+static BOOLEAN
+OhciPci_BulkProgramDma(
+    WDFDMATRANSACTION Transaction,
+    WDFDEVICE         Device,
+    PVOID             Context,
+    WDF_DMA_DIRECTION Direction,
+    PSCATTER_GATHER_LIST SgList)
+{
+    UNREFERENCED_PARAMETER(Transaction);
+    UNREFERENCED_PARAMETER(Device);
+    UNREFERENCED_PARAMETER(Direction);
+
+    OHCIPCI_URB_CTX    *uc = (OHCIPCI_URB_CTX *)Context;
+    OHCIPCI_EP_CONTEXT *ep = uc->EpCtx;
+    PDEVICE_CONTEXT     dc = ep->Dc;
+
+    if (SgList->NumberOfElements == 0) {
+        return FALSE;
+    }
+
+    /* Split each SG element down to PAGE_SIZE chunks aligned on page
+     * boundaries. OHCI §4.3.1.4 allows a TD's CBP→BE to straddle at most
+     * one page boundary (~8 KB max), but a SCATTER_GATHER_ELEMENT can be
+     * a long physically-contiguous run. Building one TD per multi-page
+     * element causes the HC to silently send only the first 4–8 KB
+     * (CC=NoError, no underrun) — observed as a USB-MSD CSW STALL after
+     * an apparently-successful 16896-byte WRITE_10 OUT. */
+    struct ohci_bulk_sg_page sg[OHCI_BULK_MAX_SG_PAGES];
+    uint32_t urbOff = 0;
+    ULONG    sgCount = 0;
+    for (ULONG i = 0; i < SgList->NumberOfElements; i++) {
+        uint32_t base = SgList->Elements[i].Address.LowPart;
+        ULONG    rem  = SgList->Elements[i].Length;
+        uint32_t pos  = base;
+        while (rem > 0) {
+            uint32_t pageEnd = (pos + PAGE_SIZE) & ~(PAGE_SIZE - 1u);
+            uint32_t chunk   = pageEnd - pos;
+            if (chunk > rem) chunk = rem;
+            if (sgCount >= OHCI_BULK_MAX_SG_PAGES) {
+                LOG("BulkProgramDma: post-split SG count exceeds %u",
+                    OHCI_BULK_MAX_SG_PAGES);
+                return FALSE;
+            }
+            sg[sgCount].phys   = pos;
+            sg[sgCount].length = chunk;
+            sg[sgCount].off    = urbOff;
+            sgCount++;
+            urbOff += chunk;
+            pos    += chunk;
+            rem    -= chunk;
+        }
+    }
+
+    /* CoreUrb's buffer_phys must yield the per-TD CBP via
+     * (buffer_phys + chunk_off). With the SG layout above, that's
+     * sg[0].phys (since sg[0].off==0). The drain accumulator uses
+     * data_tds[].chunk_off for per-TD math, so this is mainly a
+     * back-compat field. */
+    uc->CoreUrb.buffer      = NULL;
+    uc->CoreUrb.buffer_phys = sg[0].phys;
+    uc->CoreUrb.length      = urbOff;
+    uc->CoreUrb.direction   = uc->DataDirection;
+    uc->CoreUrb.complete    = OhciPci_UrbComplete;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    int rc = ohci_bulk_submit_sg(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb,
+                                  sg, sgCount);
+    WdfSpinLockRelease(dc->CoreLock);
+    if (rc != 0) {
+        LOG("BulkProgramDma: ohci_bulk_submit_sg rc=%d", rc);
+        return FALSE;
+    }
+    /* Async completion path runs OhciPci_UrbComplete; that releases the
+     * WdfDmaTransaction via WdfDmaTransactionDmaCompletedFinal. */
+    return TRUE;
+}
+
+/* --------------------------------------------------------------------------
+ * OhciPci_HandleBulkUrb
+ *
+ * Builds a WdfDmaTransaction for the caller's MDL and hands it to the HAL.
+ * The HAL deals with 32-bit address constraints (map-register bouncing) and
+ * SG fragmentation transparently — no driver-side bounce slab needed.
  * -------------------------------------------------------------------------- */
 static VOID
 OhciPci_HandleBulkUrb(
@@ -255,174 +356,43 @@ OhciPci_HandleBulkUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
-    LOG("EvtUrbBulk-SG: len=%lu dir=%s", length, isIn ? "IN" : "OUT");
-    if (!isIn && length >= 8 && bufMdl != NULL) {
-        PUCHAR sys = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl, NormalPagePriority | MdlMappingNoExecute);
-        if (sys) {
-            LOG("  OUT-VA[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X",
-                sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], sys[6], sys[7]);
-        }
-        /* Verify VA == phys content. If MDL has been re-pointed (partial
-         * MDL with different PFNs), the HC will DMA garbage. */
-        PPFN_NUMBER pfns0 = MmGetMdlPfnArray(bufMdl);
-        ULONG bo = MmGetMdlByteOffset(bufMdl);
-        PHYSICAL_ADDRESS pa;
-        pa.QuadPart = ((ULONGLONG)pfns0[0] << PAGE_SHIFT) + bo;
-        PUCHAR phys = (PUCHAR)MmMapIoSpaceEx(pa, 8, PAGE_READWRITE | PAGE_NOCACHE);
-        if (phys) {
-            LOG("  OUT-PHYS[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X (pa=0x%llX)",
-                phys[0], phys[1], phys[2], phys[3], phys[4], phys[5], phys[6], phys[7],
-                pa.QuadPart);
-            MmUnmapIoSpace(phys, 8);
-        } else {
-            LOG("  OUT-PHYS: MmMapIoSpaceEx failed (pa=0x%llX)", pa.QuadPart);
-        }
-    }
-
     if (length == 0) {
         urb->TransferBufferLength = 0;
         urb->Hdr.Status = USBD_STATUS_SUCCESS;
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
-    /* Some URBs come in with only a flat KVA buffer (no MDL). Bounce
-     * those through a 32-bit-DMA slab — we can't walk PFNs without an
-     * MDL anyway. Falls through to the no-MDL bounce branch below. */
-
-    /* Decide whether to bounce. We bounce when:
-     *   - There's no MDL (we can't walk PFNs from a flat KVA buffer)
-     *   - Any PFN is above 4 GB (OHCI is 32-bit DMA only)
-     *   - The MDL spans more pages than OHCI_BULK_MAX_SG_PAGES — bouncing
-     *     into a contiguous slab run reduces it to ceil(len/SLAB) entries
-     *     which can be smaller than pageCount when the user buffer is
-     *     poorly aligned (e.g., a 64 KB write at offset 0x40 spans 17
-     *     pages, but bounces into 16 contiguous 4 KB slabs).
-     * Otherwise we use the MDL's PFN array directly for true SG. */
-    BOOLEAN     needsBounce = (bufMdl == NULL);
-    ULONG       pageCount   = 0;
-    ULONG       byteOffset  = 0;
-    PPFN_NUMBER pfns        = NULL;
-
-    if (bufMdl != NULL) {
-        byteOffset = MmGetMdlByteOffset(bufMdl);
-        ULONG byteCount = MmGetMdlByteCount(bufMdl);
-        if (byteCount < length) length = byteCount;
-        pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
-                        (PVOID)((ULONG_PTR)MmGetMdlVirtualAddress(bufMdl) + byteOffset),
-                        length);
-        if (pageCount == 0) {
-            LOG("  rejected: pageCount=0");
+    /* WdfDmaTransactionInitialize needs an MDL. Storage class driver
+     * occasionally hands us a flat KVA buffer with no MDL (e.g. an
+     * 18-byte INQUIRY response staged in the URB itself). USB class
+     * driver buffers come from non-paged pool, so we can build a
+     * transient MDL via MmBuildMdlForNonPagedPool. Track it on uc->OurMdl
+     * so the completion path frees it. */
+    PMDL ourMdl = NULL;
+    if (bufMdl == NULL) {
+        if (bufVa == NULL) {
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
             WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
             return;
         }
-        if (pageCount > OHCI_BULK_MAX_SG_PAGES) {
-            needsBounce = TRUE;
-        }
-        pfns = MmGetMdlPfnArray(bufMdl);
-        if (!needsBounce) {
-            for (ULONG i = 0; i < pageCount; i++) {
-                if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
-                    needsBounce = TRUE;
-                    break;
-                }
-            }
-        }
-    }
-
-    struct ohci_bulk_sg_page sg[OHCI_BULK_MAX_SG_PAGES];
-    void   *bounceVa   = NULL;
-    uint32_t bouncePhys = 0;
-
-    ULONG bounceSlabs = 0;
-    if (needsBounce) {
-        bounceSlabs = (length + OHCIPCI_BOUNCE_SLAB_BYTES - 1) / OHCIPCI_BOUNCE_SLAB_BYTES;
-        if (bounceSlabs > OHCIPCI_BOUNCE_SLAB_COUNT) {
-            LOG("  rejected: bounce needs %lu slabs > pool size %u",
-                bounceSlabs, OHCIPCI_BOUNCE_SLAB_COUNT);
-            urb->TransferBufferLength = 0;
-            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
-            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-            return;
-        }
-        WdfSpinLockAcquire(dc->CoreLock);
-        bounceVa = OhciPci_BounceAllocBig(dc, bounceSlabs, &bouncePhys);
-        WdfSpinLockRelease(dc->CoreLock);
-        if (bounceVa == NULL) {
-            LOG("  rejected: no contiguous bounce run for %lu slabs", bounceSlabs);
+        ourMdl = IoAllocateMdl(bufVa, length, FALSE, FALSE, NULL);
+        if (ourMdl == NULL) {
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
             WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
             return;
         }
-        if (!isIn) {
-            PUCHAR src = NULL;
-            if (bufMdl != NULL) {
-                src = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl,
-                    NormalPagePriority | MdlMappingNoExecute);
-            } else {
-                src = (PUCHAR)bufVa;
-            }
-            if (src == NULL) {
-                WdfSpinLockAcquire(dc->CoreLock);
-                OhciPci_BounceFreeBig(dc, bounceVa, bounceSlabs);
-                WdfSpinLockRelease(dc->CoreLock);
-                urb->TransferBufferLength = 0;
-                urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
-                WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
-                return;
-            }
-            RtlCopyMemory(bounceVa, src, length);
-        }
-        /* One SG entry per slab (4 KB). Slabs are physically contiguous
-         * within the bounce pool, but breaking them up keeps each TD's
-         * CBP→BE inside the OHCI single-page-boundary limit (§4.3.1.4)
-         * without relying on the page-straddle case. */
-        ULONG remaining = length;
-        ULONG offset    = 0;
-        ULONG idx       = 0;
-        while (remaining > 0 && idx < OHCI_BULK_MAX_SG_PAGES) {
-            ULONG chunk = OHCIPCI_BOUNCE_SLAB_BYTES;
-            if (chunk > remaining) chunk = remaining;
-            sg[idx].phys   = bouncePhys + offset;
-            sg[idx].length = chunk;
-            sg[idx].off    = offset;
-            offset    += chunk;
-            remaining -= chunk;
-            idx++;
-        }
-        if (remaining > 0) {
-            LOG("  rejected: bounce chunked into >%u SG entries", OHCI_BULK_MAX_SG_PAGES);
-            WdfSpinLockAcquire(dc->CoreLock);
-            OhciPci_BounceFreeBig(dc, bounceVa, bounceSlabs);
-            WdfSpinLockRelease(dc->CoreLock);
-            urb->TransferBufferLength = 0;
-            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
-            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-            return;
-        }
-        pageCount = idx;
-    } else {
-        ULONG offInPage = byteOffset & (PAGE_SIZE - 1);
-        ULONG remaining = length;
-        ULONG urbOff    = 0;
-        for (ULONG i = 0; i < pageCount; i++) {
-            ULONG bytesThisPage = PAGE_SIZE - offInPage;
-            if (bytesThisPage > remaining) bytesThisPage = remaining;
-            sg[i].phys   = (uint32_t)((ULONGLONG)pfns[i] << PAGE_SHIFT) + offInPage;
-            sg[i].length = bytesThisPage;
-            sg[i].off    = urbOff;
-            urbOff      += bytesThisPage;
-            remaining   -= bytesThisPage;
-            offInPage    = 0;
-        }
+        MmBuildMdlForNonPagedPool(ourMdl);
+        bufMdl = ourMdl;
     }
 
+    /* Allocate per-URB context on the WDFREQUEST. */
     WDF_OBJECT_ATTRIBUTES reqAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&reqAttrs, OHCIPCI_URB_CTX);
     NTSTATUS status = WdfObjectAllocateContext(Request, &reqAttrs, NULL);
     if (!NT_SUCCESS(status)) {
+        if (ourMdl) IoFreeMdl(ourMdl);
         WdfRequestComplete(Request, status);
         return;
     }
@@ -433,48 +403,49 @@ OhciPci_HandleBulkUrb(
     uc->TransferUrb   = urb;
     uc->DataLength    = length;
     uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
-    if (bounceVa != NULL) {
-        uc->DataBounce      = bounceVa;
-        uc->DataBouncePhys  = bouncePhys;
-        uc->DataBounceSlabs = bounceSlabs;
-        uc->UserMdl         = bufMdl;
-        uc->UserVa          = (bufMdl == NULL) ? bufVa : NULL;
-    }
+    uc->OurMdl        = ourMdl;
 
-    /* buffer_phys = first chunk's phys minus its off, so the drain's
-     * "CBP - (buffer_phys + chunk_off)" arithmetic resolves correctly
-     * for every TD record in data_tds[]. */
-    uc->CoreUrb.buffer       = NULL;
-    uc->CoreUrb.buffer_phys  = sg[0].phys - sg[0].off;
-    uc->CoreUrb.length       = length;
-    uc->CoreUrb.direction    = uc->DataDirection;
-    uc->CoreUrb.complete     = OhciPci_UrbComplete;
-
-    WdfSpinLockAcquire(dc->CoreLock);
-    struct ohci_ed *bed = ep->Core.Bulk.ed;
-    uint32_t hc_ctrl_pre   = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
-    uint32_t hc_bulk_head  = dc->MmioOps.read32(dc->MmioOps.context, 0x28);
-    uint32_t hc_bulk_curr  = dc->MmioOps.read32(dc->MmioOps.context, 0x2C);
-    uint32_t hc_cmd_status = dc->MmioOps.read32(dc->MmioOps.context, 0x08);
-    LOG("  HC-pre:  HcControl=0x%08X (BLE=%u CLE=%u PLE=%u HCFS=%u) HcBulkHead=0x%08X HcBulkCurr=0x%08X HcCmdStat=0x%08X",
-        hc_ctrl_pre,
-        (hc_ctrl_pre >> 5) & 1, (hc_ctrl_pre >> 4) & 1, (hc_ctrl_pre >> 2) & 1,
-        (hc_ctrl_pre >> 6) & 3,
-        hc_bulk_head, hc_bulk_curr, hc_cmd_status);
-    LOG("  ED-pre:  Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X NextED=0x%08X (sg[0].phys=0x%08X len=%lu)",
-        bed->Control, bed->HeadP, bed->TailP, bed->NextED,
-        sg[0].phys, sg[0].length);
-    int rc = ohci_bulk_submit_sg(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb,
-                                  sg, pageCount);
-    LOG("  ED-post: Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X NextED=0x%08X",
-        bed->Control, bed->HeadP, bed->TailP, bed->NextED);
-    WdfSpinLockRelease(dc->CoreLock);
-    if (rc != 0) {
-        LOG("  bulk_submit_sg failed: rc=%d", rc);
-        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+    /* Build a WdfDmaTransaction over the caller's MDL. The HAL owns the
+     * SG mapping lifetime; we release in OhciPci_UrbComplete. */
+    WDF_OBJECT_ATTRIBUTES txnAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&txnAttrs);
+    status = WdfDmaTransactionCreate(dc->DmaEnabler, &txnAttrs,
+                                      &uc->DmaTransaction);
+    if (!NT_SUCCESS(status)) {
+        LOG("WdfDmaTransactionCreate failed: 0x%08X", status);
+        if (ourMdl) { IoFreeMdl(ourMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
         return;
     }
-    LOG("EvtUrbBulk-SG: submitted pages=%lu total=%lu", pageCount, length);
+
+    PVOID va = bufVa ? bufVa : MmGetMdlVirtualAddress(bufMdl);
+    status = WdfDmaTransactionInitialize(uc->DmaTransaction,
+                                          OhciPci_BulkProgramDma,
+                                          isIn ? WdfDmaDirectionReadFromDevice
+                                               : WdfDmaDirectionWriteToDevice,
+                                          bufMdl,
+                                          va,
+                                          length);
+    if (!NT_SUCCESS(status)) {
+        LOG("WdfDmaTransactionInitialize failed: 0x%08X", status);
+        WdfObjectDelete(uc->DmaTransaction);
+        uc->DmaTransaction = NULL;
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    /* Execute kicks off SG mapping. HAL invokes OhciPci_BulkProgramDma at
+     * DISPATCH_LEVEL, where the actual ohci_bulk_submit_sg happens. */
+    status = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
+    if (!NT_SUCCESS(status)) {
+        LOG("WdfDmaTransactionExecute failed: 0x%08X", status);
+        WdfObjectDelete(uc->DmaTransaction);
+        uc->DmaTransaction = NULL;
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
+        return;
+    }
     /* Async completion via OhciPci_UrbComplete. */
 }
 
@@ -662,7 +633,17 @@ EvtUrbDefault(
             }
         }
         if (target != NULL) {
+            /* OHCI §6.4.4: HCD must not write HeadP while the ED is on the
+             * schedule. Set K (skip) and wait one frame so the HC retires
+             * its current walk past this ED before we mutate HeadP. */
+            target->Control |= OHCI_ED_K;
+            dc->MmioOps.barrier(dc->MmioOps.context);
+            uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+            for (int i = 0; i < 10000; i++) {
+                if (dc->MmioOps.read32(dc->MmioOps.context, 0x3C) != f0) break;
+            }
             target->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
+            dc->MmioOps.barrier(dc->MmioOps.context);
             target->Control &= ~OHCI_ED_K;
             dc->MmioOps.barrier(dc->MmioOps.context);
             LOG("  CLEAR_FEATURE(HALT) ep=0x%02X addr=%u — cleared ED H+C+K",

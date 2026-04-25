@@ -52,7 +52,10 @@ struct ohci_urb {
     /* Per-data-TD records so the drain can compute urb->transferred from
      * each TD's CBP per OHCI §4.3.1.4 — replaces the Plan 6 single
      * data_td_phys, lets multi-TD Bulk SG work. */
-#define OHCI_URB_MAX_DATA_TDS 16
+/* 64 entries handles a worst-case 256 KB Bulk transfer at one TD per page,
+ * with headroom for the page-straddle case. WdfDmaTransaction will fragment
+ * larger transfers across multiple EvtProgramDma callbacks. */
+#define OHCI_URB_MAX_DATA_TDS 64
     struct ohci_urb_data_td {
         uint32_t td_phys;     /* phys of this data TD */
         uint32_t chunk_off;   /* offset within urb->buffer this TD covers */
