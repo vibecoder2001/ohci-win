@@ -75,6 +75,8 @@ Environment:
 #include <usbdi.h>
 #include "device_context.h"
 #include "ohci_control.h"
+#include "ohci_bulk.h"
+#include "ohci_interrupt.h"
 #include "ohci_urb.h"
 #include "ohci_dma.h"
 
@@ -210,6 +212,93 @@ OhciPci_UrbComplete(struct ohci_urb *u)
 }
 
 /* --------------------------------------------------------------------------
+ * OhciPci_HandleBulkOrInterruptUrb
+ *
+ * Handles URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER for non-default endpoints.
+ * Allocates one bounce slab, copies OUT data in, submits via the matching
+ * core entrypoint, completes asynchronously through OhciPci_UrbComplete.
+ * -------------------------------------------------------------------------- */
+static VOID
+OhciPci_HandleBulkOrInterruptUrb(
+    OHCIPCI_EP_CONTEXT   *ep,
+    WDFREQUEST            Request,
+    POHCIPCI_TRANSFER_URB urb)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    ULONG   length = urb->TransferBufferLength;
+    PVOID   bufVa  = urb->TransferBuffer;
+    PMDL    bufMdl = urb->TransferBufferMDL;
+    BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
+
+    LOG("EvtUrb%s: ep_kind=%d len=%lu dir=%s",
+        (ep->Kind == OhciPciEpKindBulk) ? "Bulk" : "Int",
+        ep->Kind, length, isIn ? "IN" : "OUT");
+
+    if (length == 0 || length > OHCIPCI_BOUNCE_SLAB_BYTES) {
+        urb->TransferBufferLength = 0;
+        urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    WDF_OBJECT_ATTRIBUTES reqAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&reqAttrs, OHCIPCI_URB_CTX);
+    NTSTATUS status = WdfObjectAllocateContext(Request, &reqAttrs, NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    OHCIPCI_URB_CTX *uc = OhciPci_UrbCtxGet(Request);
+    RtlZeroMemory(uc, sizeof(*uc));
+    uc->Request     = Request;
+    uc->EpCtx       = ep;
+    uc->TransferUrb = urb;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+
+    uc->DataBounce = OhciPci_BounceAlloc(dc, &uc->DataBouncePhys);
+    if (uc->DataBounce == NULL) {
+        WdfSpinLockRelease(dc->CoreLock);
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    uc->DataLength    = length;
+    uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+    uc->UserMdl       = bufMdl;
+    uc->UserVa        = bufVa;
+
+    if (!isIn) {
+        PVOID src = bufMdl
+            ? MmGetSystemAddressForMdlSafe(bufMdl, NormalPagePriority)
+            : bufVa;
+        if (src) RtlCopyMemory(uc->DataBounce, src, length);
+    }
+
+    uc->CoreUrb.buffer       = uc->DataBounce;
+    uc->CoreUrb.buffer_phys  = uc->DataBouncePhys;
+    uc->CoreUrb.length       = length;
+    uc->CoreUrb.direction    = uc->DataDirection;
+    uc->CoreUrb.complete     = OhciPci_UrbComplete;
+
+    int rc;
+    if (ep->Kind == OhciPciEpKindBulk) {
+        rc = ohci_bulk_submit(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb);
+    } else {
+        rc = ohci_interrupt_submit(&dc->Hc, &ep->Core.Interrupt, &uc->CoreUrb);
+    }
+    if (rc != 0) {
+        OhciPci_BounceFree(dc, uc->DataBounce);
+        uc->DataBounce = NULL;
+        WdfSpinLockRelease(dc->CoreLock);
+        LOG("  submit failed: rc=%d", rc);
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    WdfSpinLockRelease(dc->CoreLock);
+    /* Async completion via OhciPci_UrbComplete. */
+}
+
+/* --------------------------------------------------------------------------
  * EvtUrbDefault
  *
  * EvtIoDefault for the WDFQUEUE registered with UCX via
@@ -244,12 +333,14 @@ EvtUrbDefault(
     }
 
     USHORT fn = urb->Hdr.Function;
-    /* Plan 5: control transfers only. UCX still uses URB_FUNCTION_CONTROL_TRANSFER_EX
-     * inside the TRANSFER_URB header. */
+    if (fn == URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER) {
+        OhciPci_HandleBulkOrInterruptUrb(ep, Request, urb);
+        return;
+    }
     if (fn != URB_FUNCTION_CONTROL_TRANSFER &&
         fn != URB_FUNCTION_CONTROL_TRANSFER_EX)
     {
-        LOG("EvtUrbDefault: non-control function 0x%X — Plan 5 only handles control", fn);
+        LOG("EvtUrbDefault: unsupported function 0x%X", fn);
         WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
         return;
     }
