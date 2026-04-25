@@ -160,7 +160,10 @@ OhciPci_UrbComplete(struct ohci_urb *u)
     OHCIPCI_URB_CTX *uc =
         CONTAINING_RECORD(u, OHCIPCI_URB_CTX, CoreUrb);
 
-    /* IN data copy-back. */
+    /* IN data copy-back. If the destination map fails (low resources),
+     * we MUST NOT complete the request as success — caller would read
+     * stale memory and treat it as valid received data. Override status. */
+    BOOLEAN copyBackFailed = FALSE;
     if (uc->DataDirection == OHCI_URB_DIR_IN &&
         uc->DataLength > 0 &&
         uc->DataBounce != NULL)
@@ -173,10 +176,12 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         }
         if (dst) {
             RtlCopyMemory(dst, uc->DataBounce, uc->DataLength);
+        } else {
+            copyBackFailed = TRUE;
         }
     }
 
-    NTSTATUS status = (u->status == OHCI_URB_STATUS_OK)
+    NTSTATUS status = (u->status == OHCI_URB_STATUS_OK && !copyBackFailed)
                           ? STATUS_SUCCESS
                           : STATUS_DEVICE_DATA_ERROR;
     ULONG_PTR info = (ULONG_PTR)u->transferred;
@@ -205,7 +210,10 @@ OhciPci_UrbComplete(struct ohci_urb *u)
      * before the HC retires the TD must NOT also let this code run. */
     POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
     if (turb != NULL) {
-        turb->TransferBufferLength = u->transferred;
+        turb->TransferBufferLength = copyBackFailed ? 0 : u->transferred;
+        if (copyBackFailed) {
+            turb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
+        } else
         switch (u->status) {
         case OHCI_URB_STATUS_OK:       turb->Hdr.Status = USBD_STATUS_SUCCESS;            break;
         case OHCI_URB_STATUS_STALL:    turb->Hdr.Status = USBD_STATUS_STALL_PID;          break;
@@ -815,6 +823,36 @@ OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep)
     return NULL;
 }
 
+/* OHCI §6.4.4: HCD must not write ED.HeadP while the ED is on the
+ * schedule. Set K (skip), wait one HcFmNumber tick so the HC retires
+ * its current walk past this ED, edit HeadP via the supplied callback,
+ * then clear K. CoreLock alone is insufficient because it doesn't pause
+ * the HC's schedule walker. Caller must NOT hold CoreLock (we acquire). */
+typedef VOID (*ohcipci_headp_edit_fn)(struct ohci_ed *ed, void *ctx);
+static VOID
+OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
+                         ohcipci_headp_edit_fn edit, void *ctx)
+{
+    WdfSpinLockAcquire(dc->CoreLock);
+    ed->Control |= OHCI_ED_K;
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+    for (int i = 0; i < 10000; i++) {
+        if (dc->MmioOps.read32(dc->MmioOps.context, 0x3C) != f0) break;
+    }
+    edit(ed, ctx);
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    ed->Control &= ~OHCI_ED_K;
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    WdfSpinLockRelease(dc->CoreLock);
+}
+
+static VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    ed->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
+}
+
 /* Re-enable an EP whose ED was halted by a prior purge/abort. UCX will
  * call Start after Purge — without clearing Skip, the HC ignores the
  * ED and the next URB on it sits forever (HC never raises WDH → timeout). */
@@ -1122,14 +1160,12 @@ EvtNonDefaultEpReset(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint, WDFRE
     struct ohci_ed *ed = OhciPci_EpEd(ep);
     LOG("NonDefaultEp Reset (kind=%d) — clearing H/C toggle", ep->Kind);
     if (ed != NULL) {
-        WdfSpinLockAcquire(dc->CoreLock);
         /* USB CLEAR_FEATURE(ENDPOINT_HALT) / SET_INTERFACE resets the
          * data toggle to DATA0 on this endpoint. Mirror that in the ED:
-         * clear both H (halted) and C (toggle carry) bits in HeadP. */
-        ed->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
-        ed->Control &= ~OHCI_ED_K;
-        dc->MmioOps.barrier(dc->MmioOps.context);
-        WdfSpinLockRelease(dc->CoreLock);
+         * clear both H (halted) and C (toggle carry) bits in HeadP. Must
+         * use the K-pause dance (OHCI §6.4.4) — direct HeadP write while
+         * the ED is on the schedule corrupts Hc*CurrentED. */
+        OhciPci_EditHeadPSafely(dc, ed, OhciPci_HeadPClearHC, NULL);
     }
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
