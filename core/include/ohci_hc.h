@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 struct ohci_control_endpoint;
+struct ohci_urb;
 
 /* Software state for one OHCI controller. Zero-initialised by ohci_hc_init. */
 struct ohci_hc {
@@ -27,6 +28,10 @@ struct ohci_hc {
     /* Software-side head of the Control list (for teardown later).
      * NULL when empty. */
     struct ohci_control_endpoint *control_head;
+
+    /* Singly-linked list of URBs currently queued on any endpoint of this
+     * controller. Walked during drain_done to retire. */
+    struct ohci_urb *in_flight;
 };
 
 /* Reset the controller, allocate HCCA in the DMA region, program HcHCCA,

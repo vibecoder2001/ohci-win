@@ -41,3 +41,7 @@ add_test(NAME submit COMMAND test_submit)
 add_executable(test_fake_exec test_fake_exec.c)
 target_link_libraries(test_fake_exec PRIVATE fake_hc)
 add_test(NAME fake_exec COMMAND test_fake_exec)
+
+add_executable(test_done test_done.c)
+target_link_libraries(test_done PRIVATE fake_hc)
+add_test(NAME done COMMAND test_done)

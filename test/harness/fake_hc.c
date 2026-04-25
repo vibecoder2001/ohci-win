@@ -18,6 +18,12 @@ static void write32(void *ctx, uint32_t offset, uint32_t value) {
          * completed reset. */
         value &= ~OHCI_CMD_HCR;
     }
+    if (offset == 0x0C /* HcInterruptStatus — W1C */) {
+        uint32_t cur;
+        memcpy(&cur, hc->regs + offset, sizeof(cur));
+        /* Writing a 1 clears the corresponding bit. */
+        value = cur & ~value;
+    }
     memcpy(hc->regs + offset, &value, sizeof(value));
 }
 

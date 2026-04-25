@@ -63,6 +63,15 @@ int ohci_control_submit(struct ohci_hc *hc,
                         struct ohci_control_endpoint *ep,
                         struct ohci_urb *urb);
 
+/* Poll the HC's done queue. If WDH is set in HcInterruptStatus, snapshot
+ * HCCA.DoneHead, clear both, walk the retired TDs in LIFO order,
+ * aggregate completion status per URB, and call urb->complete on the
+ * URBs that have fully completed. TDs are returned to the TD pool.
+ *
+ * This is what Plan 3's ISR DPC will call; for Tier-1 tests, the harness
+ * invokes it directly after fake_hc_exec_step. */
+void ohci_control_drain_done(struct ohci_hc *hc);
+
 #ifdef __cplusplus
 }
 #endif

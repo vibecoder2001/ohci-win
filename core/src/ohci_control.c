@@ -193,5 +193,94 @@ int ohci_control_submit(struct ohci_hc *hc,
     /* Doorbell: HcCommandStatus.CLF = 1 signals the HC to walk the list. */
     hc->ops.barrier(hc->ops.context);
     hc->ops.write32(hc->ops.context, 0x08 /* HcCommandStatus */, OHCI_CMD_CLF);
+
+    /* Track this URB as in-flight. */
+    urb->next_pending = hc->in_flight;
+    hc->in_flight = urb;
     return 0;
+}
+
+static int cc_to_urb_status(uint8_t cc) {
+    switch (cc) {
+    case OHCI_CC_NOERROR:             return OHCI_URB_STATUS_OK;
+    case OHCI_CC_STALL:               return OHCI_URB_STATUS_STALL;
+    case OHCI_CC_CRC:                 return OHCI_URB_STATUS_CRC;
+    case OHCI_CC_DEVICENOTRESPONDING: return OHCI_URB_STATUS_TIMEOUT;
+    case OHCI_CC_DATAOVERRUN:
+    case OHCI_CC_BUFFEROVERRUN:       return OHCI_URB_STATUS_OVERRUN;
+    case OHCI_CC_DATAUNDERRUN:
+    case OHCI_CC_BUFFERUNDERRUN:      return OHCI_URB_STATUS_UNDERRUN;
+    default:                          return OHCI_URB_STATUS_OTHER;
+    }
+}
+
+/* Match retired TDs against URBs by their tail (STATUS) TD phys —
+ * that TD is unique per live URB and its slot stays allocated until
+ * we free it below. */
+static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
+                                         int remove) {
+    struct ohci_urb *prev = NULL, *u = hc->in_flight;
+    while (u) {
+        if (u->tail_td) {
+            uint32_t tail_phys = hc->dma->phys_base +
+                (uint32_t)((uint8_t*)u->tail_td - hc->dma->base);
+            if (tail_phys == td_phys) {
+                if (remove) {
+                    if (prev) prev->next_pending = u->next_pending;
+                    else      hc->in_flight = u->next_pending;
+                }
+                return u;
+            }
+        }
+        prev = u;
+        u = u->next_pending;
+    }
+    return NULL;
+}
+
+void ohci_control_drain_done(struct ohci_hc *hc) {
+    uint32_t istat = hc->ops.read32(hc->ops.context, 0x0C /* HcInterruptStatus */);
+    if (!(istat & OHCI_INT_WDH)) return;
+
+    /* Snapshot + clear DoneHead. */
+    uint32_t done_head = hc->hcca->DoneHead;
+    hc->hcca->DoneHead = 0;
+    /* Clear WDH (W1C). */
+    hc->ops.write32(hc->ops.context, 0x0C, OHCI_INT_WDH);
+
+    /* Reverse DoneHead (HC writes it LIFO; we want FIFO processing). */
+    uint32_t reversed = 0;
+    uint32_t cur = done_head;
+    while (cur) {
+        struct ohci_td *td = ohci_dma_virt_from_phys(hc->dma, cur);
+        if (!td) break;
+        uint32_t next = td->NextTD;
+        td->NextTD = reversed;
+        reversed = cur;
+        cur = next;
+    }
+
+    /* Walk in FIFO order. For each TD, find its URB (by matching the
+     * URB's tail_td phys), accumulate status, complete the URB when we
+     * hit its tail_td. Intermediate TDs don't match any URB's tail so
+     * they're silently freed. */
+    cur = reversed;
+    while (cur) {
+        struct ohci_td *td = ohci_dma_virt_from_phys(hc->dma, cur);
+        if (!td) break;
+        uint32_t next = td->NextTD;
+
+        uint8_t cc = (td->Control >> OHCI_TD_CC_SHIFT) & 0xF;
+        int s = cc_to_urb_status(cc);
+
+        /* STATUS TD match triggers URB completion. */
+        struct ohci_urb *u = urb_for_td_phys(hc, cur, /*remove=*/1);
+        if (u) {
+            if (u->status == OHCI_URB_STATUS_PENDING) u->status = s;
+            if (u->complete) u->complete(u);
+        }
+
+        ohci_td_pool_free(&hc->td_pool, td);
+        cur = next;
+    }
 }

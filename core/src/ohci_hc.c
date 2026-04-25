@@ -37,6 +37,7 @@ int ohci_hc_init(struct ohci_hc *hc,
     hc->dma = dma;
     if (ohci_td_pool_init(&hc->td_pool, dma, td_pool_size) != 0) return OHCI_ERR_NOMEM;
     hc->control_head = NULL;
+    hc->in_flight = NULL;
 
     /* 1) Reset: write HCR, wait for hardware to clear it. The fake HC
      * clears it synchronously; real hardware typically < 10 µs. */
