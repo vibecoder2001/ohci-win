@@ -5,6 +5,8 @@
 #include "ohci_pool.h"
 #include "ohci_dma.h"
 
+#define OHCI_MAX_TD_BYTES 4096u  /* one 4 KB page per TD: safe, simple */
+
 static void ed_set_bulk(struct ohci_ed *ed,
                         const struct ohci_bulk_endpoint_config *cfg) {
     uint32_t c = 0;
@@ -79,36 +81,90 @@ int ohci_bulk_submit(struct ohci_hc *hc,
     urb->transferred = 0;
     urb->ed          = ep->ed;
 
-    /* Build single data TD; chain it with a new placeholder. */
-    uint32_t data_td_phys;
-    struct ohci_td *data_td = build_bulk_data_td(&hc->td_pool,
-        urb->buffer_phys, urb->length, &data_td_phys);
-    if (!data_td) return -1;
+    /* Build one or more data TDs covering the URB buffer. Each TD carries
+     * up to OHCI_MAX_TD_BYTES. Chain them via NextTD; the LAST TD's
+     * NextTD gets set to the new placeholder below. */
+    struct ohci_td *first_td      = NULL;
+    struct ohci_td *last_td       = NULL;
+    uint32_t first_td_phys = 0;
+    uint32_t last_td_phys  = 0;
+    uint32_t remaining = urb->length;
+    uint32_t offset    = 0;
+
+    while (remaining) {
+        uint32_t chunk = remaining > OHCI_MAX_TD_BYTES ? OHCI_MAX_TD_BYTES : remaining;
+        uint32_t td_phys;
+        struct ohci_td *td = build_bulk_data_td(&hc->td_pool,
+            urb->buffer_phys + offset, chunk, &td_phys);
+        if (!td) {
+            /* Roll back: free all TDs we allocated so far. */
+            struct ohci_td *t = first_td;
+            while (t) {
+                uint32_t n_phys = t->NextTD;
+                ohci_td_pool_free(&hc->td_pool, t);
+                if (t == last_td) break;
+                t = n_phys ? ohci_dma_virt_from_phys(hc->dma, n_phys) : NULL;
+            }
+            return -1;
+        }
+        if (!first_td) {
+            first_td      = td;
+            first_td_phys = td_phys;
+        } else {
+            last_td->NextTD = td_phys;
+        }
+        last_td      = td;
+        last_td_phys = td_phys;
+        offset    += chunk;
+        remaining -= chunk;
+    }
+    (void)first_td_phys;  /* Not needed after folding; suppress warning. */
 
     uint32_t new_ph_phys;
     struct ohci_td *new_ph = ohci_td_pool_alloc(&hc->td_pool, &new_ph_phys);
     if (!new_ph) {
-        ohci_td_pool_free(&hc->td_pool, data_td);
+        struct ohci_td *t = first_td;
+        while (t) {
+            uint32_t n_phys = t->NextTD;
+            ohci_td_pool_free(&hc->td_pool, t);
+            if (t == last_td) break;
+            t = n_phys ? ohci_dma_virt_from_phys(hc->dma, n_phys) : NULL;
+        }
         return -1;
     }
 
     uint32_t head_td_phys = ep->tail_placeholder_phys;
 
-    /* Fold data_td into the old placeholder; point the data TD's
-     * NextTD at the new placeholder. */
-    *ep->tail_placeholder = *data_td;
-    ep->tail_placeholder->NextTD = new_ph_phys;
-    ohci_td_pool_free(&hc->td_pool, data_td);
+    /* Fold FIRST TD into the old placeholder. The rest of the chain
+     * (if any) is already in pool slots reachable via NextTD. */
+    *ep->tail_placeholder = *first_td;
+    ohci_td_pool_free(&hc->td_pool, first_td);
+
+    /* Point last TD's NextTD at the new placeholder. If there's only one
+     * data TD (first == last), last_td was freed above — but its phys slot
+     * (its pool entry) was the same as first_td. After freeing, we no
+     * longer have a valid `last_td` virtual pointer. Special-case it: */
+    if (last_td == first_td) {
+        /* Single-TD chain: the data now lives in the old placeholder.
+         * Update the placeholder's NextTD to the new placeholder. */
+        ep->tail_placeholder->NextTD = new_ph_phys;
+        /* tail_td for drain matching = the data TD at head_td_phys. */
+    } else {
+        /* Multi-TD chain: last_td still lives in its pool slot (not freed),
+         * and its NextTD field is currently 0 from build_bulk_data_td.
+         * Point it at the new placeholder. */
+        last_td->NextTD = new_ph_phys;
+    }
 
     ep->tail_placeholder      = new_ph;
     ep->tail_placeholder_phys = new_ph_phys;
 
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
-    /* Drain matches by URB tail_td phys. For a single-TD Bulk URB the
-     * "tail" is that one data TD — which now lives in the old placeholder
-     * slot (at head_td_phys) after the in-place swap. Task 4 (SG) will
-     * point tail_td at the LAST data TD when the chain has multiple. */
-    urb->tail_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
+    /* tail_td is the last data TD the drain will see retired. For single-TD
+     * chains that's the old placeholder slot; for multi-TD it's last_td. */
+    urb->tail_td = (last_td == first_td)
+        ? ohci_dma_virt_from_phys(hc->dma, head_td_phys)
+        : ohci_dma_virt_from_phys(hc->dma, last_td_phys);
 
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
@@ -116,7 +172,6 @@ int ohci_bulk_submit(struct ohci_hc *hc,
     hc->ops.barrier(hc->ops.context);
     hc->ops.write32(hc->ops.context, 0x08 /* HcCommandStatus */, OHCI_CMD_BLF);
 
-    /* Track in-flight. */
     urb->next_pending = hc->in_flight;
     hc->in_flight = urb;
     return 0;

@@ -57,3 +57,7 @@ add_test(NAME bulk_list COMMAND test_bulk_list)
 add_executable(test_bulk test_bulk.c)
 target_link_libraries(test_bulk PRIVATE fake_hc)
 add_test(NAME bulk COMMAND test_bulk)
+
+add_executable(test_bulk_sg test_bulk_sg.c)
+target_link_libraries(test_bulk_sg PRIVATE fake_hc)
+add_test(NAME bulk_sg COMMAND test_bulk_sg)

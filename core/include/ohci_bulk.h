@@ -33,8 +33,9 @@ int ohci_bulk_endpoint_create(struct ohci_hc *hc,
                               const struct ohci_bulk_endpoint_config *cfg,
                               struct ohci_bulk_endpoint *ep);
 
-/* Submit a Bulk URB. Single data TD in this task (SG is Task 4).
- * urb->direction is ignored for Bulk — direction comes from the ED. */
+/* Submit a Bulk URB. Splits the URB buffer into one or more General TDs
+ * each covering at most 4 KB, chained via NextTD. urb->direction is
+ * ignored for Bulk — direction comes from the ED. */
 int ohci_bulk_submit(struct ohci_hc *hc,
                      struct ohci_bulk_endpoint *ep,
                      struct ohci_urb *urb);
