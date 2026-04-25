@@ -40,6 +40,25 @@ int ohci_bulk_submit(struct ohci_hc *hc,
                      struct ohci_bulk_endpoint *ep,
                      struct ohci_urb *urb);
 
+/* Per-page descriptor for SG submit. The caller fills one of these per
+ * physically-contiguous page (typically obtained by walking an MDL). */
+struct ohci_bulk_sg_page {
+    uint32_t phys;     /* physical base address of this page chunk */
+    uint32_t length;   /* bytes to transfer within this page (≤ PAGE_SIZE) */
+    uint32_t off;      /* offset of this chunk within the overall URB */
+};
+
+#define OHCI_BULK_MAX_SG_PAGES OHCI_URB_MAX_DATA_TDS
+
+/* Submit a Bulk URB across an SG page list. One TD per page; each TD
+ * carries DI=7 except the last which gets DI=0 to fire WDH on completion.
+ * urb->length must equal sum(pages[].length). */
+int ohci_bulk_submit_sg(struct ohci_hc *hc,
+                        struct ohci_bulk_endpoint *ep,
+                        struct ohci_urb *urb,
+                        const struct ohci_bulk_sg_page *pages,
+                        unsigned page_count);
+
 void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
                                 struct ohci_bulk_endpoint *ep);
 

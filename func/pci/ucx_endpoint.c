@@ -225,7 +225,7 @@ OhciPci_UrbComplete(struct ohci_urb *u)
  * core entrypoint, completes asynchronously through OhciPci_UrbComplete.
  * -------------------------------------------------------------------------- */
 static VOID
-OhciPci_HandleBulkOrInterruptUrb(
+OhciPci_HandleBulkUrb(
     OHCIPCI_EP_CONTEXT   *ep,
     WDFREQUEST            Request,
     POHCIPCI_TRANSFER_URB urb)
@@ -236,9 +236,108 @@ OhciPci_HandleBulkOrInterruptUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
-    LOG("EvtUrb%s: ep_kind=%d len=%lu dir=%s",
-        (ep->Kind == OhciPciEpKindBulk) ? "Bulk" : "Int",
-        ep->Kind, length, isIn ? "IN" : "OUT");
+    LOG("EvtUrbBulk-SG: len=%lu dir=%s", length, isIn ? "IN" : "OUT");
+
+    if (length == 0) {
+        urb->TransferBufferLength = 0;
+        urb->Hdr.Status = USBD_STATUS_SUCCESS;
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+    }
+    if (bufMdl == NULL) {
+        LOG("  rejected: Bulk SG path requires MDL");
+        urb->TransferBufferLength = 0;
+        urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    UNREFERENCED_PARAMETER(bufVa);
+
+    /* Walk the MDL into per-page SG entries. OHCI lets a TD straddle one
+     * page boundary but the simpler "one TD per page" rule keeps the math
+     * obvious and matches the OHCI_URB_MAX_DATA_TDS cap. */
+    ULONG byteOffset = MmGetMdlByteOffset(bufMdl);
+    ULONG byteCount  = MmGetMdlByteCount(bufMdl);
+    if (byteCount < length) length = byteCount;
+    ULONG pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
+                          (PVOID)((ULONG_PTR)MmGetMdlVirtualAddress(bufMdl) + byteOffset),
+                          length);
+    if (pageCount == 0 || pageCount > OHCI_BULK_MAX_SG_PAGES) {
+        LOG("  rejected: pageCount=%lu (cap=%u)", pageCount, OHCI_BULK_MAX_SG_PAGES);
+        urb->TransferBufferLength = 0;
+        urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    struct ohci_bulk_sg_page sg[OHCI_BULK_MAX_SG_PAGES];
+    PPFN_NUMBER pfns = MmGetMdlPfnArray(bufMdl);
+    ULONG offInPage = byteOffset & (PAGE_SIZE - 1);
+    ULONG remaining = length;
+    ULONG urbOff    = 0;
+    for (ULONG i = 0; i < pageCount; i++) {
+        ULONG bytesThisPage = PAGE_SIZE - offInPage;
+        if (bytesThisPage > remaining) bytesThisPage = remaining;
+        sg[i].phys   = (uint32_t)((ULONGLONG)pfns[i] << PAGE_SHIFT) + offInPage;
+        sg[i].length = bytesThisPage;
+        sg[i].off    = urbOff;
+        urbOff      += bytesThisPage;
+        remaining   -= bytesThisPage;
+        offInPage    = 0;
+    }
+
+    WDF_OBJECT_ATTRIBUTES reqAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&reqAttrs, OHCIPCI_URB_CTX);
+    NTSTATUS status = WdfObjectAllocateContext(Request, &reqAttrs, NULL);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    OHCIPCI_URB_CTX *uc = OhciPci_UrbCtxGet(Request);
+    RtlZeroMemory(uc, sizeof(*uc));
+    uc->Request       = Request;
+    uc->EpCtx         = ep;
+    uc->TransferUrb   = urb;
+    uc->DataLength    = length;
+    uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+    /* No bounce — DataBounce stays NULL so OhciPci_UrbComplete skips
+     * the IN copy-back and the bounce-free entirely. */
+
+    /* buffer_phys = first chunk's phys minus its off, so the drain's
+     * "CBP - (buffer_phys + chunk_off)" arithmetic resolves correctly
+     * for every TD record in data_tds[]. */
+    uc->CoreUrb.buffer       = NULL;
+    uc->CoreUrb.buffer_phys  = sg[0].phys - sg[0].off;
+    uc->CoreUrb.length       = length;
+    uc->CoreUrb.direction    = uc->DataDirection;
+    uc->CoreUrb.complete     = OhciPci_UrbComplete;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    int rc = ohci_bulk_submit_sg(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb,
+                                  sg, pageCount);
+    WdfSpinLockRelease(dc->CoreLock);
+    if (rc != 0) {
+        LOG("  bulk_submit_sg failed: rc=%d", rc);
+        WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    LOG("EvtUrbBulk-SG: submitted pages=%lu total=%lu", pageCount, length);
+    /* Async completion via OhciPci_UrbComplete. */
+}
+
+static VOID
+OhciPci_HandleInterruptUrb(
+    OHCIPCI_EP_CONTEXT   *ep,
+    WDFREQUEST            Request,
+    POHCIPCI_TRANSFER_URB urb)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    ULONG   length = urb->TransferBufferLength;
+    PVOID   bufVa  = urb->TransferBuffer;
+    PMDL    bufMdl = urb->TransferBufferMDL;
+    BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
+
+    LOG("EvtUrbInt: len=%lu dir=%s", length, isIn ? "IN" : "OUT");
 
     if (length == 0 || length > OHCIPCI_BOUNCE_SLAB_BYTES) {
         urb->TransferBufferLength = 0;
@@ -286,12 +385,7 @@ OhciPci_HandleBulkOrInterruptUrb(
     uc->CoreUrb.direction    = uc->DataDirection;
     uc->CoreUrb.complete     = OhciPci_UrbComplete;
 
-    int rc;
-    if (ep->Kind == OhciPciEpKindBulk) {
-        rc = ohci_bulk_submit(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb);
-    } else {
-        rc = ohci_interrupt_submit(&dc->Hc, &ep->Core.Interrupt, &uc->CoreUrb);
-    }
+    int rc = ohci_interrupt_submit(&dc->Hc, &ep->Core.Interrupt, &uc->CoreUrb);
     if (rc != 0) {
         OhciPci_BounceFree(dc, uc->DataBounce);
         uc->DataBounce = NULL;
@@ -302,6 +396,19 @@ OhciPci_HandleBulkOrInterruptUrb(
     }
     WdfSpinLockRelease(dc->CoreLock);
     /* Async completion via OhciPci_UrbComplete. */
+}
+
+static VOID
+OhciPci_HandleBulkOrInterruptUrb(
+    OHCIPCI_EP_CONTEXT   *ep,
+    WDFREQUEST            Request,
+    POHCIPCI_TRANSFER_URB urb)
+{
+    if (ep->Kind == OhciPciEpKindBulk) {
+        OhciPci_HandleBulkUrb(ep, Request, urb);
+    } else {
+        OhciPci_HandleInterruptUrb(ep, Request, urb);
+    }
 }
 
 /* --------------------------------------------------------------------------

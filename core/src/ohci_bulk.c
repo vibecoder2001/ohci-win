@@ -210,6 +210,115 @@ int ohci_bulk_submit(struct ohci_hc *hc,
     return 0;
 }
 
+int ohci_bulk_submit_sg(struct ohci_hc *hc,
+                        struct ohci_bulk_endpoint *ep,
+                        struct ohci_urb *urb,
+                        const struct ohci_bulk_sg_page *pages,
+                        unsigned page_count) {
+    if (page_count == 0 || page_count > OHCI_BULK_MAX_SG_PAGES) return -1;
+
+    urb->status        = OHCI_URB_STATUS_PENDING;
+    urb->transferred   = 0;
+    urb->ed            = ep->ed;
+    urb->data_td_count = 0;
+
+    struct ohci_td *first_td = NULL, *last_td = NULL;
+    uint32_t first_td_phys = 0, last_td_phys = 0;
+
+    for (unsigned i = 0; i < page_count; i++) {
+        if (pages[i].length == 0) continue;
+        uint32_t td_phys;
+        struct ohci_td *td = ohci_td_pool_alloc(&hc->td_pool, &td_phys);
+        if (!td) {
+            struct ohci_td *t = first_td;
+            while (t) {
+                uint32_t n = t->NextTD;
+                ohci_td_pool_free(&hc->td_pool, t);
+                if (t == last_td) break;
+                t = n ? ohci_dma_virt_from_phys(hc->dma, n) : NULL;
+            }
+            return -1;
+        }
+        uint32_t ctrl = OHCI_TD_DI_NO_INTR | OHCI_TD_T_FROM_ED | OHCI_TD_R;
+        ctrl |= (OHCI_CC_NOTACCESSED << OHCI_TD_CC_SHIFT);
+        td->Control = ctrl;
+        td->CBP     = pages[i].phys;
+        td->BE      = pages[i].phys + pages[i].length - 1;
+        td->NextTD  = 0;
+        if (!first_td) {
+            first_td      = td;
+            first_td_phys = td_phys;
+        } else {
+            last_td->NextTD = td_phys;
+        }
+        last_td      = td;
+        last_td_phys = td_phys;
+
+        urb->data_tds[urb->data_td_count].td_phys   = td_phys;
+        urb->data_tds[urb->data_td_count].chunk_off = pages[i].off;
+        urb->data_tds[urb->data_td_count].chunk_len = pages[i].length;
+        urb->data_td_count++;
+    }
+    if (!first_td) return -1;
+    (void)first_td_phys;
+
+    uint32_t new_ph_phys;
+    struct ohci_td *new_ph = ohci_td_pool_alloc(&hc->td_pool, &new_ph_phys);
+    if (!new_ph) {
+        struct ohci_td *t = first_td;
+        while (t) {
+            uint32_t n = t->NextTD;
+            ohci_td_pool_free(&hc->td_pool, t);
+            if (t == last_td) break;
+            t = n ? ohci_dma_virt_from_phys(hc->dma, n) : NULL;
+        }
+        return -1;
+    }
+    memset(new_ph, 0, sizeof(*new_ph));
+
+    uint32_t head_td_phys = ep->tail_placeholder_phys;
+
+    /* Fold first_td into the existing placeholder so ED.HeadP still
+     * points at a live TD. */
+    *ep->tail_placeholder = *first_td;
+    ohci_td_pool_free(&hc->td_pool, first_td);
+    if (last_td == first_td) {
+        ep->tail_placeholder->NextTD = new_ph_phys;
+    } else {
+        last_td->NextTD = new_ph_phys;
+    }
+
+    /* Patch the first TD record: its physical address is now the
+     * placeholder's slot (head_td_phys), not the freed pool slot. */
+    urb->data_tds[0].td_phys = head_td_phys;
+
+    ep->tail_placeholder      = new_ph;
+    ep->tail_placeholder_phys = new_ph_phys;
+
+    urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
+    urb->tail_td = (last_td == first_td)
+        ? ohci_dma_virt_from_phys(hc->dma, head_td_phys)
+        : ohci_dma_virt_from_phys(hc->dma, last_td_phys);
+
+    /* Last TD must IOC so WDH fires when the chain completes. */
+    if (last_td == first_td) {
+        ep->tail_placeholder->Control =
+            (ep->tail_placeholder->Control & ~OHCI_TD_DI_MASK) | OHCI_TD_DI_IMMEDIATE;
+    } else {
+        last_td->Control =
+            (last_td->Control & ~OHCI_TD_DI_MASK) | OHCI_TD_DI_IMMEDIATE;
+    }
+
+    hc->ops.barrier(hc->ops.context);
+    ep->ed->TailP = new_ph_phys;
+    hc->ops.barrier(hc->ops.context);
+    hc->ops.write32(hc->ops.context, 0x08, OHCI_CMD_BLF);
+
+    urb->next_pending = hc->in_flight;
+    hc->in_flight     = urb;
+    return 0;
+}
+
 void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
                                 struct ohci_bulk_endpoint *ep) {
     ep->ed->Control |= OHCI_ED_K;
