@@ -326,7 +326,7 @@ EvtUrbDefault(
     uc->CoreUrb.direction   = uc->DataDirection;
     uc->CoreUrb.complete    = OhciPci_UrbComplete;
 
-    int rc = ohci_control_submit(&dc->Hc, &ep->Core, &uc->CoreUrb);
+    int rc = ohci_control_submit(&dc->Hc, &ep->Core.Control, &uc->CoreUrb);
     if (rc != 0) {
         if (uc->SetupBounce) OhciPci_BounceFree(dc, uc->SetupBounce);
         if (uc->DataBounce)  OhciPci_BounceFree(dc, uc->DataBounce);
@@ -531,7 +531,8 @@ OhciPci_DefaultEndpointAdd(
     LOG("DefaultEndpointAdd: low_speed=%u (PendingDeviceSpeed=%d)",
         cfg.low_speed, (int)ep->Dc->PendingDeviceSpeed);
 
-    int rc = ohci_control_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core);
+    ep->Kind = OhciPciEpKindControl;
+    int rc = ohci_control_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core.Control);
     if (rc != 0) {
         LOG("ohci_control_endpoint_create failed: %d", rc);
         return STATUS_INSUFFICIENT_RESOURCES;

@@ -8,6 +8,8 @@
 #include "ohci_dma.h"
 #include "ohci_hc.h"
 #include "ohci_control.h"
+#include "ohci_bulk.h"
+#include "ohci_interrupt.h"
 #include "ohci_urb.h"
 
 /* Bounce buffer pool sized for Plan 5 enumeration workload:
@@ -76,11 +78,22 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
  * requires a single-token type so we use a typedef'd name.
  * For the default (EP0) endpoint, Core holds the OHCI control endpoint state.
  * -------------------------------------------------------------------------- */
+typedef enum _OHCIPCI_EP_KIND {
+    OhciPciEpKindControl   = 0,
+    OhciPciEpKindBulk      = 1,
+    OhciPciEpKindInterrupt = 2,
+} OHCIPCI_EP_KIND;
+
 typedef struct _OHCIPCI_EP_CONTEXT {
     PDEVICE_CONTEXT              Dc;        /* back-pointer to device context  */
-    UCXENDPOINT                  UcxEp;    /* the endpoint handle itself       */
+    UCXENDPOINT                  UcxEp;     /* the endpoint handle itself      */
     WDFQUEUE                     UrbQueue;  /* queue UCX delivers URBs to      */
-    struct ohci_control_endpoint Core;      /* OHCI core EP state              */
+    OHCIPCI_EP_KIND              Kind;      /* discriminator for Core union    */
+    union {
+        struct ohci_control_endpoint   Control;
+        struct ohci_bulk_endpoint      Bulk;
+        struct ohci_interrupt_endpoint Interrupt;
+    } Core;                                  /* OHCI core EP state             */
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_EP_CONTEXT, OhciPci_EpContextGet)
