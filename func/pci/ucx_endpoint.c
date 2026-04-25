@@ -935,7 +935,12 @@ OhciPci_EndpointAdd(
         icfg.max_packet_size      = mps;
         icfg.direction            = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
         icfg.low_speed            = lowSpeed;
-        icfg.poll_interval_frames = 32; /* Plan 6: always 32ms slot */
+        /* USB §9.6.6: for full/low-speed Interrupt, bInterval is the period
+         * in frames (1..255). Plan 7 picker rounds down to nearest power of
+         * two in [1, 32]. bInterval=0 is illegal but defensive-default to 32. */
+        UCHAR bInterval = Desc->bInterval;
+        if (bInterval == 0) bInterval = 32;
+        icfg.poll_interval_frames = bInterval;
         WdfSpinLockAcquire(ep->Dc->CoreLock);
         rc = ohci_interrupt_endpoint_create(&ep->Dc->Hc, &icfg, &ep->Core.Interrupt);
         WdfSpinLockRelease(ep->Dc->CoreLock);

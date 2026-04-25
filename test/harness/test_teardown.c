@@ -46,20 +46,28 @@ int main(void) {
         fprintf(stderr,"FAIL: bulk head not cleared\n"); return 1;
     }
 
-    /* Interrupt endpoint: InterruptTable slot returns to pointing at
-     * the skeleton leaf after destroy. */
+    /* Interrupt endpoint (Plan 7): user ED attaches as skeleton-ED's
+     * NextED head, not directly into HCCA.InterruptTable. After destroy
+     * the skeleton ED's NextED returns to its previous value (0 for the
+     * first attached EP). HCCA[i] never moves off the skeleton phys. */
     struct ohci_interrupt_endpoint iep;
     struct ohci_interrupt_endpoint_config icfg = { .func_addr=2, .ep_num=1,
         .max_packet_size=8, .direction=OHCI_URB_DIR_IN,
         .poll_interval_frames=32 };
+    /* Snapshot the skeleton ED's NextED before insert — for a leaf this is
+     * the level-1 skeleton ED phys per build_interrupt_skeleton, not 0. */
     ohci_interrupt_endpoint_create(&hc, &icfg, &iep);
-    uint8_t slot = iep.slot_index;
-    if (hc.hcca->InterruptTable[slot] != iep.ed_phys) {
-        fprintf(stderr,"FAIL: int slot not set\n"); return 1;
+    uint8_t skel_idx = iep.slot_index;
+    uint32_t saved_next = iep.ed->NextED;   /* what skel_ed->NextED was before insert */
+    if (hc.interrupt_skeleton[skel_idx]->NextED != iep.ed_phys) {
+        fprintf(stderr,"FAIL: skeleton[%u]->NextED != ep.ed_phys\n", skel_idx);
+        return 1;
     }
     ohci_interrupt_endpoint_destroy(&hc, &iep);
-    if (hc.hcca->InterruptTable[slot] != hc.interrupt_skeleton_phys[slot]) {
-        fprintf(stderr,"FAIL: int slot not restored to skeleton\n"); return 1;
+    if (hc.interrupt_skeleton[skel_idx]->NextED != saved_next) {
+        fprintf(stderr,"FAIL: skeleton[%u]->NextED=0x%x not restored to 0x%x\n",
+                skel_idx, hc.interrupt_skeleton[skel_idx]->NextED, saved_next);
+        return 1;
     }
 
     /* Pool reuse check. */

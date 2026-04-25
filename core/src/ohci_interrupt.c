@@ -17,17 +17,45 @@ static void ed_set_interrupt(struct ohci_ed *ed,
     ed->Control = c;
 }
 
-static uint8_t pick_slot_32ms(struct ohci_hc *hc) {
-    uint8_t count = 0;
-    struct ohci_interrupt_endpoint *e = hc->interrupt_head;
-    while (e) { count++; e = e->next; }
-    return count & 31;
+/* Round requested interval DOWN to nearest power of 2 in [1,32], return
+ * skeleton level (0..5) where period = 32 / (1 << level):
+ *   interval >= 32 -> level 0 (period 32 frames)
+ *   interval >= 16 -> level 1
+ *   interval >= 8  -> level 2
+ *   interval >= 4  -> level 3
+ *   interval >= 2  -> level 4
+ *   else           -> level 5 (period 1 frame)
+ */
+static uint8_t level_for_interval(uint16_t interval_frames) {
+    if (interval_frames == 0) interval_frames = 1;
+    uint16_t p = 1;
+    while ((p << 1) <= interval_frames && (p << 1) <= 32) p <<= 1;
+    switch (p) {
+    case 32: return 0;
+    case 16: return 1;
+    case  8: return 2;
+    case  4: return 3;
+    case  2: return 4;
+    default: return 5;   /* p == 1 */
+    }
+}
+
+/* Skeleton index for the start of each level, per build_interrupt_skeleton:
+ *   level 0: leaves [ 0..31] (start  0)
+ *   level 1:        [32..47] (start 32)
+ *   level 2:        [48..55] (start 48)
+ *   level 3:        [56..59] (start 56)
+ *   level 4:        [60..61] (start 60)
+ *   level 5: root   [62..62] (start 62)
+ */
+static int skeleton_index_for_level(uint8_t level) {
+    static const int starts[6] = { 0, 32, 48, 56, 60, 62 };
+    return starts[level];
 }
 
 int ohci_interrupt_endpoint_create(struct ohci_hc *hc,
                                    const struct ohci_interrupt_endpoint_config *cfg,
                                    struct ohci_interrupt_endpoint *ep) {
-    if (cfg->poll_interval_frames != 32) return -1;
 
     uint32_t ed_phys, ph_phys;
     struct ohci_ed *ed = ohci_ed_pool_alloc(&hc->interrupt_ed_pool, &ed_phys);
@@ -42,20 +70,23 @@ int ohci_interrupt_endpoint_create(struct ohci_hc *hc,
     ed->HeadP  = ph_phys;
     ed->TailP  = ph_phys;
 
-    uint8_t slot = pick_slot_32ms(hc);
-    /* Insert at head of the slot chain: ep.NextED = current slot head;
-     * HCCA.InterruptTable[slot] = ep_phys. The previous chain still leads
-     * down through the skeleton (or through another user endpoint). */
-    ed->NextED = hc->hcca->InterruptTable[slot];
-    hc->hcca->InterruptTable[slot] = ed_phys;
+    uint8_t level    = level_for_interval(cfg->poll_interval_frames);
+    int     skel_idx = skeleton_index_for_level(level);
+    struct ohci_ed *skel_ed = hc->interrupt_skeleton[skel_idx];
+
+    /* Insert user ED at the head of skel_ed's NextED chain. The HC reaches
+     * skel_ed via HCCA[i] -> ... -> skel_ed once every (32 >> level) frames
+     * by skeleton design (build_interrupt_skeleton). */
+    ed->NextED      = skel_ed->NextED;
+    skel_ed->NextED = ed_phys;
 
     ep->ed                    = ed;
     ep->ed_phys               = ed_phys;
     ep->tail_placeholder      = ph;
     ep->tail_placeholder_phys = ph_phys;
     ep->direction             = cfg->direction;
-    ep->slot_index            = slot;
-    ep->poll_interval_frames  = cfg->poll_interval_frames;
+    ep->slot_index            = (uint8_t)skel_idx;     /* repurposed: skeleton slot */
+    ep->poll_interval_frames  = (uint16_t)(32u >> level);
 
     ep->next = hc->interrupt_head;
     hc->interrupt_head = ep;
@@ -123,21 +154,21 @@ void ohci_interrupt_endpoint_destroy(struct ohci_hc *hc,
     ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
 
-    uint8_t slot = ep->slot_index;
-    /* Unlink from the slot chain. If ep is the slot head, patch
-     * HCCA.InterruptTable[slot]; otherwise walk NextED. */
-    if (hc->hcca->InterruptTable[slot] == ep->ed_phys) {
-        hc->hcca->InterruptTable[slot] = ep->ed->NextED;
+    /* slot_index now means skeleton slot; unlink from skel_ed's NextED chain. */
+    int skel_idx = ep->slot_index;
+    struct ohci_ed *skel_ed = hc->interrupt_skeleton[skel_idx];
+    if (skel_ed->NextED == ep->ed_phys) {
+        skel_ed->NextED = ep->ed->NextED;
     } else {
-        uint32_t cur = hc->hcca->InterruptTable[slot];
+        uint32_t cur = skel_ed->NextED;
         while (cur) {
-            struct ohci_ed *ed = ohci_dma_virt_from_phys(hc->dma, cur);
-            if (!ed) break;
-            if (ed->NextED == ep->ed_phys) {
-                ed->NextED = ep->ed->NextED;
+            struct ohci_ed *e = ohci_dma_virt_from_phys(hc->dma, cur);
+            if (!e) break;
+            if (e->NextED == ep->ed_phys) {
+                e->NextED = ep->ed->NextED;
                 break;
             }
-            cur = ed->NextED;
+            cur = e->NextED;
         }
     }
 

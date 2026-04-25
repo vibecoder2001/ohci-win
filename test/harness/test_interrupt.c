@@ -35,16 +35,19 @@ int main(void) {
         fprintf(stderr,"FAIL: int ep_create\n"); return 1;
     }
 
-    /* ep attaches at one leaf; verify the HCCA.InterruptTable entry for
-     * that leaf now points at ep.ed (ep inserted before the skeleton). */
-    int slot = ep.slot_index;
-    if (hc.hcca->InterruptTable[slot] != ep.ed_phys) {
-        fprintf(stderr,"FAIL: slot %d = 0x%x, expected ep 0x%x\n",
-                slot, hc.hcca->InterruptTable[slot], ep.ed_phys); return 1;
+    /* Plan 7: ep attaches as skel_ed->NextED head (not into HCCA directly).
+     * For poll_interval_frames=32 the picker chooses level 0 -> skel_idx 0.
+     * HCCA[0] still points at skeleton[0]; skel_ed->NextED == ep.ed_phys. */
+    int skel_idx = ep.slot_index;
+    if (skel_idx != 0) {
+        fprintf(stderr,"FAIL: expected skel_idx=0 for interval=32, got %d\n", skel_idx);
+        return 1;
     }
-    /* ep.ed->NextED == skeleton leaf phys. */
-    if (ep.ed->NextED != hc.interrupt_skeleton_phys[slot]) {
-        fprintf(stderr,"FAIL: ep->NextED not skeleton leaf\n"); return 1;
+    if (hc.hcca->InterruptTable[0] != hc.interrupt_skeleton_phys[0]) {
+        fprintf(stderr,"FAIL: HCCA[0] should still point at skeleton[0]\n"); return 1;
+    }
+    if (hc.interrupt_skeleton[0]->NextED != ep.ed_phys) {
+        fprintf(stderr,"FAIL: skeleton[0]->NextED != ep.ed_phys\n"); return 1;
     }
 
     uint32_t buf_phys; uint8_t *buf = ohci_dma_alloc(&dma, 8, 4, &buf_phys);

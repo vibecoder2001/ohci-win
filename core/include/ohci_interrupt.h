@@ -29,7 +29,8 @@ struct ohci_interrupt_endpoint_config {
     uint16_t max_packet_size;
     uint8_t  direction;
     uint8_t  low_speed;
-    uint16_t poll_interval_frames;  /* Plan 3 accepts 32 only */
+    uint16_t poll_interval_frames;  /* desired period in frames; rounded down
+                                     * to nearest power of two in {1,2,4,8,16,32}. */
 };
 
 int ohci_interrupt_endpoint_create(struct ohci_hc *hc,
