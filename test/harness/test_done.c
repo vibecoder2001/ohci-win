@@ -5,6 +5,7 @@
 #include "ohci_pool.h"
 #include "ohci_urb.h"
 #include "ohci_control.h"
+#include "ohci_drain.h"
 #include "fake_hc.h"
 #include "fake_hc_exec.h"
 
@@ -24,12 +25,14 @@ int main(void) {
     fake_hc_set_dma(&fake, &dma);
 
     struct ohci_mmio_ops ops; fake_hc_get_ops(&fake, &ops);
-    struct ohci_hc hc; ohci_hc_init(&hc, &ops, &dma, 64);
-    struct ohci_ed_pool edp; ohci_ed_pool_init(&edp, &dma, 2);
+    struct ohci_hc hc;
+    struct ohci_hc_config hcfg = { .td_pool_size=64,
+        .control_ed_count=4, .bulk_ed_count=4, .interrupt_ed_count=4 };
+    ohci_hc_init(&hc, &ops, &dma, &hcfg);
 
     struct ohci_control_endpoint ep;
     struct ohci_control_endpoint_config cfg = { .max_packet_size = 8 };
-    ohci_control_endpoint_create(&hc, &edp, &cfg, &ep);
+    ohci_control_endpoint_create(&hc, &cfg, &ep);
 
     uint32_t setup_phys; uint8_t *setup = ohci_dma_alloc(&dma, 8, 4, &setup_phys);
     uint32_t data_phys;  uint8_t *data  = ohci_dma_alloc(&dma, 18, 4, &data_phys);
@@ -45,7 +48,7 @@ int main(void) {
 
     ohci_control_submit(&hc, &ep, &urb);
     fake_hc_exec_step(&fake);       /* HC retires the chain */
-    ohci_control_drain_done(&hc);   /* core drains + completes */
+    ohci_drain_done(&hc);           /* core drains + completes */
 
     if (completion_count != 1)
         { fprintf(stderr,"FAIL: completion_count=%d\n", completion_count); return 1; }

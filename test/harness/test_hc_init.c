@@ -19,7 +19,13 @@ int main(void) {
     fake_hc_get_ops(&fake, &ops);
 
     struct ohci_hc hc;
-    int rc = ohci_hc_init(&hc, &ops, &dma, 64);
+    struct ohci_hc_config hcfg = {
+        .td_pool_size       = 64,
+        .control_ed_count   = 4,
+        .bulk_ed_count      = 4,
+        .interrupt_ed_count = 4,
+    };
+    int rc = ohci_hc_init(&hc, &ops, &dma, &hcfg);
     if (rc != 0) { fprintf(stderr, "FAIL: ohci_hc_init -> %d\n", rc); return 1; }
 
     /* HcHCCA must equal the phys addr of the allocated HCCA */
@@ -47,15 +53,15 @@ int main(void) {
         }
     }
 
-    /* HcControl: OPER state, CLE + IE set, PLE + BLE clear */
+    /* HcControl: OPER state, CLE + BLE + IE set, PLE clear */
     uint32_t ctrl = ops.read32(ops.context, 0x04);
     if ((ctrl & OHCI_CTRL_HCFS_MASK) != OHCI_CTRL_HCFS_OPER) {
         fprintf(stderr, "FAIL: HCFS != OPER (ctrl=0x%x)\n", ctrl); return 1;
     }
     if (!(ctrl & OHCI_CTRL_CLE)) { fprintf(stderr, "FAIL: CLE not set\n"); return 1; }
     if (!(ctrl & OHCI_CTRL_IE))  { fprintf(stderr, "FAIL: IE not set\n"); return 1; }
+    if (!(ctrl & OHCI_CTRL_BLE)) { fprintf(stderr, "FAIL: BLE not set\n"); return 1; }
     if (ctrl & OHCI_CTRL_PLE)    { fprintf(stderr, "FAIL: PLE should be clear\n"); return 1; }
-    if (ctrl & OHCI_CTRL_BLE)    { fprintf(stderr, "FAIL: BLE should be clear\n"); return 1; }
 
     /* HcInterruptEnable: WDH + MIE */
     uint32_t ie = ops.read32(ops.context, 0x10);

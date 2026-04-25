@@ -12,37 +12,47 @@ extern "C" {
 #endif
 
 struct ohci_control_endpoint;
+struct ohci_bulk_endpoint;
+struct ohci_interrupt_endpoint;
 struct ohci_urb;
+
+/* Capacity parameters for the HC's statically-sized internal pools. */
+struct ohci_hc_config {
+    uint16_t td_pool_size;
+    uint16_t control_ed_count;
+    uint16_t bulk_ed_count;
+    uint16_t interrupt_ed_count;
+};
 
 /* Software state for one OHCI controller. Zero-initialised by ohci_hc_init. */
 struct ohci_hc {
-    struct ohci_mmio_ops    ops;    /* register read/write seam */
-    struct ohci_dma_region *dma;    /* DMA-coherent memory for HCCA + descriptors */
+    struct ohci_mmio_ops    ops;
+    struct ohci_dma_region *dma;
 
-    struct ohci_hcca       *hcca;     /* virtual pointer */
-    uint32_t                hcca_phys;/* physical address */
+    struct ohci_hcca       *hcca;
+    uint32_t                hcca_phys;
 
-    /* TD pool used for all endpoints on this controller. */
-    struct ohci_td_pool    td_pool;
+    struct ohci_td_pool     td_pool;
 
-    /* Software-side head of the Control list (for teardown later).
-     * NULL when empty. */
-    struct ohci_control_endpoint *control_head;
+    struct ohci_ed_pool     control_ed_pool;
+    struct ohci_ed_pool     bulk_ed_pool;
+    struct ohci_ed_pool     interrupt_ed_pool;
 
-    /* Singly-linked list of URBs currently queued on any endpoint of this
-     * controller. Walked during drain_done to retire. */
-    struct ohci_urb *in_flight;
+    /* Interrupt skeleton (Task 5 populates; zero-initialised for now). */
+    struct ohci_ed         *interrupt_skeleton[63];
+    uint32_t                interrupt_skeleton_phys[63];
+
+    struct ohci_control_endpoint   *control_head;
+    struct ohci_bulk_endpoint      *bulk_head;
+    struct ohci_interrupt_endpoint *interrupt_head;
+
+    struct ohci_urb        *in_flight;
 };
 
-/* Reset the controller, allocate HCCA in the DMA region, program HcHCCA,
- * enable the Control list + interrupts, and move HCFS to Operational.
- * Additional param: number of TDs the TD pool should reserve. Typical
- * sizing: 3 TDs per outstanding URB times a small queue depth, e.g. 64.
- * Returns 0 on success or a negative errno-ish code on failure. */
 int ohci_hc_init(struct ohci_hc *hc,
                  const struct ohci_mmio_ops *ops,
                  struct ohci_dma_region *dma,
-                 uint16_t td_pool_size);
+                 const struct ohci_hc_config *cfg);
 
 #ifdef __cplusplus
 }

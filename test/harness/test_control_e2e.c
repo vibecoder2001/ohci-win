@@ -6,6 +6,7 @@
 #include "ohci_pool.h"
 #include "ohci_urb.h"
 #include "ohci_control.h"
+#include "ohci_drain.h"
 #include "fake_hc.h"
 #include "fake_hc_exec.h"
 
@@ -21,7 +22,7 @@ static void submit_and_wait(struct ohci_hc *hc,
                              struct ohci_urb *urb) {
     if (ohci_control_submit(hc, ep, urb) != 0) { fprintf(stderr,"FAIL: submit\n"); exit(1); }
     fake_hc_exec_step(fake);
-    ohci_control_drain_done(hc);
+    ohci_drain_done(hc);
 }
 
 int main(void) {
@@ -33,13 +34,14 @@ int main(void) {
 
     struct ohci_mmio_ops ops; fake_hc_get_ops(&fake, &ops);
     struct ohci_hc hc;
-    if (ohci_hc_init(&hc, &ops, &dma, 128) != 0) { fprintf(stderr,"FAIL: hc_init\n"); return 1; }
-    struct ohci_ed_pool edp; ohci_ed_pool_init(&edp, &dma, 2);
+    struct ohci_hc_config hcfg = { .td_pool_size=128,
+        .control_ed_count=4, .bulk_ed_count=4, .interrupt_ed_count=4 };
+    if (ohci_hc_init(&hc, &ops, &dma, &hcfg) != 0) { fprintf(stderr,"FAIL: hc_init\n"); return 1; }
 
     struct ohci_control_endpoint ep;
     struct ohci_control_endpoint_config cfg = { .func_addr = 0, .ep_num = 0,
                                                  .max_packet_size = 8 };
-    ohci_control_endpoint_create(&hc, &edp, &cfg, &ep);
+    ohci_control_endpoint_create(&hc, &cfg, &ep);
 
     /* First URB: GET_DEVICE_DESCRIPTOR */
     uint32_t s1_phys; uint8_t *s1 = ohci_dma_alloc(&dma, 8, 4, &s1_phys);

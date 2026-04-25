@@ -49,11 +49,9 @@ struct ohci_control_endpoint_config {
 struct ohci_hc;
 
 /* Create and splice a Control endpoint onto the HC's Control list head.
- * Allocates one ED from the caller-supplied ED pool and one placeholder
- * TD from hc->td_pool. Writes HcControlHeadED. Caller provides
+ * Uses hc->control_ed_pool and hc->td_pool internally. Caller provides
  * pre-allocated ohci_control_endpoint storage. */
 int ohci_control_endpoint_create(struct ohci_hc *hc,
-                                 struct ohci_ed_pool *edp,
                                  const struct ohci_control_endpoint_config *cfg,
                                  struct ohci_control_endpoint *ep);
 
@@ -62,15 +60,6 @@ int ohci_control_endpoint_create(struct ohci_hc *hc,
 int ohci_control_submit(struct ohci_hc *hc,
                         struct ohci_control_endpoint *ep,
                         struct ohci_urb *urb);
-
-/* Poll the HC's done queue. If WDH is set in HcInterruptStatus, snapshot
- * HCCA.DoneHead, clear both, walk the retired TDs in LIFO order,
- * aggregate completion status per URB, and call urb->complete on the
- * URBs that have fully completed. TDs are returned to the TD pool.
- *
- * This is what Plan 3's ISR DPC will call; for Tier-1 tests, the harness
- * invokes it directly after fake_hc_exec_step. */
-void ohci_control_drain_done(struct ohci_hc *hc);
 
 #ifdef __cplusplus
 }

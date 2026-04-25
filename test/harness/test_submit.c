@@ -17,16 +17,15 @@ int main(void) {
     fake_hc_get_ops(&fake, &ops);
 
     struct ohci_hc hc;
-    if (ohci_hc_init(&hc, &ops, &dma, 64) != 0) { fprintf(stderr,"FAIL: hc_init\n"); return 1; }
-
-    struct ohci_ed_pool edp;
-    if (ohci_ed_pool_init(&edp, &dma, 4) != 0)   { fprintf(stderr,"FAIL: ed_pool\n"); return 1; }
+    struct ohci_hc_config hcfg = { .td_pool_size=64,
+        .control_ed_count=4, .bulk_ed_count=4, .interrupt_ed_count=4 };
+    if (ohci_hc_init(&hc, &ops, &dma, &hcfg) != 0) { fprintf(stderr,"FAIL: hc_init\n"); return 1; }
 
     struct ohci_control_endpoint ep;
     struct ohci_control_endpoint_config cfg = {
         .func_addr = 0, .ep_num = 0, .max_packet_size = 8, .low_speed = 0
     };
-    if (ohci_control_endpoint_create(&hc, &edp, &cfg, &ep) != 0)
+    if (ohci_control_endpoint_create(&hc, &cfg, &ep) != 0)
         { fprintf(stderr,"FAIL: ep_create\n"); return 1; }
 
     /* HcControlHeadED must equal ep.ed_phys */
