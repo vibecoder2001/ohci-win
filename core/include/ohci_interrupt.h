@@ -40,6 +40,9 @@ int ohci_interrupt_submit(struct ohci_hc *hc,
                           struct ohci_interrupt_endpoint *ep,
                           struct ohci_urb *urb);
 
+void ohci_interrupt_endpoint_destroy(struct ohci_hc *hc,
+                                     struct ohci_interrupt_endpoint *ep);
+
 #ifdef __cplusplus
 }
 #endif

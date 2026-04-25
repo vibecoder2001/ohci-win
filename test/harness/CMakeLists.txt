@@ -69,3 +69,7 @@ add_test(NAME interrupt_skeleton COMMAND test_interrupt_skeleton)
 add_executable(test_interrupt test_interrupt.c)
 target_link_libraries(test_interrupt PRIVATE fake_hc)
 add_test(NAME interrupt COMMAND test_interrupt)
+
+add_executable(test_teardown test_teardown.c)
+target_link_libraries(test_teardown PRIVATE fake_hc)
+add_test(NAME teardown COMMAND test_teardown)

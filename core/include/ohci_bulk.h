@@ -40,6 +40,9 @@ int ohci_bulk_submit(struct ohci_hc *hc,
                      struct ohci_bulk_endpoint *ep,
                      struct ohci_urb *urb);
 
+void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
+                                struct ohci_bulk_endpoint *ep);
+
 #ifdef __cplusplus
 }
 #endif

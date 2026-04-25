@@ -198,3 +198,39 @@ int ohci_control_submit(struct ohci_hc *hc,
     hc->in_flight = urb;
     return 0;
 }
+
+void ohci_control_endpoint_destroy(struct ohci_hc *hc,
+                                   struct ohci_control_endpoint *ep) {
+    /* 1) Skip bit so the HC stops dispatching new TDs on this ED. */
+    ep->ed->Control |= OHCI_ED_K;
+    hc->ops.barrier(hc->ops.context);
+
+    /* 2) Unlink from HcControlHeadED list. */
+    uint32_t head = hc->ops.read32(hc->ops.context, 0x20);
+    if (head == ep->ed_phys) {
+        hc->ops.write32(hc->ops.context, 0x20, ep->ed->NextED);
+    } else {
+        uint32_t cur = head;
+        while (cur) {
+            struct ohci_ed *ed = ohci_dma_virt_from_phys(hc->dma, cur);
+            if (!ed) break;
+            if (ed->NextED == ep->ed_phys) {
+                ed->NextED = ep->ed->NextED;
+                break;
+            }
+            cur = ed->NextED;
+        }
+    }
+
+    /* 3) Unlink from SW-side control_head list. */
+    struct ohci_control_endpoint **pp = &hc->control_head;
+    while (*pp) {
+        if (*pp == ep) { *pp = ep->next; break; }
+        pp = &(*pp)->next;
+    }
+
+    /* 4) Free pool resources. */
+    ohci_td_pool_free(&hc->td_pool, ep->tail_placeholder);
+    ohci_ed_pool_free(&hc->control_ed_pool, ep->ed);
+    memset(ep, 0, sizeof(*ep));
+}

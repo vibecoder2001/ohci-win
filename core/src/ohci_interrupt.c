@@ -108,3 +108,37 @@ int ohci_interrupt_submit(struct ohci_hc *hc,
     hc->in_flight = urb;
     return 0;
 }
+
+void ohci_interrupt_endpoint_destroy(struct ohci_hc *hc,
+                                     struct ohci_interrupt_endpoint *ep) {
+    ep->ed->Control |= OHCI_ED_K;
+    hc->ops.barrier(hc->ops.context);
+
+    uint8_t slot = ep->slot_index;
+    /* Unlink from the slot chain. If ep is the slot head, patch
+     * HCCA.InterruptTable[slot]; otherwise walk NextED. */
+    if (hc->hcca->InterruptTable[slot] == ep->ed_phys) {
+        hc->hcca->InterruptTable[slot] = ep->ed->NextED;
+    } else {
+        uint32_t cur = hc->hcca->InterruptTable[slot];
+        while (cur) {
+            struct ohci_ed *ed = ohci_dma_virt_from_phys(hc->dma, cur);
+            if (!ed) break;
+            if (ed->NextED == ep->ed_phys) {
+                ed->NextED = ep->ed->NextED;
+                break;
+            }
+            cur = ed->NextED;
+        }
+    }
+
+    struct ohci_interrupt_endpoint **pp = &hc->interrupt_head;
+    while (*pp) {
+        if (*pp == ep) { *pp = ep->next; break; }
+        pp = &(*pp)->next;
+    }
+
+    ohci_td_pool_free(&hc->td_pool, ep->tail_placeholder);
+    ohci_ed_pool_free(&hc->interrupt_ed_pool, ep->ed);
+    memset(ep, 0, sizeof(*ep));
+}

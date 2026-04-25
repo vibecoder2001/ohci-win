@@ -61,6 +61,12 @@ int ohci_control_submit(struct ohci_hc *hc,
                         struct ohci_control_endpoint *ep,
                         struct ohci_urb *urb);
 
+/* Remove the endpoint from the Control list, set Skip, and return
+ * its ED + placeholder TD to the pools. Caller must ensure no URBs
+ * are in flight on this endpoint (Plan 4 adds concurrency guards). */
+void ohci_control_endpoint_destroy(struct ohci_hc *hc,
+                                   struct ohci_control_endpoint *ep);
+
 #ifdef __cplusplus
 }
 #endif

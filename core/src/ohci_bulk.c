@@ -176,3 +176,35 @@ int ohci_bulk_submit(struct ohci_hc *hc,
     hc->in_flight = urb;
     return 0;
 }
+
+void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
+                                struct ohci_bulk_endpoint *ep) {
+    ep->ed->Control |= OHCI_ED_K;
+    hc->ops.barrier(hc->ops.context);
+
+    uint32_t head = hc->ops.read32(hc->ops.context, 0x28);
+    if (head == ep->ed_phys) {
+        hc->ops.write32(hc->ops.context, 0x28, ep->ed->NextED);
+    } else {
+        uint32_t cur = head;
+        while (cur) {
+            struct ohci_ed *ed = ohci_dma_virt_from_phys(hc->dma, cur);
+            if (!ed) break;
+            if (ed->NextED == ep->ed_phys) {
+                ed->NextED = ep->ed->NextED;
+                break;
+            }
+            cur = ed->NextED;
+        }
+    }
+
+    struct ohci_bulk_endpoint **pp = &hc->bulk_head;
+    while (*pp) {
+        if (*pp == ep) { *pp = ep->next; break; }
+        pp = &(*pp)->next;
+    }
+
+    ohci_td_pool_free(&hc->td_pool, ep->tail_placeholder);
+    ohci_ed_pool_free(&hc->bulk_ed_pool, ep->ed);
+    memset(ep, 0, sizeof(*ep));
+}
