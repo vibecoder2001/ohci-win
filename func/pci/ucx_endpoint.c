@@ -219,7 +219,11 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         uc->SetupBounce = NULL;
     }
     if (uc->DataBounce) {
-        OhciPci_BounceFree(uc->EpCtx->Dc, uc->DataBounce);
+        if (uc->DataBounceSlabs > 1) {
+            OhciPci_BounceFreeBig(uc->EpCtx->Dc, uc->DataBounce, uc->DataBounceSlabs);
+        } else {
+            OhciPci_BounceFree(uc->EpCtx->Dc, uc->DataBounce);
+        }
         uc->DataBounce = NULL;
     }
 
@@ -321,28 +325,28 @@ OhciPci_HandleBulkUrb(
     void   *bounceVa   = NULL;
     uint32_t bouncePhys = 0;
 
+    ULONG bounceSlabs = 0;
     if (needsBounce) {
-        if (length > OHCIPCI_BOUNCE_SLAB_BYTES) {
-            LOG("  rejected: bounce required but length=%lu exceeds slab=%u",
-                length, OHCIPCI_BOUNCE_SLAB_BYTES);
+        bounceSlabs = (length + OHCIPCI_BOUNCE_SLAB_BYTES - 1) / OHCIPCI_BOUNCE_SLAB_BYTES;
+        if (bounceSlabs > OHCIPCI_BOUNCE_SLAB_COUNT) {
+            LOG("  rejected: bounce needs %lu slabs > pool size %u",
+                bounceSlabs, OHCIPCI_BOUNCE_SLAB_COUNT);
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
             WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
             return;
         }
         WdfSpinLockAcquire(dc->CoreLock);
-        bounceVa = OhciPci_BounceAlloc(dc, &bouncePhys);
+        bounceVa = OhciPci_BounceAllocBig(dc, bounceSlabs, &bouncePhys);
         WdfSpinLockRelease(dc->CoreLock);
         if (bounceVa == NULL) {
-            LOG("  rejected: no bounce slab available");
+            LOG("  rejected: no contiguous bounce run for %lu slabs", bounceSlabs);
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
             WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
             return;
         }
         if (!isIn) {
-            /* Source bytes: from MDL's system VA if MDL present,
-             * else from the flat bufVa the URB carried. */
             PUCHAR src = NULL;
             if (bufMdl != NULL) {
                 src = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl,
@@ -352,7 +356,7 @@ OhciPci_HandleBulkUrb(
             }
             if (src == NULL) {
                 WdfSpinLockAcquire(dc->CoreLock);
-                OhciPci_BounceFree(dc, bounceVa);
+                OhciPci_BounceFreeBig(dc, bounceVa, bounceSlabs);
                 WdfSpinLockRelease(dc->CoreLock);
                 urb->TransferBufferLength = 0;
                 urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
@@ -361,10 +365,34 @@ OhciPci_HandleBulkUrb(
             }
             RtlCopyMemory(bounceVa, src, length);
         }
-        sg[0].phys   = bouncePhys;
-        sg[0].length = length;
-        sg[0].off    = 0;
-        pageCount    = 1;
+        /* One SG entry per slab (4 KB). Slabs are physically contiguous
+         * within the bounce pool, but breaking them up keeps each TD's
+         * CBP→BE inside the OHCI single-page-boundary limit (§4.3.1.4)
+         * without relying on the page-straddle case. */
+        ULONG remaining = length;
+        ULONG offset    = 0;
+        ULONG idx       = 0;
+        while (remaining > 0 && idx < OHCI_BULK_MAX_SG_PAGES) {
+            ULONG chunk = OHCIPCI_BOUNCE_SLAB_BYTES;
+            if (chunk > remaining) chunk = remaining;
+            sg[idx].phys   = bouncePhys + offset;
+            sg[idx].length = chunk;
+            sg[idx].off    = offset;
+            offset    += chunk;
+            remaining -= chunk;
+            idx++;
+        }
+        if (remaining > 0) {
+            LOG("  rejected: bounce chunked into >%u SG entries", OHCI_BULK_MAX_SG_PAGES);
+            WdfSpinLockAcquire(dc->CoreLock);
+            OhciPci_BounceFreeBig(dc, bounceVa, bounceSlabs);
+            WdfSpinLockRelease(dc->CoreLock);
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+            return;
+        }
+        pageCount = idx;
     } else {
         ULONG offInPage = byteOffset & (PAGE_SIZE - 1);
         ULONG remaining = length;
@@ -396,13 +424,11 @@ OhciPci_HandleBulkUrb(
     uc->DataLength    = length;
     uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
     if (bounceVa != NULL) {
-        /* Wire the bounce so OhciPci_UrbComplete copies IN bytes back
-         * to the user buffer and frees the slab. UrbComplete prefers
-         * UserMdl, falls back to UserVa. */
-        uc->DataBounce     = bounceVa;
-        uc->DataBouncePhys = bouncePhys;
-        uc->UserMdl        = bufMdl;
-        uc->UserVa         = (bufMdl == NULL) ? bufVa : NULL;
+        uc->DataBounce      = bounceVa;
+        uc->DataBouncePhys  = bouncePhys;
+        uc->DataBounceSlabs = bounceSlabs;
+        uc->UserMdl         = bufMdl;
+        uc->UserVa          = (bufMdl == NULL) ? bufVa : NULL;
     }
 
     /* buffer_phys = first chunk's phys minus its off, so the drain's

@@ -122,6 +122,7 @@ typedef struct _OHCIPCI_URB_CTX {
     uint32_t                     SetupBouncePhys;
     void                        *DataBounce;     /* Data-stage bounce buffer (or NULL) */
     uint32_t                     DataBouncePhys;
+    ULONG                        DataBounceSlabs; /* >1 → AllocBig, free via FreeBig */
     uint32_t                     DataLength;     /* 0 if no data stage */
     uint8_t                      DataDirection;  /* OHCI_URB_DIR_IN / _OUT */
     PMDL                         UserMdl;        /* caller's MDL (may be NULL) */
@@ -220,6 +221,8 @@ NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);
 /* Allocate one slab. Returns NULL on exhaustion. *phys_out gets the
  * physical address. Buffer size is OHCIPCI_BOUNCE_SLAB_BYTES. */
 void *OhciPci_BounceAlloc(PDEVICE_CONTEXT dc, uint32_t *phys_out);
+void *OhciPci_BounceAllocBig(PDEVICE_CONTEXT dc, ULONG n_slabs, uint32_t *phys_out);
+void  OhciPci_BounceFreeBig(PDEVICE_CONTEXT dc, void *ptr, ULONG n_slabs);
 
 void  OhciPci_BounceFree(PDEVICE_CONTEXT dc, void *ptr);
 
