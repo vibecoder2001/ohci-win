@@ -73,7 +73,11 @@ int ohci_interrupt_submit(struct ohci_hc *hc,
     uint32_t data_td_phys;
     struct ohci_td *data_td = ohci_td_pool_alloc(&hc->td_pool, &data_td_phys);
     if (!data_td) return -1;
-    uint32_t ctrl = OHCI_TD_DI_NO_INTR | OHCI_TD_T_FROM_ED | OHCI_TD_R;
+    /* DI=0 (immediate IOC). With only one TD per Interrupt URB this is the
+     * TD that signals completion; DI=7 here means the HC retires the TD but
+     * never raises WDH and the URB hangs in PENDING. Same root cause as
+     * the Plan 5 STATUS TD fix. */
+    uint32_t ctrl = OHCI_TD_DI_IMMEDIATE | OHCI_TD_T_FROM_ED | OHCI_TD_R;
     ctrl |= (OHCI_CC_NOTACCESSED << OHCI_TD_CC_SHIFT);
     data_td->Control = ctrl;
     data_td->CBP     = urb->buffer_phys;
@@ -99,6 +103,9 @@ int ohci_interrupt_submit(struct ohci_hc *hc,
 
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
+    /* Same TD is the data TD; drain reads CBP from it to compute
+     * urb->transferred per OHCI §4.3.1.4. */
+    urb->data_td_phys = head_td_phys;
 
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
