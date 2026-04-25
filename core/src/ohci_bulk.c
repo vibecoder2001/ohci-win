@@ -187,8 +187,13 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
     /* Defensive: a prior Cancel/Purge may have set ED.K=1 to halt the EP.
      * UCX is supposed to call Start before resubmitting, but in observed
      * VM traces (mass-storage CBW path) Start is occasionally skipped.
-     * Clear K here so the HC actually walks the ED. */
+     * Clear K here so the HC actually walks the ED. Also clear H (halt
+     * from a STALL'd TD); we leave the toggle (C) alone here because the
+     * caller is responsible for issuing CLEAR_FEATURE(HALT) on the wire
+     * before retrying — only the CLEAR_FEATURE intercept knows it's
+     * safe to reset the device-side toggle to DATA0. */
     ep->ed->Control &= ~OHCI_ED_K;
+    ep->ed->HeadP   &= ~(uint32_t)OHCI_ED_HEADP_H;
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
     hc->ops.barrier(hc->ops.context);

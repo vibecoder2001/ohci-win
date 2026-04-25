@@ -612,6 +612,58 @@ EvtUrbDefault(
         setupBytes[0], setupBytes[1], setupBytes[2], setupBytes[3],
         setupBytes[4], setupBytes[5], setupBytes[6], setupBytes[7]);
 
+    /* Intercept CLEAR_FEATURE(ENDPOINT_HALT) on a non-default EP so we
+     * can clear the matching OHCI ED's H+C bits in lock-step with the
+     * device's wire-level halt clear. Without this, after a STALL the
+     * ED stays halted and our toggle stays at whatever value it was at
+     * STALL time — the resumed transfer drifts off the device's reset
+     * DATA0 toggle and STALLs again. The Control transfer is still
+     * forwarded so the device sees CLEAR_FEATURE on the wire too. */
+    if (setupBytes[0] == 0x02 &&  /* OUT, standard, endpoint */
+        setupBytes[1] == 0x01 &&  /* CLEAR_FEATURE */
+        setupBytes[2] == 0x00 && setupBytes[3] == 0x00 &&  /* ENDPOINT_HALT */
+        setupBytes[5] == 0x00)
+    {
+        UCHAR    targetEp  = setupBytes[4];
+        UCHAR    targetEpN = targetEp & 0x0F;
+        BOOLEAN  targetIn  = (targetEp & 0x80) != 0;
+        UCHAR    funcAddr  = (UCHAR)(ep->Core.Control.ed->Control & 0x7F);
+        uint32_t want_d    = targetIn ? OHCI_ED_D_IN : OHCI_ED_D_OUT;
+        struct ohci_ed *target = NULL;
+        WdfSpinLockAcquire(dc->CoreLock);
+        for (struct ohci_bulk_endpoint *be = dc->Hc.bulk_head; be; be = be->next) {
+            uint32_t c = be->ed->Control;
+            if ((c & 0x7F) == funcAddr &&
+                ((c >> OHCI_ED_EN_SHIFT) & 0x0F) == targetEpN &&
+                (c & OHCI_ED_D_MASK) == want_d) {
+                target = be->ed;
+                break;
+            }
+        }
+        if (target == NULL) {
+            for (struct ohci_interrupt_endpoint *ie = dc->Hc.interrupt_head; ie; ie = ie->next) {
+                uint32_t c = ie->ed->Control;
+                if ((c & 0x7F) == funcAddr &&
+                    ((c >> OHCI_ED_EN_SHIFT) & 0x0F) == targetEpN &&
+                    (c & OHCI_ED_D_MASK) == want_d) {
+                    target = ie->ed;
+                    break;
+                }
+            }
+        }
+        if (target != NULL) {
+            target->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
+            target->Control &= ~OHCI_ED_K;
+            dc->MmioOps.barrier(dc->MmioOps.context);
+            LOG("  CLEAR_FEATURE(HALT) ep=0x%02X addr=%u — cleared ED H+C+K",
+                targetEp, funcAddr);
+        } else {
+            LOG("  CLEAR_FEATURE(HALT) ep=0x%02X addr=%u — no matching ED",
+                targetEp, funcAddr);
+        }
+        WdfSpinLockRelease(dc->CoreLock);
+    }
+
     /* Allocate per-URB context on the WDFREQUEST object. */
     WDF_OBJECT_ATTRIBUTES reqAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&reqAttrs, OHCIPCI_URB_CTX);
