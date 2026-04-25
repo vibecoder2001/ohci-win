@@ -45,3 +45,7 @@ add_test(NAME fake_exec COMMAND test_fake_exec)
 add_executable(test_done test_done.c)
 target_link_libraries(test_done PRIVATE fake_hc)
 add_test(NAME done COMMAND test_done)
+
+add_executable(test_control_e2e test_control_e2e.c)
+target_link_libraries(test_control_e2e PRIVATE fake_hc)
+add_test(NAME control_e2e COMMAND test_control_e2e)
