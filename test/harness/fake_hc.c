@@ -44,3 +44,7 @@ void fake_hc_get_ops(struct fake_hc *hc, struct ohci_mmio_ops *ops_out) {
     ops_out->write32 = write32;
     ops_out->barrier = barrier;
 }
+
+void fake_hc_set_dma(struct fake_hc *hc, struct ohci_dma_region *dma) {
+    hc->dma = dma;
+}

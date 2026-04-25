@@ -1,4 +1,4 @@
-add_library(fake_hc STATIC fake_hc.c)
+add_library(fake_hc STATIC fake_hc.c fake_hc_exec.c)
 target_link_libraries(fake_hc PUBLIC ohci_core)
 target_include_directories(fake_hc PUBLIC .)
 
@@ -37,3 +37,7 @@ add_test(NAME control_build COMMAND test_control_build)
 add_executable(test_submit test_submit.c)
 target_link_libraries(test_submit PRIVATE fake_hc)
 add_test(NAME submit COMMAND test_submit)
+
+add_executable(test_fake_exec test_fake_exec.c)
+target_link_libraries(test_fake_exec PRIVATE fake_hc)
+add_test(NAME fake_exec COMMAND test_fake_exec)
