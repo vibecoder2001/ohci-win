@@ -198,7 +198,11 @@ OhciPci_UrbComplete(struct ohci_urb *u)
 
     /* Write the result back into the TRANSFER_URB. UCX reads
      * Hdr.Status + TransferBufferLength to learn how the transfer went;
-     * the WDF request status alone is not enough. */
+     * the WDF request status alone is not enough.
+     * Lifetime: TRANSFER_URB lives as long as the WDFREQUEST, and WDF
+     * holds a reference to the request until we call WdfRequestComplete
+     * below. Anyone adding a cancel path that completes the request
+     * before the HC retires the TD must NOT also let this code run. */
     POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
     if (turb != NULL) {
         turb->TransferBufferLength = u->transferred;
@@ -260,6 +264,22 @@ OhciPci_UrbComplete(struct ohci_urb *u)
  *
  * Runs at IRQL <= DISPATCH_LEVEL.
  * -------------------------------------------------------------------------- */
+/* Release map registers + tear down the WdfDmaTransaction and complete
+ * the request with failure. Used by every BulkProgramDma early-out path —
+ * returning FALSE alone leaks map registers and never completes the URB,
+ * which hangs the endpoint. After this returns, uc is gone (WDF freed
+ * the request context); caller must not touch it. */
+static VOID
+OhciPci_BulkProgramDmaFail(OHCIPCI_URB_CTX *uc, NTSTATUS status)
+{
+    NTSTATUS dmaSt;
+    (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction, 0, &dmaSt);
+    WdfObjectDelete(uc->DmaTransaction);
+    uc->DmaTransaction = NULL;
+    if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+    WdfRequestComplete(uc->Request, status);
+}
+
 static BOOLEAN
 OhciPci_BulkProgramDma(
     WDFDMATRANSACTION Transaction,
@@ -277,7 +297,9 @@ OhciPci_BulkProgramDma(
     PDEVICE_CONTEXT     dc = ep->Dc;
 
     if (SgList->NumberOfElements == 0) {
-        return FALSE;
+        LOG("BulkProgramDma: empty SG list");
+        OhciPci_BulkProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+        return TRUE;
     }
 
     /* Split each SG element down to PAGE_SIZE chunks aligned on page
@@ -295,13 +317,22 @@ OhciPci_BulkProgramDma(
         ULONG    rem  = SgList->Elements[i].Length;
         uint32_t pos  = base;
         while (rem > 0) {
+            /* Guard: pos in the top page would wrap pageEnd to 0 and
+             * underflow chunk. HAL with our 32-bit mask shouldn't hand
+             * us anything ≥ 0xFFFFF000, but cheap to check. */
+            if (pos >= 0xFFFFF000u) {
+                LOG("BulkProgramDma: SG addr 0x%08X near 4 GB", pos);
+                OhciPci_BulkProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+                return TRUE;
+            }
             uint32_t pageEnd = (pos + PAGE_SIZE) & ~(PAGE_SIZE - 1u);
             uint32_t chunk   = pageEnd - pos;
             if (chunk > rem) chunk = rem;
             if (sgCount >= OHCI_BULK_MAX_SG_PAGES) {
                 LOG("BulkProgramDma: post-split SG count exceeds %u",
                     OHCI_BULK_MAX_SG_PAGES);
-                return FALSE;
+                OhciPci_BulkProgramDmaFail(uc, STATUS_INSUFFICIENT_RESOURCES);
+                return TRUE;
             }
             sg[sgCount].phys   = pos;
             sg[sgCount].length = chunk;
@@ -330,7 +361,8 @@ OhciPci_BulkProgramDma(
     WdfSpinLockRelease(dc->CoreLock);
     if (rc != 0) {
         LOG("BulkProgramDma: ohci_bulk_submit_sg rc=%d", rc);
-        return FALSE;
+        OhciPci_BulkProgramDmaFail(uc, STATUS_INSUFFICIENT_RESOURCES);
+        return TRUE;
     }
     /* Async completion path runs OhciPci_UrbComplete; that releases the
      * WdfDmaTransaction via WdfDmaTransactionDmaCompletedFinal. */
@@ -364,13 +396,19 @@ OhciPci_HandleBulkUrb(
     }
     /* WdfDmaTransactionInitialize needs an MDL. Storage class driver
      * occasionally hands us a flat KVA buffer with no MDL (e.g. an
-     * 18-byte INQUIRY response staged in the URB itself). USB class
-     * driver buffers come from non-paged pool, so we can build a
-     * transient MDL via MmBuildMdlForNonPagedPool. Track it on uc->OurMdl
-     * so the completion path frees it. */
+     * 18-byte INQUIRY response staged in the URB itself). MmBuildMdlForNonPagedPool
+     * is only safe if the VA is in non-paged pool — a buggy or malicious
+     * upper driver could pass a paged or session-space VA, which would
+     * yield bogus PFNs that the HC then DMAs against (kernel memory
+     * corruption). Cap the no-MDL case at a small size that matches the
+     * legitimate use (short class-staged buffers) so a large flat-KVA
+     * URB cannot weaponise this path. */
     PMDL ourMdl = NULL;
     if (bufMdl == NULL) {
-        if (bufVa == NULL) {
+        const ULONG OHCIPCI_BULK_NO_MDL_MAX = 512;
+        if (bufVa == NULL || length > OHCIPCI_BULK_NO_MDL_MAX) {
+            LOG("HandleBulkUrb: rejecting MDL-less URB len=%lu (max %lu)",
+                length, OHCIPCI_BULK_NO_MDL_MAX);
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
             WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
@@ -500,7 +538,17 @@ OhciPci_HandleInterruptUrb(
         PVOID src = bufMdl
             ? MmGetSystemAddressForMdlSafe(bufMdl, NormalPagePriority)
             : bufVa;
-        if (src) RtlCopyMemory(uc->DataBounce, src, length);
+        if (src == NULL) {
+            /* Submitting without copying would leak prior bounce-slab
+             * contents to the device (info disclosure across endpoints)
+             * and corrupt the OUT payload. Fail the request instead. */
+            OhciPci_BounceFree(dc, uc->DataBounce);
+            uc->DataBounce = NULL;
+            WdfSpinLockRelease(dc->CoreLock);
+            WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+            return;
+        }
+        RtlCopyMemory(uc->DataBounce, src, length);
     }
 
     uc->CoreUrb.buffer       = uc->DataBounce;
@@ -710,9 +758,14 @@ EvtUrbDefault(
             } else if (bufVa) {
                 src = bufVa;
             }
-            if (src) {
-                RtlCopyMemory(uc->DataBounce, src, length);
+            if (src == NULL) {
+                OhciPci_BounceFree(dc, uc->SetupBounce);
+                OhciPci_BounceFree(dc, uc->DataBounce);
+                WdfSpinLockRelease(dc->CoreLock);
+                WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+                return;
             }
+            RtlCopyMemory(uc->DataBounce, src, length);
         }
     }
 
