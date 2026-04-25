@@ -48,6 +48,16 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     dc->Device = device;
     OhciPci_InitMmioOps(dc);
     LOG("Context attached and mmio_ops wired");
+
+    /* WDF requires WdfInterruptCreate from EvtDriverDeviceAdd, not from
+     * EvtDevicePrepareHardware (the latter only works for HID minidrivers).
+     * The interrupt object is created here with EvtIsr/EvtDpc callbacks;
+     * WDF wires the actual translated IRQ resource to it during PnP later. */
+    NTSTATUS isStatus = OhciPci_CreateInterrupt(dc);
+    if (!NT_SUCCESS(isStatus)) {
+        LOG("Interrupt setup failed; refusing to start");
+        return isStatus;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -132,12 +142,6 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     /* Sanity-check the result by reading HcControl. */
     ULONG ctrl = READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x04));
     LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
-
-    NTSTATUS isStatus = OhciPci_CreateInterrupt(dc);
-    if (!NT_SUCCESS(isStatus)) {
-        LOG("Interrupt setup failed; refusing to start");
-        return isStatus;
-    }
 
     NTSTATUS ucxCtrlStatus = OhciPci_UcxControllerCreate(dc);
     if (!NT_SUCCESS(ucxCtrlStatus)) {
