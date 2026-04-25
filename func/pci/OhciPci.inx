@@ -1,0 +1,47 @@
+; OhciPci.inx — OHCI UCX miniport (PCI variant for QEMU)
+[Version]
+Signature    = "$Windows NT$"
+Class        = USB
+ClassGuid    = {36fc9e60-c465-11cf-8056-444553540000}
+Provider     = %ProviderName%
+CatalogFile  = OhciPci.cat
+DriverVer    = 01/01/2026,1.0.0.0
+PnpLockdown  = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+OhciPci.sys = 1
+
+[Manufacturer]
+%MfgName% = Standard,NTamd64.10.0...16299
+
+[Standard.NTamd64.10.0...16299]
+%DeviceDesc% = OhciPci_Device, PCI\VEN_106B&DEV_003F&CC_0C0310
+
+[OhciPci_Device.NT]
+CopyFiles = OhciPci_CopyFiles
+
+[OhciPci_CopyFiles]
+OhciPci.sys
+
+[OhciPci_Device.NT.Services]
+AddService = OhciPci, 0x00000002, OhciPci_Service
+
+[OhciPci_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\OhciPci.sys
+
+[Strings]
+ProviderName = "Vibe Coder"
+MfgName      = "Vibe Coder"
+DiskName     = "OhciPci Installation Disk"
+DeviceDesc   = "OHCI USB Host Controller (ohci-win, PCI)"
+ServiceDesc  = "OhciPci"
