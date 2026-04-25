@@ -17,11 +17,15 @@ struct ohci_dma_region {
     size_t   offset;     /* Bump pointer; bytes allocated so far. */
 };
 
+/* Initialize region; zero-fills the buffer so fresh HCCA/ED/TD fields are
+ * well-defined before hardware inspection. */
 void   ohci_dma_init(struct ohci_dma_region *r, void *base, uint32_t phys_base, size_t size);
 
-/* Allocate `size` bytes aligned to `align` (power of two). On success returns
- * virtual pointer and writes the physical address to `phys_out`. On failure
- * (out of space) returns NULL and leaves `*phys_out` untouched. */
+/* Allocate `size` bytes aligned to `align`. `align` must be a nonzero power
+ * of two (values like 4, 16, 256). On success returns virtual pointer and
+ * writes the physical address to `phys_out`. On failure (out of space)
+ * returns NULL and leaves `*phys_out` untouched. Passing NULL for `phys_out`
+ * is allowed when the caller only needs the virtual pointer. */
 void  *ohci_dma_alloc(struct ohci_dma_region *r, size_t size, size_t align, uint32_t *phys_out);
 
 /* Convert a physical address that resides within this region to its virtual
