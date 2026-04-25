@@ -2,6 +2,7 @@
 #include "ohci_regs.h"
 #include "ohci_hc.h"
 #include "ohci_pool.h"
+#include "ohci_ed.h"
 
 /* Negative error codes used internally. Kept small and symbolic. */
 #define OHCI_ERR_NOMEM      -1
@@ -26,6 +27,40 @@ static void w32(struct ohci_hc *hc, uint32_t off, uint32_t v) {
 }
 static void barrier(struct ohci_hc *hc) {
     hc->ops.barrier(hc->ops.context);
+}
+
+static int build_interrupt_skeleton(struct ohci_hc *hc) {
+    /* Allocate a dedicated ED pool for the 63 skeleton entries, distinct
+     * from hc->interrupt_ed_pool which holds user endpoints. The static
+     * keeps pool state across hc lifetime; for multi-hc scenarios in Plan 4+
+     * this would move into struct ohci_hc. */
+    static struct ohci_ed_pool skel_pool;
+    if (ohci_ed_pool_init(&skel_pool, hc->dma, 63) != 0) return -1;
+
+    uint32_t phys[63];
+    for (int i = 0; i < 63; i++) {
+        struct ohci_ed *ed = ohci_ed_pool_alloc(&skel_pool, &phys[i]);
+        if (!ed) return -1;
+        ed->Control = OHCI_ED_K;   /* Skip bit so HC never dispatches work */
+        ed->HeadP   = 0;
+        ed->TailP   = 0;
+        ed->NextED  = 0;
+        hc->interrupt_skeleton[i]      = ed;
+        hc->interrupt_skeleton_phys[i] = phys[i];
+    }
+
+    /* Link children -> parent. Levels: 0..31 leaves, 32..47 L1,
+     * 48..55 L2, 56..59 L3, 60..61 L4, 62 root. */
+    for (int i = 0; i < 32; i++) hc->interrupt_skeleton[i]->NextED      = phys[32 + i / 2];
+    for (int i = 0; i < 16; i++) hc->interrupt_skeleton[32+i]->NextED   = phys[48 + i / 2];
+    for (int i = 0; i <  8; i++) hc->interrupt_skeleton[48+i]->NextED   = phys[56 + i / 2];
+    for (int i = 0; i <  4; i++) hc->interrupt_skeleton[56+i]->NextED   = phys[60 + i / 2];
+    for (int i = 0; i <  2; i++) hc->interrupt_skeleton[60+i]->NextED   = phys[62];
+    hc->interrupt_skeleton[62]->NextED = 0;
+
+    /* HCCA.InterruptTable[i] -> leaf[i]. */
+    for (int i = 0; i < 32; i++) hc->hcca->InterruptTable[i] = phys[i];
+    return 0;
 }
 
 int ohci_hc_init(struct ohci_hc *hc,
@@ -62,6 +97,8 @@ int ohci_hc_init(struct ohci_hc *hc,
     hc->hcca_phys = phys;
     memset(hc->hcca, 0, sizeof(*hc->hcca));
 
+    if (build_interrupt_skeleton(hc) != 0) return OHCI_ERR_NOMEM;
+
     /* 3) Program HCCA + empty list heads + frame timing + interrupts. */
     w32(hc, REG_HcHCCA,            hc->hcca_phys);
     w32(hc, REG_HcControlHeadED,   0);
@@ -71,10 +108,10 @@ int ohci_hc_init(struct ohci_hc *hc,
     w32(hc, REG_HcInterruptStatus, 0xFFFFFFFFu);
     w32(hc, REG_HcInterruptEnable, OHCI_INT_WDH | OHCI_INT_MIE);
 
-    /* 4) Enable Control + Bulk lists; Periodic stays off until Task 5. */
+    /* 4) Enable Control + Bulk + Periodic lists. */
     uint32_t ctrl = r32(hc, REG_HcControl);
-    ctrl &= ~(OHCI_CTRL_HCFS_MASK | OHCI_CTRL_PLE);
-    ctrl |= OHCI_CTRL_CLE | OHCI_CTRL_BLE | OHCI_CTRL_IE | OHCI_CTRL_HCFS_OPER;
+    ctrl &= ~OHCI_CTRL_HCFS_MASK;
+    ctrl |= OHCI_CTRL_CLE | OHCI_CTRL_BLE | OHCI_CTRL_PLE | OHCI_CTRL_IE | OHCI_CTRL_HCFS_OPER;
     barrier(hc);
     w32(hc, REG_HcControl, ctrl);
 

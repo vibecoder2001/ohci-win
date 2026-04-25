@@ -61,3 +61,7 @@ add_test(NAME bulk COMMAND test_bulk)
 add_executable(test_bulk_sg test_bulk_sg.c)
 target_link_libraries(test_bulk_sg PRIVATE fake_hc)
 add_test(NAME bulk_sg COMMAND test_bulk_sg)
+
+add_executable(test_interrupt_skeleton test_interrupt_skeleton.c)
+target_link_libraries(test_interrupt_skeleton PRIVATE fake_hc)
+add_test(NAME interrupt_skeleton COMMAND test_interrupt_skeleton)

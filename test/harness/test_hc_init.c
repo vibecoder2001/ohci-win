@@ -46,14 +46,15 @@ int main(void) {
         fprintf(stderr, "FAIL: HcControlHeadED not zero\n"); return 1;
     }
 
-    /* HCCA.InterruptTable[] must be all zeroes (we don't use periodic list) */
+    /* InterruptTable[i] must now point at skeleton leaves (non-zero). */
     for (int i = 0; i < 32; i++) {
-        if (hc.hcca->InterruptTable[i] != 0) {
-            fprintf(stderr, "FAIL: HCCA.InterruptTable[%d] != 0\n", i); return 1;
+        if (hc.hcca->InterruptTable[i] == 0) {
+            fprintf(stderr, "FAIL: HCCA.InterruptTable[%d] = 0 (skeleton expected)\n", i);
+            return 1;
         }
     }
 
-    /* HcControl: OPER state, CLE + BLE + IE set, PLE clear */
+    /* HcControl: OPER state, CLE + BLE + PLE + IE set */
     uint32_t ctrl = ops.read32(ops.context, 0x04);
     if ((ctrl & OHCI_CTRL_HCFS_MASK) != OHCI_CTRL_HCFS_OPER) {
         fprintf(stderr, "FAIL: HCFS != OPER (ctrl=0x%x)\n", ctrl); return 1;
@@ -61,7 +62,7 @@ int main(void) {
     if (!(ctrl & OHCI_CTRL_CLE)) { fprintf(stderr, "FAIL: CLE not set\n"); return 1; }
     if (!(ctrl & OHCI_CTRL_IE))  { fprintf(stderr, "FAIL: IE not set\n"); return 1; }
     if (!(ctrl & OHCI_CTRL_BLE)) { fprintf(stderr, "FAIL: BLE not set\n"); return 1; }
-    if (ctrl & OHCI_CTRL_PLE)    { fprintf(stderr, "FAIL: PLE should be clear\n"); return 1; }
+    if (!(ctrl & OHCI_CTRL_PLE)) { fprintf(stderr, "FAIL: PLE should be set\n"); return 1; }
 
     /* HcInterruptEnable: WDH + MIE */
     uint32_t ie = ops.read32(ops.context, 0x10);
