@@ -25,3 +25,7 @@ add_test(NAME dma COMMAND test_dma)
 add_executable(test_hc_init test_hc_init.c)
 target_link_libraries(test_hc_init PRIVATE fake_hc)
 add_test(NAME hc_init COMMAND test_hc_init)
+
+add_executable(test_pool test_pool.c)
+target_link_libraries(test_pool PRIVATE ohci_core)
+add_test(NAME pool COMMAND test_pool)
