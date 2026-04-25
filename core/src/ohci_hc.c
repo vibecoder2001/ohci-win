@@ -1,6 +1,7 @@
 #include <string.h>
 #include "ohci_regs.h"
 #include "ohci_hc.h"
+#include "ohci_pool.h"
 
 /* Negative error codes used internally. Kept small and symbolic. */
 #define OHCI_ERR_NOMEM      -1
@@ -29,10 +30,13 @@ static void barrier(struct ohci_hc *hc) {
 
 int ohci_hc_init(struct ohci_hc *hc,
                  const struct ohci_mmio_ops *ops,
-                 struct ohci_dma_region *dma) {
+                 struct ohci_dma_region *dma,
+                 uint16_t td_pool_size) {
     memset(hc, 0, sizeof(*hc));
     hc->ops = *ops;
     hc->dma = dma;
+    if (ohci_td_pool_init(&hc->td_pool, dma, td_pool_size) != 0) return OHCI_ERR_NOMEM;
+    hc->control_head = NULL;
 
     /* 1) Reset: write HCR, wait for hardware to clear it. The fake HC
      * clears it synchronously; real hardware typically < 10 µs. */

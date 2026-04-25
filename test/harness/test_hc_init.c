@@ -19,7 +19,7 @@ int main(void) {
     fake_hc_get_ops(&fake, &ops);
 
     struct ohci_hc hc;
-    int rc = ohci_hc_init(&hc, &ops, &dma);
+    int rc = ohci_hc_init(&hc, &ops, &dma, 64);
     if (rc != 0) { fprintf(stderr, "FAIL: ohci_hc_init -> %d\n", rc); return 1; }
 
     /* HcHCCA must equal the phys addr of the allocated HCCA */

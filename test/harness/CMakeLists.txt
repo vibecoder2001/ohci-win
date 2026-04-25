@@ -33,3 +33,7 @@ add_test(NAME pool COMMAND test_pool)
 add_executable(test_control_build test_control_build.c)
 target_link_libraries(test_control_build PRIVATE ohci_core)
 add_test(NAME control_build COMMAND test_control_build)
+
+add_executable(test_submit test_submit.c)
+target_link_libraries(test_submit PRIVATE fake_hc)
+add_test(NAME submit COMMAND test_submit)

@@ -24,6 +24,45 @@ int ohci_build_control_chain(struct ohci_urb *urb,
                              struct ohci_td **head_out,
                              struct ohci_td **tail_out);
 
+/* One Control-class endpoint. Owns its ED plus an ED-dedicated pool of
+ * TDs (tail-placeholder convention). */
+struct ohci_control_endpoint {
+    struct ohci_ed *ed;
+    uint32_t        ed_phys;
+
+    /* Always-valid tail-placeholder TD. After each submit, this is
+     * overwritten in-place and a fresh TD becomes the new placeholder. */
+    struct ohci_td *tail_placeholder;
+    uint32_t        tail_placeholder_phys;
+
+    struct ohci_control_endpoint *next; /* SW-side control-list chain */
+};
+
+/* Endpoint configuration. Only FS Control in scope for this plan. */
+struct ohci_control_endpoint_config {
+    uint8_t  func_addr;     /* 0..127 */
+    uint8_t  ep_num;        /* 0..15  */
+    uint16_t max_packet_size;
+    uint8_t  low_speed;     /* 0=Full, 1=Low */
+};
+
+struct ohci_hc;
+
+/* Create and splice a Control endpoint onto the HC's Control list head.
+ * Allocates one ED from the caller-supplied ED pool and one placeholder
+ * TD from hc->td_pool. Writes HcControlHeadED. Caller provides
+ * pre-allocated ohci_control_endpoint storage. */
+int ohci_control_endpoint_create(struct ohci_hc *hc,
+                                 struct ohci_ed_pool *edp,
+                                 const struct ohci_control_endpoint_config *cfg,
+                                 struct ohci_control_endpoint *ep);
+
+/* Submit a Control URB: build TD chain, splice after the placeholder,
+ * advance TailP, write HcCommandStatus.CLF. Returns 0 on success. */
+int ohci_control_submit(struct ohci_hc *hc,
+                        struct ohci_control_endpoint *ep,
+                        struct ohci_urb *urb);
+
 #ifdef __cplusplus
 }
 #endif

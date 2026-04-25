@@ -1,5 +1,8 @@
 #include <string.h>
 #include "ohci_control.h"
+#include "ohci_hc.h"
+#include "ohci_regs.h"
+#include "ohci_dma.h"
 
 /* Build a General TD representing one stage of a Control transfer. */
 static void fill_td(struct ohci_td *td,
@@ -80,5 +83,108 @@ int ohci_build_control_chain(struct ohci_urb *urb,
 
     *head_out = setup_td;
     *tail_out = status_td;
+    return 0;
+}
+
+static void ed_set_control(struct ohci_ed *ed,
+                           const struct ohci_control_endpoint_config *cfg) {
+    uint32_t c = 0;
+    c |= ((uint32_t)cfg->func_addr & 0x7F)              << OHCI_ED_FA_SHIFT;
+    c |= ((uint32_t)cfg->ep_num & 0x0F)                 << OHCI_ED_EN_SHIFT;
+    c |= OHCI_ED_D_FROM_TD;     /* Control endpoints take direction from TD */
+    if (cfg->low_speed) c |= OHCI_ED_S;
+    c |= ((uint32_t)cfg->max_packet_size & 0x7FF)       << OHCI_ED_MPS_SHIFT;
+    ed->Control = c;
+}
+
+int ohci_control_endpoint_create(struct ohci_hc *hc,
+                                 struct ohci_ed_pool *edp,
+                                 const struct ohci_control_endpoint_config *cfg,
+                                 struct ohci_control_endpoint *ep) {
+    uint32_t ed_phys, ph_phys;
+    struct ohci_ed *ed = ohci_ed_pool_alloc(edp, &ed_phys);
+    struct ohci_td *ph = ohci_td_pool_alloc(&hc->td_pool, &ph_phys);
+    if (!ed || !ph) {
+        if (ed) ohci_ed_pool_free(edp, ed);
+        if (ph) ohci_td_pool_free(&hc->td_pool, ph);
+        return -1;
+    }
+    ed_set_control(ed, cfg);
+    ed->HeadP  = ph_phys;   /* HeadP == TailP == placeholder: empty queue */
+    ed->TailP  = ph_phys;
+    ed->NextED = 0;
+
+    ep->ed                    = ed;
+    ep->ed_phys               = ed_phys;
+    ep->tail_placeholder      = ph;
+    ep->tail_placeholder_phys = ph_phys;
+
+    /* Splice onto Control list head. */
+    uint32_t old_head = hc->ops.read32(hc->ops.context, 0x20);
+    ed->NextED = old_head;
+    hc->ops.barrier(hc->ops.context);
+    hc->ops.write32(hc->ops.context, 0x20, ed_phys);
+
+    /* SW-side list for iteration in done-queue handling. */
+    ep->next = hc->control_head;
+    hc->control_head = ep;
+    return 0;
+}
+
+int ohci_control_submit(struct ohci_hc *hc,
+                        struct ohci_control_endpoint *ep,
+                        struct ohci_urb *urb) {
+    urb->status      = OHCI_URB_STATUS_PENDING;
+    urb->transferred = 0;
+    urb->ed          = ep->ed;
+
+    /* Build a fresh 2- or 3-TD chain in a new set of pool TDs. */
+    struct ohci_td *chain_head = NULL, *chain_tail = NULL;
+    int rc = ohci_build_control_chain(urb, &hc->td_pool, &chain_head, &chain_tail);
+    if (rc != 0) return rc;
+
+    /* Allocate a NEW placeholder to become the future tail. */
+    uint32_t new_ph_phys;
+    struct ohci_td *new_ph = ohci_td_pool_alloc(&hc->td_pool, &new_ph_phys);
+    if (!new_ph) {
+        /* Roll back the chain on failure. */
+        struct ohci_td *t = chain_head;
+        while (t) {
+            struct ohci_td *n = (t->NextTD == 0) ? NULL
+                : ohci_dma_virt_from_phys(hc->dma, t->NextTD);
+            ohci_td_pool_free(&hc->td_pool, t);
+            if (t == chain_tail) break;
+            t = n;
+        }
+        return -1;
+    }
+
+    /* OHCI placeholder convention: fold chain_head's contents into the
+     * existing placeholder (so ED.HeadP still points to a live TD), then
+     * make chain_tail->NextTD point at the new placeholder. */
+    *ep->tail_placeholder = *chain_head;
+    chain_tail->NextTD = new_ph_phys;
+
+    /* chain_head's pool slot is redundant now (its content lives in
+     * the old placeholder). Free it back to the pool. */
+    ohci_td_pool_free(&hc->td_pool, chain_head);
+
+    /* Install the new placeholder as the tail. */
+    ep->tail_placeholder      = new_ph;
+    ep->tail_placeholder_phys = new_ph_phys;
+
+    urb->head_td = (ep->ed->HeadP & OHCI_ED_HEADP_ADDR_MASK)
+        ? ohci_dma_virt_from_phys(hc->dma,
+              ep->ed->HeadP & OHCI_ED_HEADP_ADDR_MASK)
+        : NULL;
+    urb->tail_td = chain_tail;
+
+    /* Update ED.TailP — publishes the new chain to the HC. */
+    hc->ops.barrier(hc->ops.context);
+    ep->ed->TailP = new_ph_phys;
+
+    /* Doorbell: HcCommandStatus.CLF = 1 signals the HC to walk the list. */
+    hc->ops.barrier(hc->ops.context);
+    hc->ops.write32(hc->ops.context, 0x08 /* HcCommandStatus */, OHCI_CMD_CLF);
     return 0;
 }
