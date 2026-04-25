@@ -1,6 +1,7 @@
 #include <ntddk.h>
 #include <wdf.h>
 #include "device_context.h"
+#include "ohci_regs.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -142,6 +143,13 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     /* Sanity-check the result by reading HcControl. */
     ULONG ctrl = READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x04));
     LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
+
+    /* Enable RHSC so port-status changes route through our DPC.
+     * HcInterruptEnable is W1S: writing 1 sets the bit, 0 leaves it alone.
+     * The WDH|MIE bits already set by ohci_hc_init are preserved. */
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x10 /* HcInterruptEnable */),
+                         OHCI_INT_RHSC);
+    LOG("RHSC interrupt enabled");
 
     NTSTATUS bcStatus = OhciPci_BounceInit(dc);
     LOG("OhciPci_BounceInit -> 0x%08X", bcStatus);

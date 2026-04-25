@@ -70,6 +70,10 @@ NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
 /* Defined in ucx_roothub.c — UCX 1.6 root hub registration. */
 NTSTATUS OhciPci_RootHubCreate(PDEVICE_CONTEXT dc, UCXCONTROLLER controller);
 
+/* Thin wrapper so interrupt.c can trigger UCX port-change without a direct
+ * UcxClass.h dependency in that translation unit. */
+void OhciPci_NotifyPortChanged(PDEVICE_CONTEXT dc);
+
 /* Defined in bounce.c — per-URB bounce buffer slab pool. */
 NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);
 

@@ -114,6 +114,11 @@ Environment:
 #define REG_HcRhDescriptorA  0x48u
 #define REG_HcRhDescriptorB  0x4Cu
 
+/* Root-hub port-status register base and change-bit mask. */
+#define REG_HcRhPortStatus_BASE  0x54u
+/* Bits 16-20: CSC|PESC|PSSC|OCIC|PRSC (OHCI spec §7.4.2) */
+#define OHCI_RHPS_CHANGE_MASK    0x001F0000u
+
 /*
  * Module-static device context pointer.
  *
@@ -141,19 +146,86 @@ static VOID StubControlUrb(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 }
 
 /* --------------------------------------------------------------------------
- * StubInterruptTx — EVT_UCX_ROOTHUB_INTERRUPT_TX
+ * OhciPciInterruptTx — EVT_UCX_ROOTHUB_INTERRUPT_TX  (Task 4 real impl)
  *
- * Plan skeleton name matches exactly.  Signature confirmed: (UCXROOTHUB, WDFREQUEST).
- * Task 4 implements.
+ * Called by UCX when it wants to know which ports have changed state.
+ * Returns a USB 2.0 hub change-status bitmap (USB 2.0 §11.12.4):
+ *   bit 0 = hub-level change (we always report 0)
+ *   bit i = port i has at least one change bit set (1-indexed)
+ *
+ * Change bits read from HcRhPortStatus[i-1] bits 16-20 (CSC|PESC|PSSC|OCIC|PRSC).
+ * They are W1C: writing them back clears them so the port doesn't re-fire.
+ *
+ * UCX may request more bytes than OHCI needs (e.g., for USB 3 port extension);
+ * we zero-pad the remainder.
  * -------------------------------------------------------------------------- */
-static EVT_UCX_ROOTHUB_INTERRUPT_TX StubInterruptTx;
+static EVT_UCX_ROOTHUB_INTERRUPT_TX OhciPciInterruptTx;
 
 _Use_decl_annotations_
-static VOID StubInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    LOG("RootHub StubInterruptTx — completing as STATUS_NOT_IMPLEMENTED");
-    WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    if (!dc || !dc->MmioBase) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+
+    ULONG rhDescA = READ_REGISTER_ULONG(
+                        (PULONG)((PUCHAR)dc->MmioBase + REG_HcRhDescriptorA));
+    ULONG ports   = rhDescA & 0xFFu;
+
+    /*
+     * USB 2.0 hub change-status bitmap: bit 0 = hub, bit i = port i (1-indexed).
+     * Allow up to 8 bytes — covers up to 63 ports, far more than OHCI's max 15.
+     */
+    UCHAR bitmap[8] = {0};
+    int anySet = 0;
+
+    for (ULONG i = 0; i < ports; i++) {
+        ULONG rhps = READ_REGISTER_ULONG(
+                         (PULONG)((PUCHAR)dc->MmioBase
+                                  + REG_HcRhPortStatus_BASE + i * 4u));
+        if (rhps & OHCI_RHPS_CHANGE_MASK) {
+            ULONG portBit = i + 1u;          /* 1-indexed */
+            bitmap[portBit / 8u] |= (UCHAR)(1u << (portBit % 8u));
+            anySet = 1;
+            /* W1C: write the change bits back to clear them. */
+            WRITE_REGISTER_ULONG(
+                (PULONG)((PUCHAR)dc->MmioBase
+                         + REG_HcRhPortStatus_BASE + i * 4u),
+                rhps & OHCI_RHPS_CHANGE_MASK);
+        }
+    }
+
+    PVOID outBuf;
+    size_t outLen;
+    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, 1, &outBuf, &outLen);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    /*
+     * If UCX requests more bytes than our bitmap covers (possible when
+     * ControllerTypeSoftXhci causes it to expect a USB 3-style longer bitmap),
+     * log it and zero-pad the extra bytes.
+     */
+    if (outLen > sizeof(bitmap)) {
+        LOG("RootHub InterruptTx: UCX requested %zu bytes (bitmap=%zu); zero-padding extra",
+            outLen, sizeof(bitmap));
+    }
+
+    size_t copyLen = (sizeof(bitmap) < outLen) ? sizeof(bitmap) : outLen;
+    RtlCopyMemory(outBuf, bitmap, copyLen);
+    if (outLen > copyLen) {
+        RtlZeroMemory((PUCHAR)outBuf + copyLen, outLen - copyLen);
+    }
+
+    LOG("RootHub InterruptTx: bitmap[0]=0x%02X (anyChange=%d), ports=%lu, copied %zu bytes",
+        bitmap[0], anySet, ports, copyLen);
+
+    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, outLen);
 }
 
 /* --------------------------------------------------------------------------
@@ -425,7 +497,7 @@ OhciPci_RootHubCreate(
     UCX_ROOTHUB_CONFIG_INIT_WITH_CONTROL_URB_HANDLER(
         &cfg,
         StubControlUrb,
-        StubInterruptTx,
+        OhciPciInterruptTx,
         OhciPciGetInfo,
         OhciPciGet20PortInfo,
         StubGet30PortInfo
@@ -435,4 +507,20 @@ OhciPci_RootHubCreate(
                                        WDF_NO_OBJECT_ATTRIBUTES, &dc->RootHub);
     LOG("UcxRootHubCreate -> 0x%08X", status);
     return status;
+}
+
+/* --------------------------------------------------------------------------
+ * OhciPci_NotifyPortChanged — declared in device_context.h
+ *
+ * Thin wrapper so interrupt.c (which does not include UcxClass.h) can trigger
+ * a UCX port-change notification without a direct UCX API dependency.
+ * -------------------------------------------------------------------------- */
+void
+OhciPci_NotifyPortChanged(
+    _In_ PDEVICE_CONTEXT dc
+    )
+{
+    if (dc && dc->RootHub) {
+        UcxRootHubPortChanged(dc->RootHub);
+    }
 }

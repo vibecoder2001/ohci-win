@@ -43,8 +43,23 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
     UNREFERENCED_PARAMETER(AssociatedObject);
     PDEVICE_CONTEXT dc = DeviceContextGet(WdfInterruptGetDevice(Interrupt));
 
-    /* Process any retired TDs (no URBs in flight in Plan 4 → no-op). */
-    ohci_drain_done(&dc->Hc);
+    /* Snapshot HcInterruptStatus to see what fired. */
+    ULONG istat = READ_REGISTER_ULONG(
+                      (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus));
+
+    if (istat & OHCI_INT_WDH) {
+        /* ohci_drain_done processes retired TDs; WDH is W1C inside the core. */
+        ohci_drain_done(&dc->Hc);
+    }
+
+    if ((istat & OHCI_INT_RHSC) && dc->RootHub) {
+        LOG("RHSC fired — notifying UCX root hub");
+        OhciPci_NotifyPortChanged(dc);
+        /* W1C the RHSC bit so it does not re-fire. */
+        WRITE_REGISTER_ULONG(
+            (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus),
+            OHCI_INT_RHSC);
+    }
 
     /* Re-enable the master interrupt. */
     if (dc->MmioBase) {
