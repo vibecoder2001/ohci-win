@@ -212,5 +212,10 @@ OhciPci_UcxControllerCreate(
      * such export. Omitted — the call would not compile or link.
      */
 
-    return status;
+    if (!NT_SUCCESS(status)) return status;
+
+    /* Save controller handle so OhciPci_RootHubCreate (ucx_roothub.c) can
+     * use it. Previously the handle was a local variable and was discarded. */
+    dc->Controller = controller;
+    return STATUS_SUCCESS;
 }

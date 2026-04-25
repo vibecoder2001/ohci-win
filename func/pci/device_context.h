@@ -3,6 +3,7 @@
 
 #include <ntddk.h>
 #include <wdf.h>
+#include <UcxClass.h>
 #include "ohci_mmio.h"
 #include "ohci_dma.h"
 #include "ohci_hc.h"
@@ -42,6 +43,10 @@ typedef struct _DEVICE_CONTEXT {
     struct ohci_dma_region   DmaRegion;
     struct ohci_hc           Hc;
 
+    /* UCX controller and root hub handles (Plan 5 Tasks 1-4). */
+    UCXCONTROLLER            Controller;    /* Saved from UcxControllerCreate. */
+    UCXROOTHUB               RootHub;      /* From UcxRootHubCreate. */
+
     BOOLEAN                  HcInitialized;  /* Set after ohci_hc_init success. */
 
     struct ohcipci_bounce_pool BouncePool;
@@ -61,6 +66,9 @@ NTSTATUS OhciPci_CreateInterrupt(PDEVICE_CONTEXT dc);
 /* Defined in ucx_glue.c — UCX 1.6 controller registration helpers. */
 NTSTATUS OhciPci_UcxInitDeviceInit(PWDFDEVICE_INIT DeviceInit);
 NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
+
+/* Defined in ucx_roothub.c — UCX 1.6 root hub registration. */
+NTSTATUS OhciPci_RootHubCreate(PDEVICE_CONTEXT dc, UCXCONTROLLER controller);
 
 /* Defined in bounce.c — per-URB bounce buffer slab pool. */
 NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);

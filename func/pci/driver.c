@@ -153,6 +153,12 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
         return ucxCtrlStatus;
     }
 
+    NTSTATUS rhStatus = OhciPci_RootHubCreate(dc, dc->Controller);
+    if (!NT_SUCCESS(rhStatus)) {
+        LOG("UcxRootHubCreate failed; refusing to start");
+        return rhStatus;
+    }
+
     return STATUS_SUCCESS;
 }
 
