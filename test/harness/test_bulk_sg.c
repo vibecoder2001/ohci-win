@@ -42,10 +42,18 @@ int main(void) {
     urb.direction = OHCI_URB_DIR_OUT;
     urb.complete = on_done;
 
-    ohci_bulk_submit(&hc, &ep, &urb);
+    /* Plan 7: SG submit takes an explicit page list. Build 3 chunks
+     * (4 KB + 4 KB + 2 KB) over the contiguous buffer to mirror what
+     * the func/ MDL walker would produce for a 10 KB buffer that spans
+     * three 4 KB pages. */
+    struct ohci_bulk_sg_page sg[3] = {
+        { .phys = buf_phys + 0,           .length = 4096, .off = 0 },
+        { .phys = buf_phys + 4096,        .length = 4096, .off = 4096 },
+        { .phys = buf_phys + 8192,        .length = 2048, .off = 8192 },
+    };
+    ohci_bulk_submit_sg(&hc, &ep, &urb, sg, 3);
 
-    /* Walk the queue from ED.HeadP to count TDs excluding placeholder.
-     * 10 KB / 4 KB per TD = 3 TDs (4 + 4 + 2). */
+    /* Walk the queue from ED.HeadP to count TDs excluding placeholder. */
     uint32_t cur = ep.ed->HeadP & OHCI_ED_HEADP_ADDR_MASK;
     uint32_t tail = ep.ed->TailP;
     int tds = 0;

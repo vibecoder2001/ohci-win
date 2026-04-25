@@ -33,13 +33,6 @@ int ohci_bulk_endpoint_create(struct ohci_hc *hc,
                               const struct ohci_bulk_endpoint_config *cfg,
                               struct ohci_bulk_endpoint *ep);
 
-/* Submit a Bulk URB. Splits the URB buffer into one or more General TDs
- * each covering at most 4 KB, chained via NextTD. urb->direction is
- * ignored for Bulk — direction comes from the ED. */
-int ohci_bulk_submit(struct ohci_hc *hc,
-                     struct ohci_bulk_endpoint *ep,
-                     struct ohci_urb *urb);
-
 /* Per-page descriptor for SG submit. The caller fills one of these per
  * physically-contiguous page (typically obtained by walking an MDL). */
 struct ohci_bulk_sg_page {
@@ -58,6 +51,19 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
                         struct ohci_urb *urb,
                         const struct ohci_bulk_sg_page *pages,
                         unsigned page_count);
+
+/* Single-page convenience wrapper around ohci_bulk_submit_sg. Used by the
+ * Tier-1 harness (which has no MDL plumbing) and any caller that already
+ * has a single physically-contiguous buffer ≤ 4 KB. */
+static inline int ohci_bulk_submit(struct ohci_hc *hc,
+                                   struct ohci_bulk_endpoint *ep,
+                                   struct ohci_urb *urb) {
+    struct ohci_bulk_sg_page page;
+    page.phys   = urb->buffer_phys;
+    page.length = urb->length;
+    page.off    = 0;
+    return ohci_bulk_submit_sg(hc, ep, urb, &page, 1);
+}
 
 void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
                                 struct ohci_bulk_endpoint *ep);
