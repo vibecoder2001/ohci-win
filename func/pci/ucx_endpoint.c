@@ -270,9 +270,14 @@ EvtUrbDefault(
     uc->EpCtx       = ep;
     uc->TransferUrb = urb;
 
+    /* CoreLock guards the bounce-pool bitmap RMW + ohci_control_submit's
+     * mutation of hc->in_flight against the WDH DPC running concurrently. */
+    WdfSpinLockAcquire(dc->CoreLock);
+
     /* SETUP bounce: always 8 bytes. */
     uc->SetupBounce = OhciPci_BounceAlloc(dc, &uc->SetupBouncePhys);
     if (uc->SetupBounce == NULL) {
+        WdfSpinLockRelease(dc->CoreLock);
         WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
         return;
     }
@@ -282,12 +287,14 @@ EvtUrbDefault(
     if (length > 0) {
         if (length > OHCIPCI_BOUNCE_SLAB_BYTES) {
             OhciPci_BounceFree(dc, uc->SetupBounce);
+            WdfSpinLockRelease(dc->CoreLock);
             WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
             return;
         }
         uc->DataBounce = OhciPci_BounceAlloc(dc, &uc->DataBouncePhys);
         if (uc->DataBounce == NULL) {
             OhciPci_BounceFree(dc, uc->SetupBounce);
+            WdfSpinLockRelease(dc->CoreLock);
             WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
             return;
         }
@@ -321,12 +328,14 @@ EvtUrbDefault(
 
     int rc = ohci_control_submit(&dc->Hc, &ep->Core, &uc->CoreUrb);
     if (rc != 0) {
-        LOG("ohci_control_submit failed: %d", rc);
         if (uc->SetupBounce) OhciPci_BounceFree(dc, uc->SetupBounce);
         if (uc->DataBounce)  OhciPci_BounceFree(dc, uc->DataBounce);
+        WdfSpinLockRelease(dc->CoreLock);
+        LOG("ohci_control_submit failed: %d", rc);
         WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
         return;
     }
+    WdfSpinLockRelease(dc->CoreLock);
     LOG("ohci_control_submit OK (setup_phys=0x%08X data_phys=0x%08X len=%u dir=%u)",
         uc->SetupBouncePhys, uc->DataBouncePhys, uc->DataLength, uc->DataDirection);
     /* Completion is asynchronous — OhciPci_UrbComplete will call
