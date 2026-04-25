@@ -72,9 +72,83 @@ Environment:
 #include <UcxClass.h>
 #include <usbioctl.h>
 #include "device_context.h"
+#include "ohci_control.h"
+#include "ohci_urb.h"
+#include "ohci_dma.h"
+#include "ohci_ed.h"
+#include "ohci_regs.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
+
+/* --------------------------------------------------------------------------
+ * Synchronous SETUP-only Control transfer helper (Plan 7).
+ *
+ * Used by EvtUsbDeviceAddress to issue a real SET_ADDRESS on the wire.
+ * EvtUsbDeviceAddress is __drv_maxIRQL(DISPATCH_LEVEL) per ucxusbdevice.h
+ * — in practice during enumeration UCX dispatches at PASSIVE so KeWait is
+ * legal. Asserts PASSIVE; if a future Windows build delivers Address at
+ * DISPATCH this will trip and we'll switch to a WDFWORKITEM.
+ * -------------------------------------------------------------------------- */
+typedef struct _OHCIPCI_SYNC_URB {
+    struct ohci_urb urb;
+    KEVENT          done;
+} OHCIPCI_SYNC_URB;
+
+static VOID OhciPci_SyncUrbComplete(struct ohci_urb *u) {
+    OHCIPCI_SYNC_URB *s = CONTAINING_RECORD(u, OHCIPCI_SYNC_URB, urb);
+    KeSetEvent(&s->done, IO_NO_INCREMENT, FALSE);
+}
+
+static NTSTATUS
+OhciPci_SyncSetupOnly(PDEVICE_CONTEXT dc,
+                      OHCIPCI_EP_CONTEXT *ep0,
+                      const UCHAR setup[8])
+{
+    NT_ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    uint32_t setup_phys;
+    void *setupBounce;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    setupBounce = OhciPci_BounceAlloc(dc, &setup_phys);
+    WdfSpinLockRelease(dc->CoreLock);
+    if (setupBounce == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlCopyMemory(setupBounce, setup, 8);
+
+    OHCIPCI_SYNC_URB s;
+    RtlZeroMemory(&s, sizeof(s));
+    KeInitializeEvent(&s.done, NotificationEvent, FALSE);
+    RtlCopyMemory(s.urb.setup, setup, 8);
+    s.urb.setup_phys = setup_phys;
+    s.urb.buffer     = NULL;
+    s.urb.length     = 0;
+    s.urb.direction  = OHCI_URB_DIR_IN;
+    s.urb.complete   = OhciPci_SyncUrbComplete;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    int rc = ohci_control_submit(&dc->Hc, &ep0->Core.Control, &s.urb);
+    WdfSpinLockRelease(dc->CoreLock);
+    if (rc != 0) {
+        WdfSpinLockAcquire(dc->CoreLock);
+        OhciPci_BounceFree(dc, setupBounce);
+        WdfSpinLockRelease(dc->CoreLock);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -50LL * 1000LL * 10LL; /* 50 ms */
+    NTSTATUS w = KeWaitForSingleObject(&s.done, Executive, KernelMode, FALSE, &timeout);
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    OhciPci_BounceFree(dc, setupBounce);
+    WdfSpinLockRelease(dc->CoreLock);
+
+    if (w != STATUS_SUCCESS) return STATUS_IO_TIMEOUT;
+    return (s.urb.status == OHCI_URB_STATUS_OK)
+            ? STATUS_SUCCESS
+            : STATUS_DEVICE_DATA_ERROR;
+}
 
 /* --------------------------------------------------------------------------
  * Forward declarations for endpoint callbacks.
@@ -148,12 +222,74 @@ StubUsbDeviceAddress(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    /* Plan 7 Task 2 will replace this with a real SET_ADDRESS on the wire
-     * + EP0 ED func_addr rewrite, reading the requested address from
-     * Parameters.Others.Arg1 (PUSBDEVICE_ADDRESS) and storing it on the
-     * per-device OHCIPCI_USBDEV_CTX. For Task 1 we just ack so enumeration
-     * still works at addr=0 between Tasks 1 and 2. */
-    LOG("UsbDeviceAddress (stub — Task 2 will implement)");
+    extern PDEVICE_CONTEXT g_DeviceContext;
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_ADDRESS addrPkt = (PUSBDEVICE_ADDRESS)rp.Parameters.Others.Arg1;
+    if (addrPkt == NULL) {
+        LOG("UsbDeviceAddress: missing addr packet");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    /* USBDEVICE_MGMT_HEADER carries UCXUSBDEVICE UsbDevice via an anon
+     * struct member; reach it through the typed pointer cast. */
+    UCXUSBDEVICE usbDev = addrPkt->UsbDevice;
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(usbDev);
+    UCHAR newAddr = (UCHAR)(addrPkt->Address & 0x7F);
+
+    if (udc == NULL || udc->Ep0 == NULL) {
+        LOG("UsbDeviceAddress: per-device context or EP0 missing");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+
+    LOG("UsbDeviceAddress: requested addr=%u (current=%u)", newAddr, udc->FuncAddr);
+
+    /* Build SET_ADDRESS SETUP packet (USB §9.4.6):
+     *   bmRequestType=0x00 (host->dev, std, device)
+     *   bRequest=0x05 (SET_ADDRESS)
+     *   wValue=newAddr  wIndex=0  wLength=0  (no data stage) */
+    UCHAR setup[8] = { 0x00, 0x05, newAddr, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    NTSTATUS s = OhciPci_SyncSetupOnly(g_DeviceContext, udc->Ep0, setup);
+    LOG("UsbDeviceAddress: SyncSetupOnly -> 0x%08X", s);
+    if (!NT_SUCCESS(s)) {
+        WdfRequestComplete(Request, s);
+        return;
+    }
+
+    /* Device is now at newAddr (USB §9.4.6 says 2 ms transition; we'll
+     * naturally wait that out before the next URB). Rewrite the EP0 ED
+     * func_addr so all subsequent transfers go to the right address.
+     * Pause CLE around the rewrite per OHCI §6.2.1 to avoid racing the HC
+     * mid-walk. */
+    struct ohci_ed *ed = udc->Ep0->Core.Control.ed;
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    uint32_t hc_ctrl = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
+    int was_enabled = (hc_ctrl & OHCI_CTRL_CLE) != 0;
+    if (was_enabled) {
+        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
+        dc->MmioOps.barrier(dc->MmioOps.context);
+        uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+        for (int i = 0; i < 10000; i++) {
+            uint32_t f = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+            if (f != f0) break;
+        }
+    }
+    /* OHCI §4.2.2: ED.Control bits [6:0] = function address. */
+    ed->Control = (ed->Control & ~0x7Fu) | ((uint32_t)newAddr & 0x7F);
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    if (was_enabled) {
+        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
+    }
+    udc->FuncAddr = newAddr;
+    WdfSpinLockRelease(dc->CoreLock);
+
+    LOG("UsbDeviceAddress: ED.func_addr rewritten to %u", newAddr);
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
