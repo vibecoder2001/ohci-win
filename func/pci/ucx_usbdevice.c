@@ -84,11 +84,11 @@ Environment:
 /* --------------------------------------------------------------------------
  * Synchronous SETUP-only Control transfer helper (Plan 7).
  *
- * Used by EvtUsbDeviceAddress to issue a real SET_ADDRESS on the wire.
- * EvtUsbDeviceAddress is __drv_maxIRQL(DISPATCH_LEVEL) per ucxusbdevice.h
- * — in practice during enumeration UCX dispatches at PASSIVE so KeWait is
- * legal. Asserts PASSIVE; if a future Windows build delivers Address at
- * DISPATCH this will trip and we'll switch to a WDFWORKITEM.
+ * Used by the SET_ADDRESS path to issue a real SET_ADDRESS on the wire.
+ * This routine MUST run at PASSIVE_LEVEL because it KeWaits on the URB
+ * completion event. EvtUsbDeviceAddress, however, can fire at DISPATCH
+ * (UCX delivers it from a timer DPC) so the caller is responsible for
+ * dispatching here via a WDF workitem (see OhciPci_SetAddressWorker).
  * -------------------------------------------------------------------------- */
 typedef struct _OHCIPCI_SYNC_URB {
     struct ohci_urb urb;
@@ -148,6 +148,65 @@ OhciPci_SyncSetupOnly(PDEVICE_CONTEXT dc,
     return (s.urb.status == OHCI_URB_STATUS_OK)
             ? STATUS_SUCCESS
             : STATUS_DEVICE_DATA_ERROR;
+}
+
+/* Workitem context: carries the request + decoded args from
+ * EvtUsbDeviceAddress (DISPATCH) down to the worker (PASSIVE). */
+typedef struct _OHCIPCI_SETADDR_CTX {
+    WDFREQUEST           Request;
+    OHCIPCI_USBDEV_CTX  *Udc;
+    OHCIPCI_EP_CONTEXT  *Ep0;
+    UCHAR                NewAddr;
+} OHCIPCI_SETADDR_CTX, *POHCIPCI_SETADDR_CTX;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_SETADDR_CTX, OhciPci_SetAddrCtxGet)
+
+static EVT_WDF_WORKITEM OhciPci_SetAddressWorker;
+
+_Use_decl_annotations_
+static VOID
+OhciPci_SetAddressWorker(WDFWORKITEM WorkItem)
+{
+    extern PDEVICE_CONTEXT g_DeviceContext;
+    POHCIPCI_SETADDR_CTX ctx = OhciPci_SetAddrCtxGet(WorkItem);
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+
+    UCHAR setup[8] = { 0x00, 0x05, ctx->NewAddr, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    NTSTATUS s = OhciPci_SyncSetupOnly(dc, ctx->Ep0, setup);
+    LOG("UsbDeviceAddress[wi]: SyncSetupOnly addr=%u -> 0x%08X",
+        ctx->NewAddr, s);
+    if (!NT_SUCCESS(s)) {
+        WdfRequestComplete(ctx->Request, s);
+        WdfObjectDelete(WorkItem);
+        return;
+    }
+
+    /* Rewrite the EP0 ED's func_addr field. Pause CLE around the edit
+     * (OHCI §6.2.1) so the HC isn't mid-walk. */
+    struct ohci_ed *ed = ctx->Ep0->Core.Control.ed;
+    WdfSpinLockAcquire(dc->CoreLock);
+    uint32_t hc_ctrl = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
+    int was_enabled = (hc_ctrl & OHCI_CTRL_CLE) != 0;
+    if (was_enabled) {
+        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
+        dc->MmioOps.barrier(dc->MmioOps.context);
+        uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+        for (int i = 0; i < 10000; i++) {
+            uint32_t f = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+            if (f != f0) break;
+        }
+    }
+    ed->Control = (ed->Control & ~0x7Fu) | ((uint32_t)ctx->NewAddr & 0x7F);
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    if (was_enabled) {
+        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
+    }
+    ctx->Udc->FuncAddr = ctx->NewAddr;
+    WdfSpinLockRelease(dc->CoreLock);
+
+    LOG("UsbDeviceAddress[wi]: ED.func_addr rewritten to %u", ctx->NewAddr);
+    WdfRequestComplete(ctx->Request, STATUS_SUCCESS);
+    WdfObjectDelete(WorkItem);
 }
 
 /* --------------------------------------------------------------------------
@@ -246,51 +305,33 @@ StubUsbDeviceAddress(
         return;
     }
 
-    LOG("UsbDeviceAddress: requested addr=%u (current=%u)", newAddr, udc->FuncAddr);
+    LOG("UsbDeviceAddress: requested addr=%u (current=%u) — deferring to workitem",
+        newAddr, udc->FuncAddr);
 
-    /* Build SET_ADDRESS SETUP packet (USB §9.4.6):
-     *   bmRequestType=0x00 (host->dev, std, device)
-     *   bRequest=0x05 (SET_ADDRESS)
-     *   wValue=newAddr  wIndex=0  wLength=0  (no data stage) */
-    UCHAR setup[8] = { 0x00, 0x05, newAddr, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    NTSTATUS s = OhciPci_SyncSetupOnly(g_DeviceContext, udc->Ep0, setup);
-    LOG("UsbDeviceAddress: SyncSetupOnly -> 0x%08X", s);
-    if (!NT_SUCCESS(s)) {
-        WdfRequestComplete(Request, s);
+    /* The actual SET_ADDRESS work (sync URB submit + KeWait + ED rewrite)
+     * needs PASSIVE. UCX delivers this callback from a timer DPC at
+     * DISPATCH, so we queue a workitem and return; the worker completes
+     * the request when SET_ADDRESS lands on the wire. */
+    WDF_WORKITEM_CONFIG wic;
+    WDF_WORKITEM_CONFIG_INIT(&wic, OhciPci_SetAddressWorker);
+
+    WDF_OBJECT_ATTRIBUTES wia;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&wia, OHCIPCI_SETADDR_CTX);
+    wia.ParentObject = g_DeviceContext->Device;
+
+    WDFWORKITEM wi;
+    NTSTATUS ws = WdfWorkItemCreate(&wic, &wia, &wi);
+    if (!NT_SUCCESS(ws)) {
+        LOG("UsbDeviceAddress: WdfWorkItemCreate -> 0x%08X", ws);
+        WdfRequestComplete(Request, ws);
         return;
     }
-
-    /* Device is now at newAddr (USB §9.4.6 says 2 ms transition; we'll
-     * naturally wait that out before the next URB). Rewrite the EP0 ED
-     * func_addr so all subsequent transfers go to the right address.
-     * Pause CLE around the rewrite per OHCI §6.2.1 to avoid racing the HC
-     * mid-walk. */
-    struct ohci_ed *ed = udc->Ep0->Core.Control.ed;
-    PDEVICE_CONTEXT dc = g_DeviceContext;
-
-    WdfSpinLockAcquire(dc->CoreLock);
-    uint32_t hc_ctrl = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
-    int was_enabled = (hc_ctrl & OHCI_CTRL_CLE) != 0;
-    if (was_enabled) {
-        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
-        dc->MmioOps.barrier(dc->MmioOps.context);
-        uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
-        for (int i = 0; i < 10000; i++) {
-            uint32_t f = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
-            if (f != f0) break;
-        }
-    }
-    /* OHCI §4.2.2: ED.Control bits [6:0] = function address. */
-    ed->Control = (ed->Control & ~0x7Fu) | ((uint32_t)newAddr & 0x7F);
-    dc->MmioOps.barrier(dc->MmioOps.context);
-    if (was_enabled) {
-        dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
-    }
-    udc->FuncAddr = newAddr;
-    WdfSpinLockRelease(dc->CoreLock);
-
-    LOG("UsbDeviceAddress: ED.func_addr rewritten to %u", newAddr);
-    WdfRequestComplete(Request, STATUS_SUCCESS);
+    POHCIPCI_SETADDR_CTX ctx = OhciPci_SetAddrCtxGet(wi);
+    ctx->Request = Request;
+    ctx->Udc     = udc;
+    ctx->Ep0     = udc->Ep0;
+    ctx->NewAddr = newAddr;
+    WdfWorkItemEnqueue(wi);
 }
 
 _Use_decl_annotations_
