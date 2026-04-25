@@ -214,10 +214,15 @@ int ohci_control_submit(struct ohci_hc *hc,
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = chain_tail;
     /* If there's a data stage, the SETUP TD's NextTD now points at it.
-     * Drain uses this to compute bytes transferred from the DATA TD's CBP. */
-    urb->data_td_phys = (urb->buffer && urb->length > 0)
-                            ? urb->head_td->NextTD
-                            : 0;
+     * Record the data TD so the drain can compute bytes transferred. */
+    if (urb->buffer && urb->length > 0) {
+        urb->data_tds[0].td_phys   = urb->head_td->NextTD;
+        urb->data_tds[0].chunk_off = 0;
+        urb->data_tds[0].chunk_len = urb->length;
+        urb->data_td_count = 1;
+    } else {
+        urb->data_td_count = 0;
+    }
 
     /* Update ED.TailP — publishes the new chain to the HC. */
     hc->ops.barrier(hc->ops.context);

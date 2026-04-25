@@ -183,11 +183,11 @@ int ohci_bulk_submit(struct ohci_hc *hc,
     urb->tail_td = (last_td == first_td)
         ? ohci_dma_virt_from_phys(hc->dma, head_td_phys)
         : ohci_dma_virt_from_phys(hc->dma, last_td_phys);
-    /* For drain bytes-transferred accumulation we point at the LAST TD
-     * (the one whose CBP gives the final byte position). Plan 6 caps
-     * Bulk URBs at one slab so head == last; Plan 7 multi-TD Bulk will
-     * need richer accounting. */
-    urb->data_td_phys = (last_td == first_td) ? head_td_phys : last_td_phys;
+    /* Single-TD Bulk URB (Plan 7 Task 4 adds the SG variant). */
+    urb->data_tds[0].td_phys   = (last_td == first_td) ? head_td_phys : last_td_phys;
+    urb->data_tds[0].chunk_off = 0;
+    urb->data_tds[0].chunk_len = urb->length;
+    urb->data_td_count = 1;
 
     /* Last TD must signal IOC so the WDH interrupt fires when the URB is
      * done. Earlier TDs (if any) keep DI=7 to suppress mid-transfer IRQs. */

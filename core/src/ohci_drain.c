@@ -43,11 +43,17 @@ static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
     return NULL;
 }
 
-/* Find the URB whose data TD lives at td_phys (no removal). */
+/* Find the URB and TD-record-index for a retired data TD at td_phys. */
 static struct ohci_urb *urb_for_data_td_phys(struct ohci_hc *hc,
-                                              uint32_t td_phys) {
+                                              uint32_t td_phys,
+                                              int *out_idx) {
     for (struct ohci_urb *u = hc->in_flight; u != NULL; u = u->next_pending) {
-        if (u->data_td_phys != 0 && u->data_td_phys == td_phys) return u;
+        for (int i = 0; i < u->data_td_count; i++) {
+            if (u->data_tds[i].td_phys == td_phys) {
+                if (out_idx) *out_idx = i;
+                return u;
+            }
+        }
     }
     return NULL;
 }
@@ -81,19 +87,25 @@ void ohci_drain_done(struct ohci_hc *hc) {
         uint8_t cc = (td->Control >> OHCI_TD_CC_SHIFT) & 0xF;
         int s = cc_to_urb_status(cc);
 
-        /* If this is a DATA-stage TD, accumulate bytes-transferred onto
-         * its URB before the URB completes. OHCI rule (§4.3.1.4): when
-         * the TD finishes successfully with all data moved, CBP=0. On a
-         * short transfer, CBP points at the next un-transferred byte. */
-        struct ohci_urb *du = urb_for_data_td_phys(hc, cur);
-        if (du) {
+        /* If this TD belongs to a URB's data_tds[] array, accumulate its
+         * bytes-transferred onto urb->transferred. OHCI §4.3.1.4: CBP=0
+         * when the chunk fully transferred; otherwise CBP points at the
+         * next un-transferred byte (within the chunk's range). Multi-TD
+         * URBs (Bulk SG) get summed; single-TD URBs match once. */
+        int td_idx = -1;
+        struct ohci_urb *du = urb_for_data_td_phys(hc, cur, &td_idx);
+        if (du && td_idx >= 0) {
+            uint32_t chunk_off = du->data_tds[td_idx].chunk_off;
+            uint32_t chunk_len = du->data_tds[td_idx].chunk_len;
+            uint32_t per_td_done;
             if (td->CBP == 0) {
-                du->transferred = du->length;
-            } else if (td->CBP >= du->buffer_phys) {
-                du->transferred = td->CBP - du->buffer_phys;
+                per_td_done = chunk_len;
+            } else if (td->CBP >= du->buffer_phys + chunk_off) {
+                per_td_done = td->CBP - (du->buffer_phys + chunk_off);
+            } else {
+                per_td_done = 0;
             }
-            /* Surface the data-stage CC if there is one — STATUS still drives
-             * final completion below. */
+            du->transferred += per_td_done;
             if (cc != OHCI_CC_NOERROR && du->status == OHCI_URB_STATUS_PENDING) {
                 du->status = s;
             }

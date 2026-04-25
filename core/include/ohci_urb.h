@@ -49,10 +49,16 @@ struct ohci_urb {
     struct ohci_ed *ed;
     struct ohci_td *head_td;
     struct ohci_td *tail_td;
-    /* Phys address of the DATA-stage TD (Control) or the single data TD
-     * (Bulk/Interrupt). 0 if no data stage. The drain matches retired TDs
-     * against this so it can read CBP and compute bytes transferred. */
-    uint32_t data_td_phys;
+    /* Per-data-TD records so the drain can compute urb->transferred from
+     * each TD's CBP per OHCI §4.3.1.4 — replaces the Plan 6 single
+     * data_td_phys, lets multi-TD Bulk SG work. */
+#define OHCI_URB_MAX_DATA_TDS 16
+    struct ohci_urb_data_td {
+        uint32_t td_phys;     /* phys of this data TD */
+        uint32_t chunk_off;   /* offset within urb->buffer this TD covers */
+        uint32_t chunk_len;   /* bytes this TD intended to move */
+    } data_tds[OHCI_URB_MAX_DATA_TDS];
+    uint8_t  data_td_count;
     struct ohci_urb *next_pending;
 };
 

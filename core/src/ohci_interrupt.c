@@ -103,9 +103,11 @@ int ohci_interrupt_submit(struct ohci_hc *hc,
 
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
-    /* Same TD is the data TD; drain reads CBP from it to compute
-     * urb->transferred per OHCI §4.3.1.4. */
-    urb->data_td_phys = head_td_phys;
+    /* Single TD per Interrupt URB; drain reads CBP from it. */
+    urb->data_tds[0].td_phys   = head_td_phys;
+    urb->data_tds[0].chunk_off = 0;
+    urb->data_tds[0].chunk_len = urb->length;
+    urb->data_td_count = 1;
 
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
