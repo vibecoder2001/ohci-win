@@ -5,5 +5,6 @@ add_library(ohci_core STATIC
   src/ohci_pool.c
   src/ohci_control.c
   src/ohci_drain.c
+  src/ohci_bulk.c
 )
 target_include_directories(ohci_core PUBLIC include)

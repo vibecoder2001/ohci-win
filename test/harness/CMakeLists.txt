@@ -53,3 +53,7 @@ add_test(NAME control_e2e COMMAND test_control_e2e)
 add_executable(test_bulk_list test_bulk_list.c)
 target_link_libraries(test_bulk_list PRIVATE fake_hc)
 add_test(NAME bulk_list COMMAND test_bulk_list)
+
+add_executable(test_bulk test_bulk.c)
+target_link_libraries(test_bulk PRIVATE fake_hc)
+add_test(NAME bulk COMMAND test_bulk)
