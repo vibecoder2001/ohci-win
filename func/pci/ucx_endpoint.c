@@ -281,43 +281,39 @@ OhciPci_HandleBulkUrb(
         WdfRequestComplete(Request, STATUS_SUCCESS);
         return;
     }
-    if (bufMdl == NULL) {
-        LOG("  rejected: Bulk SG path requires MDL");
-        urb->TransferBufferLength = 0;
-        urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
-        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-        return;
-    }
-    UNREFERENCED_PARAMETER(bufVa);
+    /* Some URBs come in with only a flat KVA buffer (no MDL). Bounce
+     * those through a 32-bit-DMA slab — we can't walk PFNs without an
+     * MDL anyway. Falls through to the no-MDL bounce branch below. */
 
-    /* Walk the MDL into per-page SG entries. OHCI lets a TD straddle one
-     * page boundary but the simpler "one TD per page" rule keeps the math
-     * obvious and matches the OHCI_URB_MAX_DATA_TDS cap. */
-    ULONG byteOffset = MmGetMdlByteOffset(bufMdl);
-    ULONG byteCount  = MmGetMdlByteCount(bufMdl);
-    if (byteCount < length) length = byteCount;
-    ULONG pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
-                          (PVOID)((ULONG_PTR)MmGetMdlVirtualAddress(bufMdl) + byteOffset),
-                          length);
-    if (pageCount == 0 || pageCount > OHCI_BULK_MAX_SG_PAGES) {
-        LOG("  rejected: pageCount=%lu (cap=%u)", pageCount, OHCI_BULK_MAX_SG_PAGES);
-        urb->TransferBufferLength = 0;
-        urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
-        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-        return;
-    }
+    /* Decide whether to bounce. We bounce when:
+     *   - There's no MDL (we can't walk PFNs from a flat KVA buffer)
+     *   - Any PFN is above 4 GB (OHCI is 32-bit DMA only)
+     * Otherwise we use the MDL's PFN array directly for true SG. */
+    BOOLEAN     needsBounce = (bufMdl == NULL);
+    ULONG       pageCount   = 0;
+    ULONG       byteOffset  = 0;
+    PPFN_NUMBER pfns        = NULL;
 
-    /* OHCI is a 32-bit DMA controller. Modern Windows freely allocates user
-     * MDLs above 4 GB; we'd silently truncate the high bits and DMA from a
-     * random low-memory page, which qemu's usb-msd reports as
-     * "Bad signature 00000000". Detect any high PFN and bounce through our
-     * 32-bit-DMA-safe slab pool. */
-    PPFN_NUMBER pfns = MmGetMdlPfnArray(bufMdl);
-    BOOLEAN needsBounce = FALSE;
-    for (ULONG i = 0; i < pageCount; i++) {
-        if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
-            needsBounce = TRUE;
-            break;
+    if (bufMdl != NULL) {
+        byteOffset = MmGetMdlByteOffset(bufMdl);
+        ULONG byteCount = MmGetMdlByteCount(bufMdl);
+        if (byteCount < length) length = byteCount;
+        pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
+                        (PVOID)((ULONG_PTR)MmGetMdlVirtualAddress(bufMdl) + byteOffset),
+                        length);
+        if (pageCount == 0 || pageCount > OHCI_BULK_MAX_SG_PAGES) {
+            LOG("  rejected: pageCount=%lu (cap=%u)", pageCount, OHCI_BULK_MAX_SG_PAGES);
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+            return;
+        }
+        pfns = MmGetMdlPfnArray(bufMdl);
+        for (ULONG i = 0; i < pageCount; i++) {
+            if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
+                needsBounce = TRUE;
+                break;
+            }
         }
     }
 
@@ -327,7 +323,7 @@ OhciPci_HandleBulkUrb(
 
     if (needsBounce) {
         if (length > OHCIPCI_BOUNCE_SLAB_BYTES) {
-            LOG("  rejected: high-mem MDL with length=%lu exceeds bounce slab=%u",
+            LOG("  rejected: bounce required but length=%lu exceeds slab=%u",
                 length, OHCIPCI_BOUNCE_SLAB_BYTES);
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
@@ -345,9 +341,16 @@ OhciPci_HandleBulkUrb(
             return;
         }
         if (!isIn) {
-            PUCHAR sysVa = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl,
-                NormalPagePriority | MdlMappingNoExecute);
-            if (sysVa == NULL) {
+            /* Source bytes: from MDL's system VA if MDL present,
+             * else from the flat bufVa the URB carried. */
+            PUCHAR src = NULL;
+            if (bufMdl != NULL) {
+                src = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl,
+                    NormalPagePriority | MdlMappingNoExecute);
+            } else {
+                src = (PUCHAR)bufVa;
+            }
+            if (src == NULL) {
                 WdfSpinLockAcquire(dc->CoreLock);
                 OhciPci_BounceFree(dc, bounceVa);
                 WdfSpinLockRelease(dc->CoreLock);
@@ -356,9 +359,8 @@ OhciPci_HandleBulkUrb(
                 WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
                 return;
             }
-            RtlCopyMemory(bounceVa, sysVa, length);
+            RtlCopyMemory(bounceVa, src, length);
         }
-        /* Single SG entry covering the whole bounced buffer. */
         sg[0].phys   = bouncePhys;
         sg[0].length = length;
         sg[0].off    = 0;
@@ -395,11 +397,12 @@ OhciPci_HandleBulkUrb(
     uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
     if (bounceVa != NULL) {
         /* Wire the bounce so OhciPci_UrbComplete copies IN bytes back
-         * to the user MDL and frees the slab. UserMdl drives the
-         * copy-back path. */
+         * to the user buffer and frees the slab. UrbComplete prefers
+         * UserMdl, falls back to UserVa. */
         uc->DataBounce     = bounceVa;
         uc->DataBouncePhys = bouncePhys;
         uc->UserMdl        = bufMdl;
+        uc->UserVa         = (bufMdl == NULL) ? bufVa : NULL;
     }
 
     /* buffer_phys = first chunk's phys minus its off, so the drain's

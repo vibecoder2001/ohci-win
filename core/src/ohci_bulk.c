@@ -160,15 +160,19 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
      * placeholder's slot (head_td_phys), not the freed pool slot. */
     urb->data_tds[0].td_phys = head_td_phys;
 
-    ep->tail_placeholder      = new_ph;
-    ep->tail_placeholder_phys = new_ph_phys;
-
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = (last_td == first_td)
         ? ohci_dma_virt_from_phys(hc->dma, head_td_phys)
         : ohci_dma_virt_from_phys(hc->dma, last_td_phys);
 
-    /* Last TD must IOC so WDH fires when the chain completes. */
+    /* Last TD must IOC so WDH fires when the chain completes. CRITICAL:
+     * for the single-TD case the "last TD" lives in the OLD placeholder
+     * slot (we folded first_td's contents into it above). Update its
+     * Control via ep->tail_placeholder BEFORE reassigning that pointer
+     * to new_ph — otherwise IOC lands on the empty new placeholder and
+     * WDH never fires for successful completions (errors still raise
+     * interrupt regardless of DI per OHCI §6.4.4, which is why this
+     * latent bug was masked until we got past the STALL). */
     if (last_td == first_td) {
         ep->tail_placeholder->Control =
             (ep->tail_placeholder->Control & ~OHCI_TD_DI_MASK) | OHCI_TD_DI_IMMEDIATE;
@@ -176,6 +180,9 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
         last_td->Control =
             (last_td->Control & ~OHCI_TD_DI_MASK) | OHCI_TD_DI_IMMEDIATE;
     }
+
+    ep->tail_placeholder      = new_ph;
+    ep->tail_placeholder_phys = new_ph_phys;
 
     /* Defensive: a prior Cancel/Purge may have set ED.K=1 to halt the EP.
      * UCX is supposed to call Start before resubmitting, but in observed
