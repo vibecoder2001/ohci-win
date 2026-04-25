@@ -42,4 +42,7 @@ void OhciPci_InitMmioOps(PDEVICE_CONTEXT dc);
 /* Defined in dma.c — allocates WDFCOMMONBUFFER and wraps it in dc->DmaRegion. */
 NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc);
 
+/* Defined in interrupt.c — creates WDFINTERRUPT with ISR + DPC. */
+NTSTATUS OhciPci_CreateInterrupt(PDEVICE_CONTEXT dc);
+
 #endif /* OHCIPCI_DEVICE_CONTEXT_H */

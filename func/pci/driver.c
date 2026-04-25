@@ -129,6 +129,12 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     ULONG ctrl = READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x04));
     LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
 
+    NTSTATUS isStatus = OhciPci_CreateInterrupt(dc);
+    if (!NT_SUCCESS(isStatus)) {
+        LOG("Interrupt setup failed; refusing to start");
+        return isStatus;
+    }
+
     return STATUS_SUCCESS;
 }
 
