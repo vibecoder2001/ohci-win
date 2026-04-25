@@ -252,17 +252,27 @@ static VOID OhciPciGetInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
     }
 
     /*
-     * UCX conveys the ROOTHUB_INFO output buffer as IRP
-     * Parameters.Others.Argument1, NOT through WDF input/output buffers.
-     * (Same convention as IOCTL_INTERNAL_USB_SUBMIT_URB.) Initial code
-     * used WdfRequestRetrieveOutputBuffer and crashed with NULL deref
-     * because UCX's IOCTL has no METHOD_BUFFERED output staged.
-     */
-    PIRP irp = WdfRequestWdmGetIrp(Request);
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    PROOTHUB_INFO info = (PROOTHUB_INFO)stack->Parameters.Others.Argument1;
-    if (!info) {
-        LOG("RootHub GetInfo: NULL output struct in Argument1");
+     * UCX conveys the ROOTHUB_INFO output buffer in Parameters.Others.Arg1.
+     * Use WdfRequestGetParameters (the WDF-blessed accessor that resolves
+     * to the right IO_STACK_LOCATION level) instead of digging through
+     * IoGetCurrentIrpStackLocation directly — same pattern dwusb uses,
+     * and avoids an observed crash where the raw IRP stack arg came back
+     * as a 32-bit-truncated kernel pointer (0x00000000XXXXXXXX). */
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PROOTHUB_INFO info = (PROOTHUB_INFO)rp.Parameters.Others.Arg1;
+    LOG("RootHub GetInfo: info=0x%p", info);
+    if (info == NULL) {
+        LOG("RootHub GetInfo: NULL output struct in Arg1");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    /* Sanity: kernel pointers on x64 are sign-extended from bit 47, so the
+     * top 16 bits should be 0xFFFF. Anything else is a stale/truncated
+     * pointer we must NOT touch. */
+    if (((ULONG_PTR)info >> 48) != 0xFFFFu) {
+        LOG("RootHub GetInfo: non-kernel pointer 0x%p — refusing", info);
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
