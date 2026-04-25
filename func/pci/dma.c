@@ -6,7 +6,10 @@
 #include <wdf.h>
 #include "device_context.h"
 
-#define OHCIPCI_DMA_BUFFER_SIZE  (256 * 1024)  /* HCCA + descriptors + small URB buffers */
+/* Sized for ohci_hc_init's overhead (HCCA + 4 ED pools + TD pool + 63-ED
+ * interrupt skeleton ≈ 6 KB) PLUS the 256 KB bounce buffer pool (Plan 5
+ * Task 1). 512 KB gives generous headroom. */
+#define OHCIPCI_DMA_BUFFER_SIZE  (512 * 1024)
 
 NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc) {
     NTSTATUS status;
