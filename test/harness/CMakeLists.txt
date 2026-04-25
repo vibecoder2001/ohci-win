@@ -29,3 +29,7 @@ add_test(NAME hc_init COMMAND test_hc_init)
 add_executable(test_pool test_pool.c)
 target_link_libraries(test_pool PRIVATE ohci_core)
 add_test(NAME pool COMMAND test_pool)
+
+add_executable(test_control_build test_control_build.c)
+target_link_libraries(test_control_build PRIVATE ohci_core)
+add_test(NAME control_build COMMAND test_control_build)
