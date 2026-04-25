@@ -17,3 +17,7 @@ add_test(NAME fake_hc COMMAND test_fake_hc)
 add_executable(test_edtd_layout test_edtd_layout.c)
 target_link_libraries(test_edtd_layout PRIVATE ohci_core)
 add_test(NAME edtd_layout COMMAND test_edtd_layout)
+
+add_executable(test_dma test_dma.c)
+target_link_libraries(test_dma PRIVATE ohci_core)
+add_test(NAME dma COMMAND test_dma)
