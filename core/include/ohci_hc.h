@@ -1,7 +1,7 @@
 #ifndef OHCI_HC_H
 #define OHCI_HC_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 #include "ohci_mmio.h"
 #include "ohci_dma.h"
 #include "ohci_hcca.h"

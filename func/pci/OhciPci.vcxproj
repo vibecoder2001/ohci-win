@@ -66,8 +66,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="mmio.c" />
     <!-- Re-enabled in subsequent tasks as files are added -->
-    <!-- <ClCompile Include="mmio.c" /> -->
     <!-- <ClCompile Include="dma.c" /> -->
     <!-- <ClCompile Include="interrupt.c" /> -->
     <!-- <ClCompile Include="ucx_glue.c" /> -->
@@ -87,7 +87,7 @@
     <!-- <ClCompile Include="..\..\core\src\ohci_interrupt.c" /> -->
   </ItemGroup>
   <ItemGroup>
-    <!-- <ClInclude Include="device_context.h" /> -->
+    <ClInclude Include="device_context.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="OhciPci.inx" />

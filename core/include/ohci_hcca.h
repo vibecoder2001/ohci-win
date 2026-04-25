@@ -2,7 +2,7 @@
 #ifndef OHCI_HCCA_H
 #define OHCI_HCCA_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 
 #pragma pack(push, 1)
 struct ohci_hcca {

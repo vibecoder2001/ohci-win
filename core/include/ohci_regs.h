@@ -2,7 +2,7 @@
 #ifndef OHCI_REGS_H
 #define OHCI_REGS_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 
 #pragma pack(push, 1)
 struct ohci_regs {

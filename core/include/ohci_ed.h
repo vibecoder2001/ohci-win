@@ -2,7 +2,7 @@
 #ifndef OHCI_ED_H
 #define OHCI_ED_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 
 #pragma pack(push, 4)
 struct ohci_ed {

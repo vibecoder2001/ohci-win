@@ -1,7 +1,7 @@
 #ifndef OHCI_MMIO_H
 #define OHCI_MMIO_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 
 #ifdef __cplusplus
 extern "C" {

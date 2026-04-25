@@ -1,8 +1,7 @@
 #ifndef OHCI_URB_H
 #define OHCI_URB_H
 
-#include <stdint.h>
-#include <stddef.h>
+#include "ohci_types.h"
 
 #ifdef __cplusplus
 extern "C" {

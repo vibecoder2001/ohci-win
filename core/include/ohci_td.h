@@ -2,7 +2,7 @@
 #ifndef OHCI_TD_H
 #define OHCI_TD_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 
 #pragma pack(push, 4)
 struct ohci_td {

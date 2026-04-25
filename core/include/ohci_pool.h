@@ -1,8 +1,7 @@
 #ifndef OHCI_POOL_H
 #define OHCI_POOL_H
 
-#include <stdint.h>
-#include <stddef.h>
+#include "ohci_types.h"
 #include "ohci_dma.h"
 #include "ohci_ed.h"
 #include "ohci_td.h"

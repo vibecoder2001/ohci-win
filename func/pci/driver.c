@@ -1,5 +1,6 @@
 #include <ntddk.h>
 #include <wdf.h>
+#include "device_context.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -30,10 +31,20 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     pnp.EvtDeviceReleaseHardware = EvtDeviceReleaseHardware;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
+    WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DEVICE_CONTEXT);
+
     WDFDEVICE device;
-    status = WdfDeviceCreate(&DeviceInit, WDF_NO_OBJECT_ATTRIBUTES, &device);
+    status = WdfDeviceCreate(&DeviceInit, &attrs, &device);
     LOG("WdfDeviceCreate -> 0x%08X", status);
-    return status;
+    if (!NT_SUCCESS(status)) return status;
+
+    PDEVICE_CONTEXT dc = DeviceContextGet(device);
+    RtlZeroMemory(dc, sizeof(*dc));
+    dc->Device = device;
+    OhciPci_InitMmioOps(dc);
+    LOG("Context attached and mmio_ops wired");
+    return STATUS_SUCCESS;
 }
 
 _Use_decl_annotations_

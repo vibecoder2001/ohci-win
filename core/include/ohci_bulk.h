@@ -1,7 +1,7 @@
 #ifndef OHCI_BULK_H
 #define OHCI_BULK_H
 
-#include <stdint.h>
+#include "ohci_types.h"
 #include "ohci_ed.h"
 #include "ohci_td.h"
 #include "ohci_urb.h"

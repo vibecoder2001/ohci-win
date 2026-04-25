@@ -1,8 +1,7 @@
 #ifndef OHCI_DMA_H
 #define OHCI_DMA_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "ohci_types.h"
 
 #ifdef __cplusplus
 extern "C" {
