@@ -182,6 +182,19 @@ OhciPci_UrbComplete(struct ohci_urb *u)
     ULONG_PTR info = (ULONG_PTR)u->transferred;
     LOG("UrbComplete: core_status=%d transferred=%u dir=%u",
         u->status, u->transferred, uc->DataDirection);
+    if (u->ed != NULL) {
+        LOG("  ED-done: Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X",
+            u->ed->Control, u->ed->HeadP, u->ed->TailP);
+    }
+    if (u->head_td != NULL) {
+        struct ohci_td *td = u->head_td;
+        uint32_t ctrl = td->Control;
+        uint32_t cc   = (ctrl >> 28) & 0xF;
+        uint32_t ec   = (ctrl >> 26) & 0x3;
+        uint32_t tval = (ctrl >> 24) & 0x3;
+        LOG("  TD-done: Ctrl=0x%08X CC=%u EC=%u T=%u CBP=0x%08X BE=0x%08X",
+            ctrl, cc, ec, tval, td->CBP, td->BE);
+    }
 
     /* Write the result back into the TRANSFER_URB. UCX reads
      * Hdr.Status + TransferBufferLength to learn how the transfer went;
@@ -239,6 +252,13 @@ OhciPci_HandleBulkUrb(
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
     LOG("EvtUrbBulk-SG: len=%lu dir=%s", length, isIn ? "IN" : "OUT");
+    if (!isIn && length >= 8 && bufMdl != NULL) {
+        PUCHAR sys = (PUCHAR)MmGetSystemAddressForMdlSafe(bufMdl, NormalPagePriority | MdlMappingNoExecute);
+        if (sys) {
+            LOG("  OUT[0..7]=%02X %02X %02X %02X %02X %02X %02X %02X",
+                sys[0], sys[1], sys[2], sys[3], sys[4], sys[5], sys[6], sys[7]);
+        }
+    }
 
     if (length == 0) {
         urb->TransferBufferLength = 0;
@@ -315,8 +335,14 @@ OhciPci_HandleBulkUrb(
     uc->CoreUrb.complete     = OhciPci_UrbComplete;
 
     WdfSpinLockAcquire(dc->CoreLock);
+    struct ohci_ed *bed = ep->Core.Bulk.ed;
+    LOG("  ED-pre:  Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X NextED=0x%08X (sg[0].phys=0x%08X len=%lu)",
+        bed->Control, bed->HeadP, bed->TailP, bed->NextED,
+        sg[0].phys, sg[0].length);
     int rc = ohci_bulk_submit_sg(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb,
                                   sg, pageCount);
+    LOG("  ED-post: Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X NextED=0x%08X",
+        bed->Control, bed->HeadP, bed->TailP, bed->NextED);
     WdfSpinLockRelease(dc->CoreLock);
     if (rc != 0) {
         LOG("  bulk_submit_sg failed: rc=%d", rc);
@@ -880,8 +906,20 @@ static VOID
 EvtNonDefaultEpReset(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxController);
-    UNREFERENCED_PARAMETER(UcxEndpoint);
-    LOG("NonDefaultEp Reset (Plan 6 best-effort ack)");
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
+    PDEVICE_CONTEXT dc = ep->Dc;
+    struct ohci_ed *ed = OhciPci_EpEd(ep);
+    LOG("NonDefaultEp Reset (kind=%d) — clearing H/C toggle", ep->Kind);
+    if (ed != NULL) {
+        WdfSpinLockAcquire(dc->CoreLock);
+        /* USB CLEAR_FEATURE(ENDPOINT_HALT) / SET_INTERFACE resets the
+         * data toggle to DATA0 on this endpoint. Mirror that in the ED:
+         * clear both H (halted) and C (toggle carry) bits in HeadP. */
+        ed->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
+        ed->Control &= ~OHCI_ED_K;
+        dc->MmioOps.barrier(dc->MmioOps.context);
+        WdfSpinLockRelease(dc->CoreLock);
+    }
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 

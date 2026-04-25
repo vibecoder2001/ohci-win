@@ -100,7 +100,14 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
             }
             return -1;
         }
-        uint32_t ctrl = OHCI_TD_DI_NO_INTR | OHCI_TD_T_FROM_ED | OHCI_TD_R;
+        /* Be explicit about direction even though OHCI §4.2.1 says HC takes
+         * direction from ED.D when D!=00. qemu's hcd-ohci.c has been observed
+         * to STALL fresh Bulk-OUT CBWs when the TD's DP field is left as
+         * SETUP (00). Setting DP to match the EP direction is harmless under
+         * a strict reading of the spec and unblocks the picky emulator. */
+        uint32_t dp_bits = (ep->direction == OHCI_URB_DIR_IN)
+                           ? OHCI_TD_DP_IN : OHCI_TD_DP_OUT;
+        uint32_t ctrl = OHCI_TD_DI_NO_INTR | OHCI_TD_T_FROM_ED | OHCI_TD_R | dp_bits;
         ctrl |= (OHCI_CC_NOTACCESSED << OHCI_TD_CC_SHIFT);
         td->Control = ctrl;
         td->CBP     = pages[i].phys;
@@ -170,6 +177,11 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
             (last_td->Control & ~OHCI_TD_DI_MASK) | OHCI_TD_DI_IMMEDIATE;
     }
 
+    /* Defensive: a prior Cancel/Purge may have set ED.K=1 to halt the EP.
+     * UCX is supposed to call Start before resubmitting, but in observed
+     * VM traces (mass-storage CBW path) Start is occasionally skipped.
+     * Clear K here so the HC actually walks the ED. */
+    ep->ed->Control &= ~OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
     hc->ops.barrier(hc->ops.context);
