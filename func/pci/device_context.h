@@ -72,6 +72,15 @@ typedef struct _DEVICE_CONTEXT {
      *   - Endpoint create paths before splicing onto the HC list
      * Created in EvtDriverDeviceAdd; tied to WDFDEVICE lifetime. */
     WDFSPINLOCK              CoreLock;
+
+    /* Deferred-completion list. WdfRequestComplete() must NOT be called
+     * with CoreLock held: completion can synchronously re-enter our queue
+     * EvtIoDefault, which then tries to acquire CoreLock again — and
+     * WDFSPINLOCK is not re-entrant. So OhciPci_UrbComplete (running
+     * under CoreLock from inside the WDH DPC) only stages the result on
+     * this list; EvtDpc drains the list and completes each request
+     * AFTER releasing CoreLock. Protected by CoreLock. */
+    LIST_ENTRY               DeferredCompletions;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
@@ -125,6 +134,11 @@ typedef struct _OHCIPCI_URB_CTX {
     PVOID                        TransferUrb;    /* TRANSFER_URB; UCX reads back
                                                    * TransferBufferLength + Hdr.Status
                                                    * after the request completes. */
+    /* Deferred-completion staging. Populated by OhciPci_UrbComplete while
+     * CoreLock is held; consumed by EvtDpc after CoreLock release. */
+    LIST_ENTRY                   DeferredEntry;
+    NTSTATUS                     DeferredStatus;
+    ULONG_PTR                    DeferredInfo;
 } OHCIPCI_URB_CTX, *POHCIPCI_URB_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_URB_CTX, OhciPci_UrbCtxGet)

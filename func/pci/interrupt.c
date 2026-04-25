@@ -51,10 +51,29 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
         /* ohci_drain_done processes retired TDs; WDH is W1C inside the core.
          * CoreLock serialises against the per-EP queue submit path which
          * mutates hc->in_flight and the bounce-pool bitmap from PASSIVE/
-         * DISPATCH context. */
+         * DISPATCH context. OhciPci_UrbComplete (called from inside the
+         * drain) only stages completions onto dc->DeferredCompletions —
+         * we drain the list AFTER releasing CoreLock so WdfRequestComplete
+         * can re-enter our submit path without deadlocking. */
+        LIST_ENTRY local;
+        InitializeListHead(&local);
+
         WdfSpinLockAcquire(dc->CoreLock);
         ohci_drain_done(&dc->Hc);
+        while (!IsListEmpty(&dc->DeferredCompletions)) {
+            PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
+            InsertTailList(&local, le);
+        }
         WdfSpinLockRelease(dc->CoreLock);
+
+        while (!IsListEmpty(&local)) {
+            PLIST_ENTRY le = RemoveHeadList(&local);
+            POHCIPCI_URB_CTX uc =
+                CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+            WdfRequestCompleteWithInformation(uc->Request,
+                                              uc->DeferredStatus,
+                                              uc->DeferredInfo);
+        }
     }
 
     if ((istat & OHCI_INT_RHSC) && dc->RootHub) {

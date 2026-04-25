@@ -58,6 +58,7 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
         LOG("WdfSpinLockCreate (CoreLock) -> 0x%08X", lockStatus);
         if (!NT_SUCCESS(lockStatus)) return lockStatus;
     }
+    InitializeListHead(&dc->DeferredCompletions);
 
     /* Default WDFQUEUE that forwards URB IOCTLs (IOCTL_INTERNAL_USB_SUBMIT_URB
      * etc.) from UsbHub3 into UCX via UcxIoDeviceControl. Without this, UCX's

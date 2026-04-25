@@ -208,7 +208,13 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         uc->DataBounce = NULL;
     }
 
-    WdfRequestCompleteWithInformation(uc->Request, status, info);
+    /* Defer the actual WdfRequestComplete until CoreLock is released.
+     * Calling it here would deadlock — UCX completion can synchronously
+     * dispatch the next URB to our queue, which then re-acquires CoreLock,
+     * but WDFSPINLOCK is non-recursive. EvtDpc drains the list. */
+    uc->DeferredStatus = status;
+    uc->DeferredInfo   = info;
+    InsertTailList(&uc->EpCtx->Dc->DeferredCompletions, &uc->DeferredEntry);
 }
 
 /* --------------------------------------------------------------------------
