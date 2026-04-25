@@ -93,8 +93,46 @@ static EVT_UCX_ENDPOINT_ABORT               EvtDefaultEpAbort;
 static EVT_UCX_ENDPOINT_OK_TO_CANCEL_TRANSFERS EvtDefaultEpOkToCancel;
 static EVT_UCX_DEFAULT_ENDPOINT_UPDATE      EvtDefaultEpUpdate;
 
-/* Forward declaration for URB IOCTL handler. */
-static EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL EvtUrbIoctl;
+/* Forward declaration for URB delivery handler.
+ *
+ * UCX 1.6 delivers per-endpoint transfers via EvtIoDefault (NOT
+ * EvtIoInternalDeviceControl, which only the root-hub queue receives from
+ * UsbHub3). The request's Parameters.Others.Arg1 is a TRANSFER_URB —
+ * a UCX-internal layout that is NOT the legacy URB struct. (Confirmed in
+ * dwusb reference: Driver.h::TRANSFER_URB, UsbDevice.c::Control_WdfEvtIoDefault.)
+ */
+static EVT_WDF_IO_QUEUE_IO_DEFAULT EvtUrbDefault;
+
+/* TRANSFER_URB layout, copied from the dwusb reference (Driver.h). The struct
+ * is a UCX-private contract not exported in any public WDK header; UCX puts a
+ * pointer to it in Parameters.Others.Arg1 of every request enqueued to a
+ * per-EP WDFQUEUE. SetupPacket[8] lives at u.SetupPacket for control transfers. */
+typedef struct _OHCIPCI_UCX_URB_DATA {
+    PVOID Reserved[8];
+} OHCIPCI_UCX_URB_DATA;
+
+typedef struct _OHCIPCI_TRANSFER_URB {
+    struct _URB_HEADER Hdr;
+    PVOID UsbdPipeHandle;
+    ULONG TransferFlags;
+    ULONG TransferBufferLength;
+    PVOID TransferBuffer;
+    PMDL  TransferBufferMDL;
+    union {
+        ULONG Timeout;
+        PVOID ReservedMBNull;
+    };
+    OHCIPCI_UCX_URB_DATA UrbData;
+    union {
+        struct {
+            ULONG StartFrame;
+            ULONG NumberOfPackets;
+            ULONG ErrorCount;
+            USBD_ISO_PACKET_DESCRIPTOR IsoPacket[1];
+        } Isoch;
+        UCHAR SetupPacket[8];
+    } u;
+} OHCIPCI_TRANSFER_URB, *POHCIPCI_TRANSFER_URB;
 
 /* --------------------------------------------------------------------------
  * OhciPci_UrbComplete
@@ -129,6 +167,25 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                           ? STATUS_SUCCESS
                           : STATUS_DEVICE_DATA_ERROR;
     ULONG_PTR info = (ULONG_PTR)u->transferred;
+    LOG("UrbComplete: core_status=%d transferred=%u dir=%u",
+        u->status, u->transferred, uc->DataDirection);
+
+    /* Write the result back into the TRANSFER_URB. UCX reads
+     * Hdr.Status + TransferBufferLength to learn how the transfer went;
+     * the WDF request status alone is not enough. */
+    POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
+    if (turb != NULL) {
+        turb->TransferBufferLength = u->transferred;
+        switch (u->status) {
+        case OHCI_URB_STATUS_OK:       turb->Hdr.Status = USBD_STATUS_SUCCESS;            break;
+        case OHCI_URB_STATUS_STALL:    turb->Hdr.Status = USBD_STATUS_STALL_PID;          break;
+        case OHCI_URB_STATUS_CRC:      turb->Hdr.Status = USBD_STATUS_CRC;                break;
+        case OHCI_URB_STATUS_TIMEOUT:  turb->Hdr.Status = USBD_STATUS_TIMEOUT;            break;
+        case OHCI_URB_STATUS_OVERRUN:  turb->Hdr.Status = USBD_STATUS_DATA_OVERRUN;       break;
+        case OHCI_URB_STATUS_UNDERRUN: turb->Hdr.Status = USBD_STATUS_DATA_UNDERRUN;      break;
+        default:                       turb->Hdr.Status = USBD_STATUS_INTERNAL_HC_ERROR;  break;
+        }
+    }
 
     /* Return bounce buffers to pool before completing the request. */
     if (uc->SetupBounce) {
@@ -144,64 +201,60 @@ OhciPci_UrbComplete(struct ohci_urb *u)
 }
 
 /* --------------------------------------------------------------------------
- * EvtUrbIoctl
+ * EvtUrbDefault
  *
- * EvtIoInternalDeviceControl for the WDFQUEUE registered with UCX via
- * UcxEndpointSetWdfIoQueue. UCX delivers each URB as an
- * IOCTL_INTERNAL_USB_SUBMIT_URB request on this queue.
+ * EvtIoDefault for the WDFQUEUE registered with UCX via
+ * UcxEndpointSetWdfIoQueue. UCX delivers each per-endpoint transfer as a
+ * plain WDF request whose Parameters.Others.Arg1 points to a TRANSFER_URB.
  *
  * We retrieve the per-EP context via the queue context (ohcipci_queue_ctx),
  * because WDF provides no WdfIoQueueGetParentObject API.
  * -------------------------------------------------------------------------- */
 _Use_decl_annotations_
 static VOID
-EvtUrbIoctl(
-    WDFQUEUE  Queue,
-    WDFREQUEST Request,
-    size_t    OutputBufferLength,
-    size_t    InputBufferLength,
-    ULONG     IoControlCode
+EvtUrbDefault(
+    WDFQUEUE   Queue,
+    WDFREQUEST Request
     )
 {
-    UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(InputBufferLength);
-
-    if (IoControlCode != IOCTL_INTERNAL_USB_SUBMIT_URB) {
-        WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
-        return;
-    }
-
     /* Retrieve per-EP context via queue context back-pointer. */
     OHCIPCI_QUEUE_CTX *qc = OhciPci_QueueCtxGet(Queue);
     OHCIPCI_EP_CONTEXT *ep = qc->EpCtx;
     PDEVICE_CONTEXT dc = ep->Dc;
 
-    /* Extract the URB from the IRP. UCX places it in the current stack location's
-     * Parameters.Others.Argument1 (irp->Parameters is not a direct field;
-     * use IoGetCurrentIrpStackLocation). */
-    PIRP irp = WdfRequestWdmGetIrp(Request);
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    PURB urb = (PURB)stack->Parameters.Others.Argument1;
+    WDF_REQUEST_PARAMETERS params;
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+
+    POHCIPCI_TRANSFER_URB urb =
+        (POHCIPCI_TRANSFER_URB)params.Parameters.Others.Arg1;
     if (urb == NULL) {
+        LOG("EvtUrbDefault: NULL TRANSFER_URB in Arg1");
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
 
-    USHORT fn = urb->UrbHeader.Function;
+    USHORT fn = urb->Hdr.Function;
+    /* Plan 5: control transfers only. UCX still uses URB_FUNCTION_CONTROL_TRANSFER_EX
+     * inside the TRANSFER_URB header. */
     if (fn != URB_FUNCTION_CONTROL_TRANSFER &&
         fn != URB_FUNCTION_CONTROL_TRANSFER_EX)
     {
-        LOG("EvtUrbIoctl: non-control function 0x%X — Plan 5 only handles control", fn);
+        LOG("EvtUrbDefault: non-control function 0x%X — Plan 5 only handles control", fn);
         WdfRequestComplete(Request, STATUS_NOT_SUPPORTED);
         return;
     }
 
-    UCHAR  *setupBytes = urb->UrbControlTransfer.SetupPacket;
-    ULONG   length     = urb->UrbControlTransfer.TransferBufferLength;
-    PVOID   bufVa      = urb->UrbControlTransfer.TransferBuffer;
-    PMDL    bufMdl     = urb->UrbControlTransfer.TransferBufferMDL;
-    BOOLEAN isIn       = !!(urb->UrbControlTransfer.TransferFlags
-                            & USBD_TRANSFER_DIRECTION_IN);
+    UCHAR  *setupBytes = urb->u.SetupPacket;
+    ULONG   length     = urb->TransferBufferLength;
+    PVOID   bufVa      = urb->TransferBuffer;
+    PMDL    bufMdl     = urb->TransferBufferMDL;
+    BOOLEAN isIn       = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
+
+    LOG("EvtUrbDefault: fn=0x%X len=%lu dir=%s setup=%02X %02X %02X %02X %02X %02X %02X %02X",
+        fn, length, isIn ? "IN" : "OUT",
+        setupBytes[0], setupBytes[1], setupBytes[2], setupBytes[3],
+        setupBytes[4], setupBytes[5], setupBytes[6], setupBytes[7]);
 
     /* Allocate per-URB context on the WDFREQUEST object. */
     WDF_OBJECT_ATTRIBUTES reqAttrs;
@@ -213,8 +266,9 @@ EvtUrbIoctl(
     }
     OHCIPCI_URB_CTX *uc = OhciPci_UrbCtxGet(Request);
     RtlZeroMemory(uc, sizeof(*uc));
-    uc->Request = Request;
-    uc->EpCtx   = ep;
+    uc->Request     = Request;
+    uc->EpCtx       = ep;
+    uc->TransferUrb = urb;
 
     /* SETUP bounce: always 8 bytes. */
     uc->SetupBounce = OhciPci_BounceAlloc(dc, &uc->SetupBouncePhys);
@@ -273,6 +327,8 @@ EvtUrbIoctl(
         WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
         return;
     }
+    LOG("ohci_control_submit OK (setup_phys=0x%08X data_phys=0x%08X len=%u dir=%u)",
+        uc->SetupBouncePhys, uc->DataBouncePhys, uc->DataLength, uc->DataDirection);
     /* Completion is asynchronous — OhciPci_UrbComplete will call
      * WdfRequestCompleteWithInformation when the OHCI hardware is done. */
 }
@@ -422,7 +478,11 @@ OhciPci_DefaultEndpointAdd(
      *    pointer in a small ohcipci_queue_ctx on the WDFQUEUE object. */
     WDF_IO_QUEUE_CONFIG qCfg;
     WDF_IO_QUEUE_CONFIG_INIT(&qCfg, WdfIoQueueDispatchSequential);
-    qCfg.EvtIoInternalDeviceControl = EvtUrbIoctl;
+    qCfg.EvtIoDefault = EvtUrbDefault;
+    /* UCX manages our power state for us; the queue must not be power-managed
+     * or it will sit paused while UCX is trying to deliver URBs during
+     * enumeration before the device finishes its D0 transition. */
+    qCfg.PowerManaged = WdfFalse;
 
     WDF_OBJECT_ATTRIBUTES qAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&qAttrs, OHCIPCI_QUEUE_CTX);
@@ -449,14 +509,18 @@ OhciPci_DefaultEndpointAdd(
     UcxEndpointSetWdfIoQueue(ucxEp, urbQueue);
 
     /* 4. Configure OHCI core Control endpoint for EP0 (func_addr=0, ep_num=0).
-     *    low_speed=0 (Full Speed default). LS devices still work because OHCI
-     *    negotiates at port level; a future task can use UCXUSBDEVICE_INFO
-     *    DeviceSpeed to set this accurately. */
+     *    OHCI requires the ED's S (low-speed) bit to match the device's
+     *    actual port speed or the controller will not progress the transfer
+     *    (no error reported, just nothing happens). UCX stores the speed in
+     *    UCXUSBDEVICE_INFO at UsbDeviceAdd time; we stashed it on the device
+     *    context for retrieval here (single-instance limitation). */
     struct ohci_control_endpoint_config cfg;
     cfg.func_addr       = 0;
     cfg.ep_num          = 0;
     cfg.max_packet_size = (uint16_t)MaxPacketSize;
-    cfg.low_speed       = 0;
+    cfg.low_speed       = (ep->Dc->PendingDeviceSpeed == UsbLowSpeed) ? 1 : 0;
+    LOG("DefaultEndpointAdd: low_speed=%u (PendingDeviceSpeed=%d)",
+        cfg.low_speed, (int)ep->Dc->PendingDeviceSpeed);
 
     int rc = ohci_control_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core);
     if (rc != 0) {

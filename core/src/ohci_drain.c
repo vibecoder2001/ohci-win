@@ -43,6 +43,15 @@ static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
     return NULL;
 }
 
+/* Find the URB whose data TD lives at td_phys (no removal). */
+static struct ohci_urb *urb_for_data_td_phys(struct ohci_hc *hc,
+                                              uint32_t td_phys) {
+    for (struct ohci_urb *u = hc->in_flight; u != NULL; u = u->next_pending) {
+        if (u->data_td_phys != 0 && u->data_td_phys == td_phys) return u;
+    }
+    return NULL;
+}
+
 void ohci_drain_done(struct ohci_hc *hc) {
     uint32_t istat = hc->ops.read32(hc->ops.context, 0x0C);
     if (!(istat & OHCI_INT_WDH)) return;
@@ -71,6 +80,24 @@ void ohci_drain_done(struct ohci_hc *hc) {
 
         uint8_t cc = (td->Control >> OHCI_TD_CC_SHIFT) & 0xF;
         int s = cc_to_urb_status(cc);
+
+        /* If this is a DATA-stage TD, accumulate bytes-transferred onto
+         * its URB before the URB completes. OHCI rule (§4.3.1.4): when
+         * the TD finishes successfully with all data moved, CBP=0. On a
+         * short transfer, CBP points at the next un-transferred byte. */
+        struct ohci_urb *du = urb_for_data_td_phys(hc, cur);
+        if (du) {
+            if (td->CBP == 0) {
+                du->transferred = du->length;
+            } else if (td->CBP >= du->buffer_phys) {
+                du->transferred = td->CBP - du->buffer_phys;
+            }
+            /* Surface the data-stage CC if there is one — STATUS still drives
+             * final completion below. */
+            if (cc != OHCI_CC_NOERROR && du->status == OHCI_URB_STATUS_PENDING) {
+                du->status = s;
+            }
+        }
 
         struct ohci_urb *u = urb_for_td_phys(hc, cur, /*remove=*/1);
         if (u) {

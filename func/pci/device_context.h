@@ -51,6 +51,11 @@ typedef struct _DEVICE_CONTEXT {
 
     BOOLEAN                  HcInitialized;  /* Set after ohci_hc_init success. */
 
+    /* Speed of the device currently being enumerated. Set in UsbDeviceAdd,
+     * read in DefaultEndpointAdd to set the OHCI ED's S (low-speed) bit.
+     * Single-instance limitation; matches dwusb's per-UCXUSBDEVICE pattern. */
+    USB_DEVICE_SPEED         PendingDeviceSpeed;
+
     struct ohcipci_bounce_pool BouncePool;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
@@ -91,6 +96,9 @@ typedef struct _OHCIPCI_URB_CTX {
     PVOID                        UserVa;         /* caller's KVA if no MDL    */
     WDFREQUEST                   Request;        /* the owning WDFREQUEST      */
     POHCIPCI_EP_CONTEXT          EpCtx;         /* owning endpoint context    */
+    PVOID                        TransferUrb;    /* TRANSFER_URB; UCX reads back
+                                                   * TransferBufferLength + Hdr.Status
+                                                   * after the request completes. */
 } OHCIPCI_URB_CTX, *POHCIPCI_URB_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_URB_CTX, OhciPci_UrbCtxGet)

@@ -215,6 +215,11 @@ OhciPci_UsbDeviceAdd(
         (int)UsbDeviceInfo->DeviceSpeed,
         UsbDeviceInfo->PortPath.PortPathDepth);
 
+    extern PDEVICE_CONTEXT g_DeviceContext;
+    if (g_DeviceContext) {
+        g_DeviceContext->PendingDeviceSpeed = UsbDeviceInfo->DeviceSpeed;
+    }
+
     /*
      * Build the per-device event callbacks struct.
      *

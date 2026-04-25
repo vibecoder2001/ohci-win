@@ -11,8 +11,9 @@ static void fill_td(struct ohci_td *td,
                     uint32_t cbp,
                     uint32_t be,
                     uint32_t next_td_phys,
-                    int allow_short) {
-    uint32_t ctrl = OHCI_TD_DI_NO_INTR | dp | toggle;
+                    int allow_short,
+                    uint32_t di) {
+    uint32_t ctrl = di | dp | toggle;
     ctrl |= (OHCI_CC_NOTACCESSED << OHCI_TD_CC_SHIFT);
     if (allow_short) ctrl |= OHCI_TD_R;
     td->Control = ctrl;
@@ -51,7 +52,8 @@ int ohci_build_control_chain(struct ohci_urb *urb,
             urb->setup_phys,
             urb->setup_phys + 7,
             next_after_setup,
-            /*allow_short=*/0);
+            /*allow_short=*/0,
+            OHCI_TD_DI_NO_INTR);
 
     /* DATA: DATA1, direction from URB, short packets allowed. */
     if (have_data) {
@@ -62,7 +64,8 @@ int ohci_build_control_chain(struct ohci_urb *urb,
                 urb->buffer_phys,
                 urb->buffer_phys + urb->length - 1,
                 status_td_phys,
-                /*allow_short=*/1);
+                /*allow_short=*/1,
+                OHCI_TD_DI_NO_INTR);
     }
 
     /* STATUS: DATA1, opposite direction. Zero-length (CBP=BE=0). */
@@ -73,13 +76,17 @@ int ohci_build_control_chain(struct ohci_urb *urb,
         /* No data stage: STATUS is always IN (device acks). */
         status_dp = OHCI_TD_DP_IN;
     }
+    /* DI=0 on STATUS so the controller raises WDH as soon as this TD is
+     * retired — that's how we learn the URB completed. Earlier stages use
+     * DI=7 (no IOC) to avoid extra interrupts mid-transfer. */
     fill_td(status_td,
             status_dp,
             OHCI_TD_T_DATA1,
             /*cbp=*/0,
             /*be =*/0,
             /*next=*/0,
-            /*allow_short=*/0);
+            /*allow_short=*/0,
+            OHCI_TD_DI_IMMEDIATE);
 
     *head_out = setup_td;
     *tail_out = status_td;
@@ -184,6 +191,11 @@ int ohci_control_submit(struct ohci_hc *hc,
 
     urb->head_td = ohci_dma_virt_from_phys(hc->dma, head_td_phys);
     urb->tail_td = chain_tail;
+    /* If there's a data stage, the SETUP TD's NextTD now points at it.
+     * Drain uses this to compute bytes transferred from the DATA TD's CBP. */
+    urb->data_td_phys = (urb->buffer && urb->length > 0)
+                            ? urb->head_td->NextTD
+                            : 0;
 
     /* Update ED.TailP — publishes the new chain to the HC. */
     hc->ops.barrier(hc->ops.context);

@@ -49,6 +49,10 @@ struct ohci_urb {
     struct ohci_ed *ed;
     struct ohci_td *head_td;
     struct ohci_td *tail_td;
+    /* Phys address of the DATA-stage TD (Control) or the single data TD
+     * (Bulk/Interrupt). 0 if no data stage. The drain matches retired TDs
+     * against this so it can read CBP and compute bytes transferred. */
+    uint32_t data_td_phys;
     struct ohci_urb *next_pending;
 };
 

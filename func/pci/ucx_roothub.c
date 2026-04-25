@@ -171,11 +171,12 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
             ULONG portBit = i + 1u;
             bitmap[portBit / 8u] |= (UCHAR)(1u << (portBit % 8u));
             anySet = 1;
-            /* W1C: write change bits back to clear. */
-            WRITE_REGISTER_ULONG(
-                (PULONG)((PUCHAR)dc->MmioBase
-                         + REG_HcRhPortStatus_BASE + i * 4u),
-                rhps & OHCI_RHPS_CHANGE_MASK);
+            /* Do NOT W1C the change bits here. USB hub class requires the
+             * change bits to remain set until the host clears them via
+             * ClearPortFeature(C_PORT_*). UCX reads them in GetPortStatus
+             * to know e.g. that C_PORT_RESET completed; if we cleared them
+             * here, UCX would see change=0 and keep re-issuing PORT_RESET
+             * forever. */
         }
     }
 
