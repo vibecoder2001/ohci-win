@@ -154,6 +154,26 @@ void ohci_interrupt_endpoint_destroy(struct ohci_hc *hc,
     ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
 
+    /* OHCI §6.2.1: pause PLE around link-edit. Periodic schedule is
+     * walked per frame; without the pause the HC can be mid-walk through
+     * the skeleton + leaf chain when we patch NextED, leaving
+     * HcPeriodCurrentED dangling at our about-to-be-freed slot. */
+    uint32_t hc_ctrl     = hc->ops.read32(hc->ops.context, 0x04);
+    int      was_enabled = (hc_ctrl & OHCI_CTRL_PLE) != 0;
+    if (was_enabled) {
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl & ~OHCI_CTRL_PLE);
+        hc->ops.barrier(hc->ops.context);
+        uint32_t f0 = hc->ops.read32(hc->ops.context, 0x3C);
+        for (int i = 0; i < 10000; i++) {
+            uint32_t f = hc->ops.read32(hc->ops.context, 0x3C);
+            if (f != f0) break;
+        }
+    }
+    uint32_t cur_ed = hc->ops.read32(hc->ops.context, 0x1C /* HcPeriodCurrentED */);
+    if (cur_ed == ep->ed_phys) {
+        hc->ops.write32(hc->ops.context, 0x1C, 0);
+    }
+
     /* slot_index now means skeleton slot; unlink from skel_ed's NextED chain. */
     int skel_idx = ep->slot_index;
     struct ohci_ed *skel_ed = hc->interrupt_skeleton[skel_idx];
@@ -170,6 +190,11 @@ void ohci_interrupt_endpoint_destroy(struct ohci_hc *hc,
             }
             cur = e->NextED;
         }
+    }
+
+    if (was_enabled) {
+        hc->ops.barrier(hc->ops.context);
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl | OHCI_CTRL_PLE);
     }
 
     struct ohci_interrupt_endpoint **pp = &hc->interrupt_head;

@@ -197,6 +197,28 @@ void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
     ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
 
+    /* OHCI §6.2.1: pause BLE around link-edit so the HC isn't mid-walk
+     * through the bulk schedule when we patch HcBulkHeadED / NextED.
+     * Without this, after a destroy the HC's HcBulkCurrentED can point
+     * at freed memory → next bulk dispatch sends garbage on the wire
+     * → device STALLs the OUT (observed as qemu usb-msd CBW STALL after
+     * EndpointsConfigure tears down the prior round of EDs). */
+    uint32_t hc_ctrl    = hc->ops.read32(hc->ops.context, 0x04 /* HcControl */);
+    int      was_enabled = (hc_ctrl & OHCI_CTRL_BLE) != 0;
+    if (was_enabled) {
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl & ~OHCI_CTRL_BLE);
+        hc->ops.barrier(hc->ops.context);
+        wait_one_frame(hc);
+    }
+    /* Also clear HcBulkCurrentED — if HC was paused mid-walk on this ED,
+     * resuming with a stale CurrentED pointing at our freed slot is a
+     * dangling deref. Per §6.2.1 the HC reloads CurrentED from HeadED at
+     * the next BLF. */
+    uint32_t cur_ed = hc->ops.read32(hc->ops.context, 0x2C /* HcBulkCurrentED */);
+    if (cur_ed == ep->ed_phys) {
+        hc->ops.write32(hc->ops.context, 0x2C, 0);
+    }
+
     uint32_t head = hc->ops.read32(hc->ops.context, 0x28);
     if (head == ep->ed_phys) {
         hc->ops.write32(hc->ops.context, 0x28, ep->ed->NextED);
@@ -211,6 +233,11 @@ void ohci_bulk_endpoint_destroy(struct ohci_hc *hc,
             }
             cur = ed->NextED;
         }
+    }
+
+    if (was_enabled) {
+        hc->ops.barrier(hc->ops.context);
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl | OHCI_CTRL_BLE);
     }
 
     struct ohci_bulk_endpoint **pp = &hc->bulk_head;

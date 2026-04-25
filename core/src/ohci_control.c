@@ -244,6 +244,21 @@ void ohci_control_endpoint_destroy(struct ohci_hc *hc,
     ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
 
+    /* OHCI §6.2.1: pause CLE around link-edit. Same reasoning as
+     * ohci_bulk_endpoint_destroy — unsafe link mutation while HC walks
+     * leaves HcControlCurrentED dangling. */
+    uint32_t hc_ctrl     = hc->ops.read32(hc->ops.context, 0x04);
+    int      was_enabled = (hc_ctrl & OHCI_CTRL_CLE) != 0;
+    if (was_enabled) {
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
+        hc->ops.barrier(hc->ops.context);
+        wait_one_frame(hc);
+    }
+    uint32_t cur_ed = hc->ops.read32(hc->ops.context, 0x24 /* HcControlCurrentED */);
+    if (cur_ed == ep->ed_phys) {
+        hc->ops.write32(hc->ops.context, 0x24, 0);
+    }
+
     /* 2) Unlink from HcControlHeadED list. */
     uint32_t head = hc->ops.read32(hc->ops.context, 0x20);
     if (head == ep->ed_phys) {
@@ -259,6 +274,11 @@ void ohci_control_endpoint_destroy(struct ohci_hc *hc,
             }
             cur = ed->NextED;
         }
+    }
+
+    if (was_enabled) {
+        hc->ops.barrier(hc->ops.context);
+        hc->ops.write32(hc->ops.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
     }
 
     /* 3) Unlink from SW-side control_head list. */
