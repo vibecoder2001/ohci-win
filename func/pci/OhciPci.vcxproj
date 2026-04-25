@@ -68,23 +68,16 @@
     <ClCompile Include="driver.c" />
     <ClCompile Include="mmio.c" />
     <ClCompile Include="dma.c" />
-    <ClCompile Include="..\..\core\src\ohci_dma.c" />
-    <!-- Re-enabled in subsequent tasks as files are added -->
     <!-- <ClCompile Include="interrupt.c" /> -->
     <!-- <ClCompile Include="ucx_glue.c" /> -->
-    <!--
-      core/ files use <stdint.h>/<stddef.h>/<string.h> which conflict with
-      WDK kernel-mode headers in this toolset. They will be re-enabled in a
-      subsequent task once the core headers are adapted for kernel-mode
-      compilation (or wrapped in a KM-compatible shim).
-    -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_core.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_hc.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_pool.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_control.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_drain.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_bulk.c" /> -->
-    <!-- <ClCompile Include="..\..\core\src\ohci_interrupt.c" /> -->
+    <ClCompile Include="..\..\core\src\ohci_core.c" />
+    <ClCompile Include="..\..\core\src\ohci_dma.c" />
+    <ClCompile Include="..\..\core\src\ohci_hc.c" />
+    <ClCompile Include="..\..\core\src\ohci_pool.c" />
+    <ClCompile Include="..\..\core\src\ohci_control.c" />
+    <ClCompile Include="..\..\core\src\ohci_drain.c" />
+    <ClCompile Include="..\..\core\src\ohci_bulk.c" />
+    <ClCompile Include="..\..\core\src\ohci_interrupt.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="device_context.h" />

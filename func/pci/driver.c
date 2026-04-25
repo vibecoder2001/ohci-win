@@ -102,6 +102,33 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     ULONG revision = READ_REGISTER_ULONG((PULONG)dc->MmioBase);
     LOG("HcRevision = 0x%08X (low byte 0x10 means OHCI 1.0)", revision);
 
+    /* Allocate DMA region (HCCA + descriptors + URB buffers). */
+    NTSTATUS status = OhciPci_AllocateDma(dc);
+    if (!NT_SUCCESS(status)) {
+        LOG("OhciPci_AllocateDma -> 0x%08X", status);
+        return status;
+    }
+    LOG("DMA region 0x%lX bytes at virt %p / phys 0x%X",
+        (ULONG)dc->DmaRegion.size, dc->DmaRegion.base, dc->DmaRegion.phys_base);
+
+    /* Run the core init sequence (reset, HCCA, lists, OPER). */
+    struct ohci_hc_config hccfg = {
+        .td_pool_size       = 256,
+        .control_ed_count   = 16,
+        .bulk_ed_count      = 16,
+        .interrupt_ed_count = 16,
+    };
+    int rc = ohci_hc_init(&dc->Hc, &dc->MmioOps, &dc->DmaRegion, &hccfg);
+    LOG("ohci_hc_init -> %d", rc);
+    if (rc != 0) {
+        return STATUS_UNSUCCESSFUL;
+    }
+    dc->HcInitialized = TRUE;
+
+    /* Sanity-check the result by reading HcControl. */
+    ULONG ctrl = READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x04));
+    LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
+
     return STATUS_SUCCESS;
 }
 
