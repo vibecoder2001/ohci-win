@@ -292,6 +292,11 @@ OhciPci_HandleBulkUrb(
     /* Decide whether to bounce. We bounce when:
      *   - There's no MDL (we can't walk PFNs from a flat KVA buffer)
      *   - Any PFN is above 4 GB (OHCI is 32-bit DMA only)
+     *   - The MDL spans more pages than OHCI_BULK_MAX_SG_PAGES — bouncing
+     *     into a contiguous slab run reduces it to ceil(len/SLAB) entries
+     *     which can be smaller than pageCount when the user buffer is
+     *     poorly aligned (e.g., a 64 KB write at offset 0x40 spans 17
+     *     pages, but bounces into 16 contiguous 4 KB slabs).
      * Otherwise we use the MDL's PFN array directly for true SG. */
     BOOLEAN     needsBounce = (bufMdl == NULL);
     ULONG       pageCount   = 0;
@@ -305,18 +310,23 @@ OhciPci_HandleBulkUrb(
         pageCount = ADDRESS_AND_SIZE_TO_SPAN_PAGES(
                         (PVOID)((ULONG_PTR)MmGetMdlVirtualAddress(bufMdl) + byteOffset),
                         length);
-        if (pageCount == 0 || pageCount > OHCI_BULK_MAX_SG_PAGES) {
-            LOG("  rejected: pageCount=%lu (cap=%u)", pageCount, OHCI_BULK_MAX_SG_PAGES);
+        if (pageCount == 0) {
+            LOG("  rejected: pageCount=0");
             urb->TransferBufferLength = 0;
             urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
             WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
             return;
         }
+        if (pageCount > OHCI_BULK_MAX_SG_PAGES) {
+            needsBounce = TRUE;
+        }
         pfns = MmGetMdlPfnArray(bufMdl);
-        for (ULONG i = 0; i < pageCount; i++) {
-            if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
-                needsBounce = TRUE;
-                break;
+        if (!needsBounce) {
+            for (ULONG i = 0; i < pageCount; i++) {
+                if (((ULONGLONG)pfns[i] << PAGE_SHIFT) >= 0x100000000ULL) {
+                    needsBounce = TRUE;
+                    break;
+                }
             }
         }
     }
