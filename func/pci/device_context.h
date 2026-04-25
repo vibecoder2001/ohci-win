@@ -53,16 +53,6 @@ typedef struct _DEVICE_CONTEXT {
 
     BOOLEAN                  HcInitialized;  /* Set after ohci_hc_init success. */
 
-    /* Speed of the device currently being enumerated. Set in UsbDeviceAdd,
-     * read in DefaultEndpointAdd to set the OHCI ED's S (low-speed) bit.
-     * Single-instance limitation; matches dwusb's per-UCXUSBDEVICE pattern. */
-    USB_DEVICE_SPEED         PendingDeviceSpeed;
-
-    /* Function address most recently assigned via EvtUsbDeviceAddress.
-     * Read by OhciPci_EndpointAdd when wiring up Bulk/Interrupt EDs.
-     * Single-instance limitation, same shape as PendingDeviceSpeed. */
-    UCHAR                    PendingFuncAddr;
-
     struct ohcipci_bounce_pool BouncePool;
 
     /* Coarse spinlock serialising every call into the OHCI core that
@@ -155,6 +145,24 @@ typedef struct _OHCIPCI_QUEUE_CTX {
 } OHCIPCI_QUEUE_CTX, *POHCIPCI_QUEUE_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_QUEUE_CTX, OhciPci_QueueCtxGet)
+
+/* --------------------------------------------------------------------------
+ * Per-USB-device context (Plan 7).
+ *
+ * Attached to each UCXUSBDEVICE WDF object. Replaces the single-instance
+ * PendingDeviceSpeed / PendingFuncAddr fields previously on DEVICE_CONTEXT
+ * so concurrent enumerations (e.g. a USB hub with two children) don't race.
+ *
+ * EP0 is also tracked here so EvtUsbDeviceAddress can rewrite the
+ * func_addr field on the existing OHCI ED after SET_ADDRESS completes.
+ * -------------------------------------------------------------------------- */
+typedef struct _OHCIPCI_USBDEV_CTX {
+    USB_DEVICE_SPEED              Speed;
+    UCHAR                         FuncAddr;     /* 0 until EvtUsbDeviceAddress runs */
+    struct _OHCIPCI_EP_CONTEXT   *Ep0;          /* set by OhciPci_DefaultEndpointAdd */
+} OHCIPCI_USBDEV_CTX, *POHCIPCI_USBDEV_CTX;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_USBDEV_CTX, OhciPci_UsbDevContextGet)
 
 /* g_DeviceContext — single-instance shortcut. Defined in ucx_roothub.c;
  * set once in OhciPci_RootHubCreate before any UCX callbacks fire. */

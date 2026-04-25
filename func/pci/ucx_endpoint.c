@@ -629,16 +629,20 @@ OhciPci_DefaultEndpointAdd(
      *    (no error reported, just nothing happens). UCX stores the speed in
      *    UCXUSBDEVICE_INFO at UsbDeviceAdd time; we stashed it on the device
      *    context for retrieval here (single-instance limitation). */
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(UcxUsbDevice);
     struct ohci_control_endpoint_config cfg;
-    cfg.func_addr       = 0;
+    cfg.func_addr       = udc ? udc->FuncAddr : 0;
     cfg.ep_num          = 0;
     cfg.max_packet_size = (uint16_t)MaxPacketSize;
-    cfg.low_speed       = (ep->Dc->PendingDeviceSpeed == UsbLowSpeed) ? 1 : 0;
-    LOG("DefaultEndpointAdd: low_speed=%u (PendingDeviceSpeed=%d)",
-        cfg.low_speed, (int)ep->Dc->PendingDeviceSpeed);
+    cfg.low_speed       = (udc && udc->Speed == UsbLowSpeed) ? 1 : 0;
+    LOG("DefaultEndpointAdd: low_speed=%u func_addr=%u (per-device ctx)",
+        cfg.low_speed, cfg.func_addr);
 
     ep->Kind = OhciPciEpKindControl;
     int rc = ohci_control_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core.Control);
+    /* Remember EP0 on the per-device context so EvtUsbDeviceAddress (Task 2)
+     * can rewrite the func_addr field after SET_ADDRESS lands on the wire. */
+    if (rc == 0 && udc) udc->Ep0 = ep;
     if (rc != 0) {
         LOG("ohci_control_endpoint_create failed: %d", rc);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -797,9 +801,11 @@ OhciPci_EndpointAdd(
     ep->UrbQueue = q;
     UcxEndpointSetWdfIoQueue(ucxEp, q);
 
-    /* 4. Configure the OHCI core endpoint. */
-    UCHAR funcAddr = ep->Dc->PendingFuncAddr;
-    UCHAR lowSpeed = (ep->Dc->PendingDeviceSpeed == UsbLowSpeed) ? 1 : 0;
+    /* 4. Configure the OHCI core endpoint. Read per-device state instead
+     *    of the obsolete single-instance Pending* globals. */
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    UCHAR funcAddr = udc ? udc->FuncAddr : 0;
+    UCHAR lowSpeed = (udc && udc->Speed == UsbLowSpeed) ? 1 : 0;
     int rc;
     if (attrs == 0x02) {
         ep->Kind = OhciPciEpKindBulk;

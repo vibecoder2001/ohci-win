@@ -148,21 +148,12 @@ StubUsbDeviceAddress(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    /* UCX delivers the new address in Parameters.Others.Arg1 as a
-     * PUSBDEVICE_ADDRESS (UCX-private layout, same as dwusb).
-     * Stash it for OhciPci_EndpointAdd to read when configuring
-     * non-default EDs. */
-    extern PDEVICE_CONTEXT g_DeviceContext;
-    WDF_REQUEST_PARAMETERS rp;
-    WDF_REQUEST_PARAMETERS_INIT(&rp);
-    WdfRequestGetParameters(Request, &rp);
-    PUSBDEVICE_ADDRESS addr = (PUSBDEVICE_ADDRESS)rp.Parameters.Others.Arg1;
-    if (addr && g_DeviceContext) {
-        g_DeviceContext->PendingFuncAddr = (UCHAR)(addr->Address & 0x7F);
-        LOG("UsbDeviceAddress: addr=%u", g_DeviceContext->PendingFuncAddr);
-    } else {
-        LOG("UsbDeviceAddress: missing addr struct");
-    }
+    /* Plan 7 Task 2 will replace this with a real SET_ADDRESS on the wire
+     * + EP0 ED func_addr rewrite, reading the requested address from
+     * Parameters.Others.Arg1 (PUSBDEVICE_ADDRESS) and storing it on the
+     * per-device OHCIPCI_USBDEV_CTX. For Task 1 we just ack so enumeration
+     * still works at addr=0 between Tasks 1 and 2. */
+    LOG("UsbDeviceAddress (stub — Task 2 will implement)");
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -230,11 +221,6 @@ OhciPci_UsbDeviceAdd(
         (int)UsbDeviceInfo->DeviceSpeed,
         UsbDeviceInfo->PortPath.PortPathDepth);
 
-    extern PDEVICE_CONTEXT g_DeviceContext;
-    if (g_DeviceContext) {
-        g_DeviceContext->PendingDeviceSpeed = UsbDeviceInfo->DeviceSpeed;
-    }
-
     /*
      * Build the per-device event callbacks struct.
      *
@@ -259,12 +245,22 @@ OhciPci_UsbDeviceAdd(
 
     UcxUsbDeviceInitSetEventCallbacks(UsbDeviceInit, &cbs);
 
+    WDF_OBJECT_ATTRIBUTES devAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&devAttrs, OHCIPCI_USBDEV_CTX);
+
     UCXUSBDEVICE usbDevice;
     NTSTATUS status = UcxUsbDeviceCreate(Controller,
                                          &UsbDeviceInit,
-                                         WDF_NO_OBJECT_ATTRIBUTES,
+                                         &devAttrs,
                                          &usbDevice);
     LOG("UcxUsbDeviceCreate -> 0x%08X", status);
+    if (!NT_SUCCESS(status)) return status;
+
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(usbDevice);
+    RtlZeroMemory(udc, sizeof(*udc));
+    udc->Speed    = UsbDeviceInfo->DeviceSpeed;
+    udc->FuncAddr = 0;
+    LOG("UsbDevContext attached: speed=%d", (int)udc->Speed);
     return status;
 }
 
