@@ -58,6 +58,11 @@ typedef struct _DEVICE_CONTEXT {
      * Single-instance limitation; matches dwusb's per-UCXUSBDEVICE pattern. */
     USB_DEVICE_SPEED         PendingDeviceSpeed;
 
+    /* Function address most recently assigned via EvtUsbDeviceAddress.
+     * Read by OhciPci_EndpointAdd when wiring up Bulk/Interrupt EDs.
+     * Single-instance limitation, same shape as PendingDeviceSpeed. */
+    UCHAR                    PendingFuncAddr;
+
     struct ohcipci_bounce_pool BouncePool;
 
     /* Coarse spinlock serialising every call into the OHCI core that

@@ -70,6 +70,7 @@ Environment:
 #include <ntddk.h>
 #include <wdf.h>
 #include <UcxClass.h>
+#include <usbioctl.h>
 #include "device_context.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
@@ -147,7 +148,21 @@ StubUsbDeviceAddress(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceAddress (stub)");
+    /* UCX delivers the new address in Parameters.Others.Arg1 as a
+     * PUSBDEVICE_ADDRESS (UCX-private layout, same as dwusb).
+     * Stash it for OhciPci_EndpointAdd to read when configuring
+     * non-default EDs. */
+    extern PDEVICE_CONTEXT g_DeviceContext;
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_ADDRESS addr = (PUSBDEVICE_ADDRESS)rp.Parameters.Others.Arg1;
+    if (addr && g_DeviceContext) {
+        g_DeviceContext->PendingFuncAddr = (UCHAR)(addr->Address & 0x7F);
+        LOG("UsbDeviceAddress: addr=%u", g_DeviceContext->PendingFuncAddr);
+    } else {
+        LOG("UsbDeviceAddress: missing addr struct");
+    }
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 

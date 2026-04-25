@@ -93,6 +93,15 @@ static EVT_UCX_ENDPOINT_ABORT               EvtDefaultEpAbort;
 static EVT_UCX_ENDPOINT_OK_TO_CANCEL_TRANSFERS EvtDefaultEpOkToCancel;
 static EVT_UCX_DEFAULT_ENDPOINT_UPDATE      EvtDefaultEpUpdate;
 
+/* Non-default (Bulk/Interrupt) endpoint callbacks. The non-default callbacks
+ * struct adds a Reset slot the default EP doesn't have, plus three streams
+ * callbacks we leave NULL because OHCI doesn't support USB 3.0 streams. */
+static EVT_UCX_ENDPOINT_PURGE                  EvtNonDefaultEpPurge;
+static EVT_UCX_ENDPOINT_START                  EvtNonDefaultEpStart;
+static EVT_UCX_ENDPOINT_ABORT                  EvtNonDefaultEpAbort;
+static EVT_UCX_ENDPOINT_RESET                  EvtNonDefaultEpReset;
+static EVT_UCX_ENDPOINT_OK_TO_CANCEL_TRANSFERS EvtNonDefaultEpOkToCancel;
+
 /* Forward declaration for URB delivery handler.
  *
  * UCX 1.6 delivers per-endpoint transfers via EvtIoDefault (NOT
@@ -549,23 +558,182 @@ OhciPci_DefaultEndpointAdd(
  * endpoints. Implemented in Plan 6. Returns STATUS_NOT_IMPLEMENTED so UCX
  * fails gracefully during enumeration of multi-endpoint devices.
  * -------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+ * Non-default endpoint lifecycle callbacks. Same shape as default-EP
+ * variants but slot in to UCX_ENDPOINT_EVENT_CALLBACKS_INIT instead of
+ * the default-EP-only struct.
+ * -------------------------------------------------------------------------- */
+_Use_decl_annotations_
+static VOID
+EvtNonDefaultEpPurge(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
+    LOG("NonDefaultEp Purge (kind=%d)", ep->Kind);
+    if (ep->UrbQueue) WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
+    UcxEndpointPurgeComplete(UcxEndpoint);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtNonDefaultEpStart(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
+    LOG("NonDefaultEp Start (kind=%d)", ep->Kind);
+    if (ep->UrbQueue) WdfIoQueueStart(ep->UrbQueue);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtNonDefaultEpAbort(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint)
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
+    LOG("NonDefaultEp Abort (kind=%d)", ep->Kind);
+    if (ep->UrbQueue) WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
+    UcxEndpointAbortComplete(UcxEndpoint);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtNonDefaultEpReset(UCXCONTROLLER UcxController, UCXENDPOINT UcxEndpoint, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    UNREFERENCED_PARAMETER(UcxEndpoint);
+    LOG("NonDefaultEp Reset (Plan 6 best-effort ack)");
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtNonDefaultEpOkToCancel(UCXENDPOINT UcxEndpoint)
+{
+    UNREFERENCED_PARAMETER(UcxEndpoint);
+}
+
+/* --------------------------------------------------------------------------
+ * OhciPci_EndpointAdd
+ *
+ * EVT_UCX_USBDEVICE_ENDPOINT_ADD — non-default (Bulk/Interrupt/Isoch)
+ * endpoints. Routes by bmAttributes; isoch returns STATUS_NOT_SUPPORTED.
+ * -------------------------------------------------------------------------- */
 _Use_decl_annotations_
 NTSTATUS
 OhciPci_EndpointAdd(
     UCXCONTROLLER                                 UcxController,
     UCXUSBDEVICE                                  UcxUsbDevice,
-    PUSB_ENDPOINT_DESCRIPTOR                      UsbEndpointDescriptor,
-    ULONG                                         UsbEndpointDescriptorBufferLength,
-    PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR SuperSpeedEndpointCompanionDescriptor,
-    PUCXENDPOINT_INIT                             UcxEndpointInit
+    PUSB_ENDPOINT_DESCRIPTOR                      Desc,
+    ULONG                                         DescLen,
+    PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR SsCompanion,
+    PUCXENDPOINT_INIT                             EpInit
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
     UNREFERENCED_PARAMETER(UcxUsbDevice);
-    UNREFERENCED_PARAMETER(UsbEndpointDescriptor);
-    UNREFERENCED_PARAMETER(UsbEndpointDescriptorBufferLength);
-    UNREFERENCED_PARAMETER(SuperSpeedEndpointCompanionDescriptor);
-    UNREFERENCED_PARAMETER(UcxEndpointInit);
-    LOG("EndpointAdd (Plan 6 implements non-default endpoints)");
-    return STATUS_NOT_IMPLEMENTED;
+    UNREFERENCED_PARAMETER(DescLen);
+    UNREFERENCED_PARAMETER(SsCompanion);
+
+    if (Desc == NULL) return STATUS_INVALID_PARAMETER;
+
+    UCHAR  attrs  = Desc->bmAttributes & 0x03; /* 0=Ctrl 1=Iso 2=Bulk 3=Int */
+    UCHAR  epAddr = Desc->bEndpointAddress;
+    UCHAR  epNum  = epAddr & 0x0F;
+    BOOLEAN isIn  = (epAddr & 0x80) != 0;
+    USHORT mps    = Desc->wMaxPacketSize & 0x07FF;
+
+    LOG("EndpointAdd: addr=0x%02X attrs=0x%02X mps=%u", epAddr, attrs, mps);
+
+    if (attrs == 0x01) {
+        LOG("EndpointAdd: isochronous not supported (Plan 7+)");
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (attrs == 0x00) {
+        LOG("EndpointAdd: non-default control endpoints not supported");
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    /* 1. Register non-default callbacks. */
+    UCX_ENDPOINT_EVENT_CALLBACKS ecb;
+    UCX_ENDPOINT_EVENT_CALLBACKS_INIT(
+        &ecb,
+        EvtNonDefaultEpPurge,
+        EvtNonDefaultEpStart,
+        EvtNonDefaultEpAbort,
+        EvtNonDefaultEpReset,
+        EvtNonDefaultEpOkToCancel,
+        NULL,   /* StaticStreamsAdd     — OHCI has no streams */
+        NULL,   /* StaticStreamsEnable  */
+        NULL    /* StaticStreamsDisable */
+    );
+    UcxEndpointInitSetEventCallbacks(EpInit, &ecb);
+
+    /* 2. Create UCXENDPOINT. */
+    WDF_OBJECT_ATTRIBUTES epAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&epAttrs, OHCIPCI_EP_CONTEXT);
+    UCXENDPOINT ucxEp;
+    NTSTATUS status = UcxEndpointCreate(UcxUsbDevice, &EpInit, &epAttrs, &ucxEp);
+    if (!NT_SUCCESS(status)) {
+        LOG("UcxEndpointCreate (non-default) -> 0x%08X", status);
+        return status;
+    }
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
+    RtlZeroMemory(ep, sizeof(*ep));
+    ep->Dc    = g_DeviceContext;
+    ep->UcxEp = ucxEp;
+
+    /* 3. Per-EP WDFQUEUE (same recipe as default EP). */
+    WDF_IO_QUEUE_CONFIG qCfg;
+    WDF_IO_QUEUE_CONFIG_INIT(&qCfg, WdfIoQueueDispatchSequential);
+    qCfg.EvtIoDefault = EvtUrbDefault;
+    qCfg.PowerManaged = WdfFalse;
+    WDF_OBJECT_ATTRIBUTES qAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&qAttrs, OHCIPCI_QUEUE_CTX);
+    qAttrs.ParentObject = ucxEp;
+    WDFQUEUE q;
+    status = WdfIoQueueCreate(ep->Dc->Device, &qCfg, &qAttrs, &q);
+    if (!NT_SUCCESS(status)) {
+        LOG("WdfIoQueueCreate (non-default) failed: 0x%08X", status);
+        return status;
+    }
+    OhciPci_QueueCtxGet(q)->EpCtx = ep;
+    ep->UrbQueue = q;
+    UcxEndpointSetWdfIoQueue(ucxEp, q);
+
+    /* 4. Configure the OHCI core endpoint. */
+    UCHAR funcAddr = ep->Dc->PendingFuncAddr;
+    UCHAR lowSpeed = (ep->Dc->PendingDeviceSpeed == UsbLowSpeed) ? 1 : 0;
+    int rc;
+    if (attrs == 0x02) {
+        ep->Kind = OhciPciEpKindBulk;
+        struct ohci_bulk_endpoint_config bcfg;
+        bcfg.func_addr       = funcAddr;
+        bcfg.ep_num          = epNum;
+        bcfg.max_packet_size = mps;
+        bcfg.direction       = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+        bcfg.low_speed       = lowSpeed;
+        WdfSpinLockAcquire(ep->Dc->CoreLock);
+        rc = ohci_bulk_endpoint_create(&ep->Dc->Hc, &bcfg, &ep->Core.Bulk);
+        WdfSpinLockRelease(ep->Dc->CoreLock);
+        LOG("Bulk EP created: addr=%u ep=%u dir=%s mps=%u rc=%d",
+            funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc);
+    } else { /* attrs == 0x03 — Interrupt */
+        ep->Kind = OhciPciEpKindInterrupt;
+        struct ohci_interrupt_endpoint_config icfg;
+        icfg.func_addr            = funcAddr;
+        icfg.ep_num               = epNum;
+        icfg.max_packet_size      = mps;
+        icfg.direction            = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+        icfg.low_speed            = lowSpeed;
+        icfg.poll_interval_frames = 32; /* Plan 6: always 32ms slot */
+        WdfSpinLockAcquire(ep->Dc->CoreLock);
+        rc = ohci_interrupt_endpoint_create(&ep->Dc->Hc, &icfg, &ep->Core.Interrupt);
+        WdfSpinLockRelease(ep->Dc->CoreLock);
+        LOG("Interrupt EP created: addr=%u ep=%u dir=%s mps=%u (32ms slot) rc=%d",
+            funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc);
+    }
+    if (rc != 0) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    return STATUS_SUCCESS;
 }
