@@ -53,6 +53,15 @@ void fake_hc_exec_step(struct fake_hc *hc) {
     retired += walk_ed_list(hc, rd(hc, 0x20 /* HcControlHeadED */), hcca);
     retired += walk_ed_list(hc, rd(hc, 0x28 /* HcBulkHeadED    */), hcca);
 
+    /* Periodic list: advance frame counter and walk the one slot pointed
+     * at by HCCA.InterruptTable[frame & 31]. Each leaf chains through
+     * user EPs then the skeleton tree; skeleton EDs have K=1 and are
+     * skipped by walk_ed_list. */
+    uint32_t slot = hc->frame_number & 31;
+    retired += walk_ed_list(hc, hcca->InterruptTable[slot], hcca);
+    hc->frame_number++;
+    hcca->FrameNumber = (uint16_t)hc->frame_number;
+
     if (retired) {
         uint32_t s = rd(hc, 0x0C);
         s |= OHCI_INT_WDH;

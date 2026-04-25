@@ -11,6 +11,7 @@
 struct fake_hc {
     uint8_t  regs[FAKE_HC_MMIO_SIZE];
     uint32_t barrier_calls;
+    uint32_t frame_number;
     struct ohci_dma_region *dma;
 };
 
