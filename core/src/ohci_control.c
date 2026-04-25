@@ -120,7 +120,7 @@ int ohci_control_endpoint_create(struct ohci_hc *hc,
 
     /* Splice onto Control list head.
      *
-     * TODO(Plan 3): pause CLE (HcControl.CLE=0) around this sequence
+     * TODO(Plan 4): pause CLE (HcControl.CLE=0) around this sequence
      * when a real HC may be mid-list-walk (OHCI §5.2.3). Safe in
      * Tier-1 harness where no HC is actively walking. */
     uint32_t old_head = hc->ops.read32(hc->ops.context, 0x20);
