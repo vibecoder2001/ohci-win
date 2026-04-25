@@ -124,6 +124,7 @@ NTSTATUS OhciPci_CreateInterrupt(PDEVICE_CONTEXT dc);
 /* Defined in ucx_glue.c — UCX 1.6 controller registration helpers. */
 NTSTATUS OhciPci_UcxInitDeviceInit(PWDFDEVICE_INIT DeviceInit);
 NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
+NTSTATUS OhciPci_CreateDefaultQueue(PDEVICE_CONTEXT dc);
 
 /* Defined in ucx_roothub.c — UCX 1.6 root hub registration. */
 NTSTATUS OhciPci_RootHubCreate(PDEVICE_CONTEXT dc, UCXCONTROLLER controller);

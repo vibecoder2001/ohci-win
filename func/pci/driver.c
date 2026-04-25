@@ -50,6 +50,16 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     OhciPci_InitMmioOps(dc);
     LOG("Context attached and mmio_ops wired");
 
+    /* Default WDFQUEUE that forwards URB IOCTLs (IOCTL_INTERNAL_USB_SUBMIT_URB
+     * etc.) from UsbHub3 into UCX via UcxIoDeviceControl. Without this, UCX's
+     * root-hub control-URB callback never fires and UsbHub3 keeps failing,
+     * causing UCX to loop on EvtControllerReset. */
+    NTSTATUS qStatus = OhciPci_CreateDefaultQueue(dc);
+    if (!NT_SUCCESS(qStatus)) {
+        LOG("Default queue setup failed; refusing to start");
+        return qStatus;
+    }
+
     /* WDF requires WdfInterruptCreate from EvtDriverDeviceAdd, not from
      * EvtDevicePrepareHardware (the latter only works for HID minidrivers).
      * The interrupt object is created here with EvtIsr/EvtDpc callbacks;

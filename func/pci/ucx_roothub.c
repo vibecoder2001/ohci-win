@@ -105,6 +105,8 @@ Environment:
 #include <ntddk.h>
 #include <wdf.h>
 #include <UcxClass.h>
+#include <usbdi.h>
+#include <usbioctl.h>
 #include "device_context.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
@@ -127,23 +129,6 @@ Environment:
  * WDF context attached to the UCXROOTHUB object instead.
  */
 PDEVICE_CONTEXT g_DeviceContext;  /* extern in device_context.h; shared across glue TUs */
-
-/* --------------------------------------------------------------------------
- * StubControlUrb — EVT_UCX_ROOTHUB_CONTROL_URB
- *
- * Dispatched for all standard root hub control requests (GetHubStatus,
- * GetPortStatus, SetPortFeature, etc.) when using the combined handler path.
- * Task 4 decomposes into individual callbacks.
- * -------------------------------------------------------------------------- */
-static EVT_UCX_ROOTHUB_CONTROL_URB StubControlUrb;
-
-_Use_decl_annotations_
-static VOID StubControlUrb(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
-{
-    UNREFERENCED_PARAMETER(UcxRootHub);
-    LOG("RootHub StubControlUrb (Task 4 will implement)");
-    WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
-}
 
 /* --------------------------------------------------------------------------
  * OhciPciInterruptTx — EVT_UCX_ROOTHUB_INTERRUPT_TX  (Task 4 real impl)
@@ -175,10 +160,6 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
                         (PULONG)((PUCHAR)dc->MmioBase + REG_HcRhDescriptorA));
     ULONG ports   = rhDescA & 0xFFu;
 
-    /*
-     * USB 2.0 hub change-status bitmap: bit 0 = hub, bit i = port i (1-indexed).
-     * Allow up to 8 bytes — covers up to 63 ports, far more than OHCI's max 15.
-     */
     UCHAR bitmap[8] = {0};
     int anySet = 0;
 
@@ -187,10 +168,10 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
                          (PULONG)((PUCHAR)dc->MmioBase
                                   + REG_HcRhPortStatus_BASE + i * 4u));
         if (rhps & OHCI_RHPS_CHANGE_MASK) {
-            ULONG portBit = i + 1u;          /* 1-indexed */
+            ULONG portBit = i + 1u;
             bitmap[portBit / 8u] |= (UCHAR)(1u << (portBit % 8u));
             anySet = 1;
-            /* W1C: write the change bits back to clear them. */
+            /* W1C: write change bits back to clear. */
             WRITE_REGISTER_ULONG(
                 (PULONG)((PUCHAR)dc->MmioBase
                          + REG_HcRhPortStatus_BASE + i * 4u),
@@ -198,11 +179,22 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
         }
     }
 
-    PVOID outBuf;
-    size_t outLen;
-    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, 1, &outBuf, &outLen);
-    if (!NT_SUCCESS(status)) {
-        WdfRequestComplete(Request, status);
+    /* Argument1 is a URB pointer (URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER),
+     * NOT a raw buffer. Buffer + length come from the URB struct. (Confirmed
+     * against dwusb RootHub_UcxEvtInterruptTransfer.) */
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)stack->Parameters.Others.Argument1;
+    if (!urb) {
+        LOG("RootHub InterruptTx: NULL URB in Argument1");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    PVOID outBuf = urb->UrbBulkOrInterruptTransfer.TransferBuffer;
+    size_t outLen = urb->UrbBulkOrInterruptTransfer.TransferBufferLength;
+    if (!outBuf || outLen == 0) {
+        urb->UrbHeader.Status = USBD_STATUS_INVALID_PARAMETER;
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
 
@@ -225,7 +217,8 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
     LOG("RootHub InterruptTx: bitmap[0]=0x%02X (anyChange=%d), ports=%lu, copied %zu bytes",
         bitmap[0], anySet, ports, copyLen);
 
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, outLen);
+    urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
 /* --------------------------------------------------------------------------
@@ -257,12 +250,19 @@ static VOID OhciPciGetInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
         return;
     }
 
-    PROOTHUB_INFO info;
-    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*info),
-                                                     (PVOID *)&info, NULL);
-    if (!NT_SUCCESS(status)) {
-        LOG("RootHub GetInfo: WdfRequestRetrieveOutputBuffer -> 0x%08X", status);
-        WdfRequestComplete(Request, status);
+    /*
+     * UCX conveys the ROOTHUB_INFO output buffer as IRP
+     * Parameters.Others.Argument1, NOT through WDF input/output buffers.
+     * (Same convention as IOCTL_INTERNAL_USB_SUBMIT_URB.) Initial code
+     * used WdfRequestRetrieveOutputBuffer and crashed with NULL deref
+     * because UCX's IOCTL has no METHOD_BUFFERED output staged.
+     */
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PROOTHUB_INFO info = (PROOTHUB_INFO)stack->Parameters.Others.Argument1;
+    if (!info) {
+        LOG("RootHub GetInfo: NULL output struct in Argument1");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
 
@@ -361,88 +361,57 @@ static VOID OhciPciGet20PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
                         (PULONG)((PUCHAR)dc->MmioBase + REG_HcRhDescriptorB));
     USHORT drMask = (USHORT)(rhDescB & 0xFFFFu);
 
-    PROOTHUB_20PORTS_INFO portsInfo;
-    NTSTATUS status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*portsInfo),
-                                                     (PVOID *)&portsInfo, NULL);
-    if (!NT_SUCCESS(status)) {
-        LOG("RootHub Get20PortInfo: WdfRequestRetrieveOutputBuffer -> 0x%08X", status);
-        WdfRequestComplete(Request, status);
+    /* UCX conveys ROOTHUB_20PORTS_INFO via Argument1. The struct's
+     * PortInfoArray field is *pre-allocated by UCX* with NumberOfPorts
+     * pointer slots — we fill in the existing PROOTHUB_20PORT_INFO entries
+     * UCX has prepared. (Confirmed against dwusb reference driver:
+     * Device.c RootHub_UcxEvtGet20PortInfo.) Replacing PortInfoArray with
+     * our own allocation and freeing it caused UCX to read freed memory,
+     * corrupting per-port topology and triggering a controller reset loop. */
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PROOTHUB_20PORTS_INFO portsInfo =
+        (PROOTHUB_20PORTS_INFO)stack->Parameters.Others.Argument1;
+    if (!portsInfo) {
+        LOG("RootHub Get20PortInfo: NULL output struct in Argument1");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    if (portsInfo->Size < sizeof(*portsInfo)) {
+        LOG("RootHub Get20PortInfo: portsInfo->Size %lu < %llu",
+            portsInfo->Size, (ULONGLONG)sizeof(*portsInfo));
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    if (portsInfo->NumberOfPorts != ports) {
+        LOG("RootHub Get20PortInfo: NumberOfPorts mismatch UCX=%u hw=%lu",
+            portsInfo->NumberOfPorts, ports);
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
         return;
     }
 
-    /*
-     * Allocate a single block:
-     *   [0 .. ports*sizeof(PROOTHUB_20PORT_INFO))  — pointer array
-     *   [ports*sizeof(PROOTHUB_20PORT_INFO) .. end) — ROOTHUB_20PORT_INFO structs
-     *
-     * This block is freed after WdfRequestCompleteWithInformation because UCX
-     * reads the data synchronously before returning from the callback.
-     *
-     * If ports == 0 (pathological hardware) skip allocation and return empty.
-     */
-    PROOTHUB_20PORT_INFO  *ptrArray  = NULL;
-    PROOTHUB_20PORT_INFO   portStructs = NULL;
-    SIZE_T ptrArrayBytes  = 0;
-    SIZE_T structArrayBytes = 0;
-
-    if (ports > 0) {
-        ptrArrayBytes    = (SIZE_T)ports * sizeof(PROOTHUB_20PORT_INFO);
-        structArrayBytes = (SIZE_T)ports * sizeof(ROOTHUB_20PORT_INFO);
-        SIZE_T totalBytes = ptrArrayBytes + structArrayBytes;
-
-        PVOID block = ExAllocatePool2(POOL_FLAG_NON_PAGED, totalBytes,
-                                      'hrPO');   /* OhciPci port-info tag */
-        if (!block) {
-            LOG("RootHub Get20PortInfo: ExAllocatePool2 failed (ports=%lu)", ports);
-            WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+    PROOTHUB_20PORT_INFO *arr = portsInfo->PortInfoArray;
+    for (ULONG i = 0; i < ports; i++) {
+        PROOTHUB_20PORT_INFO p = arr[i];
+        if (!p) {
+            LOG("RootHub Get20PortInfo: PortInfoArray[%lu] is NULL", i);
+            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
             return;
         }
-        RtlZeroMemory(block, totalBytes);
-
-        ptrArray   = (PROOTHUB_20PORT_INFO *)block;
-        portStructs = (PROOTHUB_20PORT_INFO)((PUCHAR)block + ptrArrayBytes);
-
-        for (ULONG i = 0; i < ports; i++) {
-            PROOTHUB_20PORT_INFO p = &portStructs[i];
-            ptrArray[i] = p;
-
-            p->PortNumber   = (USHORT)(i + 1u);  /* 1-indexed */
-            p->MinorRevision = 0;                 /* OHCI 1.0a, minor = 0 */
-            p->HubDepth      = 0;                 /* root hub is at depth 0 */
-
-            /*
-             * DR bit (i+1) set means device NOT removable (integrated);
-             * DR bit clear means removable.  Map to TRISTATE:
-             *   TriStateFalse = 'f' = removable (false = "not fixed")
-             *   TriStateTrue  = 't' = not removable (true = "integrated/fixed")
-             */
-            BOOLEAN notRemovable = !!((drMask >> (i + 1u)) & 1u);
-            p->Removable = notRemovable ? TriStateTrue : TriStateFalse;
-
-            /* OHCI does not implement integrated hub; no debug capability. */
-            p->IntegratedHubImplemented = TriStateFalse;
-            p->DebugCapable             = TriStateFalse;
-
-            /* LPM not supported by OHCI (USB 1.1 / USB 2.0 without LPM). */
-            p->ControllerUsb20HardwareLpmFlags.AsUchar = 0;
-        }
+        p->PortNumber               = (USHORT)(i + 1u);
+        p->MinorRevision            = 0;
+        p->HubDepth                 = 0;
+        BOOLEAN notRemovable        = !!((drMask >> (i + 1u)) & 1u);
+        p->Removable                = notRemovable ? TriStateTrue : TriStateFalse;
+        p->IntegratedHubImplemented = TriStateFalse;
+        p->DebugCapable             = TriStateFalse;
+        p->ControllerUsb20HardwareLpmFlags.AsUchar = 0;
     }
 
-    RtlZeroMemory(portsInfo, sizeof(*portsInfo));
-    portsInfo->Size          = sizeof(*portsInfo);
-    portsInfo->NumberOfPorts = (USHORT)ports;
-    portsInfo->PortInfoSize  = sizeof(ROOTHUB_20PORT_INFO);
-    portsInfo->PortInfoArray = ptrArray;
+    LOG("RootHub Get20PortInfo: filled %lu ports drMask=0x%04X",
+        ports, (USHORT)drMask);
 
-    LOG("RootHub Get20PortInfo: count=%lu drMask=0x%04X (rhDescA=0x%08X rhDescB=0x%08X)",
-        ports, (USHORT)drMask, rhDescA, rhDescB);
-
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, sizeof(*portsInfo));
-
-    /* Free the per-port allocation after completing the request. */
-    if (ptrArray) {
-        ExFreePoolWithTag(ptrArray, 'hrPO');
-    }
+    WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
 /* --------------------------------------------------------------------------
@@ -461,6 +430,353 @@ static VOID StubGet30PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
     UNREFERENCED_PARAMETER(UcxRootHub);
     LOG("RootHub StubGet30PortInfo — OHCI is USB 2.0 only; not implemented");
     WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
+}
+
+/* --------------------------------------------------------------------------
+ * Per-class diagnostic stubs for the 7-individual-callbacks variant.
+ * Each logs the URB function code from Argument1 so we can see which
+ * hub-class operations UCX dispatches to which slot.
+ * -------------------------------------------------------------------------- */
+/* Helper: pick SetupPacket address based on URB function (CONTROL_TRANSFER vs
+ * CONTROL_TRANSFER_EX have different layouts). */
+static PUCHAR GetUrbSetupPacket(PURB urb)
+{
+    if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
+        return urb->UrbControlTransferEx.SetupPacket;
+    }
+    return urb->UrbControlTransfer.SetupPacket;
+}
+
+static ULONG GetUrbTransferBufferLength(PURB urb)
+{
+    if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
+        return urb->UrbControlTransferEx.TransferBufferLength;
+    }
+    return urb->UrbControlTransfer.TransferBufferLength;
+}
+
+static PVOID GetUrbTransferBuffer(PURB urb)
+{
+    if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
+        return urb->UrbControlTransferEx.TransferBuffer;
+    }
+    return urb->UrbControlTransfer.TransferBuffer;
+}
+
+/* USB hub-spec feature selectors (USB 2.0 §11.24.2) */
+#define USB_FEATURE_PORT_CONNECTION       0
+#define USB_FEATURE_PORT_ENABLE           1
+#define USB_FEATURE_PORT_SUSPEND          2
+#define USB_FEATURE_PORT_OVER_CURRENT     3
+#define USB_FEATURE_PORT_RESET            4
+#define USB_FEATURE_PORT_POWER            8
+#define USB_FEATURE_PORT_LOW_SPEED        9
+#define USB_FEATURE_C_PORT_CONNECTION    16
+#define USB_FEATURE_C_PORT_ENABLE        17
+#define USB_FEATURE_C_PORT_SUSPEND       18
+#define USB_FEATURE_C_PORT_OVER_CURRENT  19
+#define USB_FEATURE_C_PORT_RESET         20
+
+/* OHCI HcRhPortStatus bits (OHCI spec §7.4.4) */
+#define OHCI_RHPS_CCS    (1u << 0)   /* Current Connect Status */
+#define OHCI_RHPS_PES    (1u << 1)   /* Port Enable Status */
+#define OHCI_RHPS_PSS    (1u << 2)   /* Port Suspend Status */
+#define OHCI_RHPS_POCI   (1u << 3)   /* Port Over-Current Indicator */
+#define OHCI_RHPS_PRS    (1u << 4)   /* Port Reset Status */
+#define OHCI_RHPS_PPS    (1u << 8)   /* Port Power Status */
+#define OHCI_RHPS_LSDA   (1u << 9)   /* Low-Speed Device Attached */
+#define OHCI_RHPS_CSC    (1u << 16)
+#define OHCI_RHPS_PESC   (1u << 17)
+#define OHCI_RHPS_PSSC   (1u << 18)
+#define OHCI_RHPS_OCIC   (1u << 19)
+#define OHCI_RHPS_PRSC   (1u << 20)
+
+/* W1S bits (write to set) */
+#define OHCI_RHPS_SET_PES   (1u << 1)
+#define OHCI_RHPS_SET_PSS   (1u << 2)
+#define OHCI_RHPS_SET_PRS   (1u << 4)
+#define OHCI_RHPS_SET_PPS   (1u << 8)
+/* W1C clear-feature bits (write to clear) */
+#define OHCI_RHPS_CLR_PES   (1u << 0)   /* CCS=1 also clears enable when written */
+#define OHCI_RHPS_CLR_PSS   (1u << 3)   /* POCI write */
+#define OHCI_RHPS_CLR_PPS   (1u << 9)   /* LSDA write */
+/* (the proper "clear" bit conventions are encoded below per feature) */
+
+static ULONG ReadRhPortStatus(PDEVICE_CONTEXT dc, ULONG portIdx /* 0-based */)
+{
+    return READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase
+                                        + REG_HcRhPortStatus_BASE + portIdx * 4u));
+}
+static VOID WriteRhPortStatus(PDEVICE_CONTEXT dc, ULONG portIdx, ULONG val)
+{
+    WRITE_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase
+                                  + REG_HcRhPortStatus_BASE + portIdx * 4u), val);
+}
+
+/* Helper: set URB header status to success — required by UCX. dwusb sets it
+ * explicitly in every callback; without it UCX treats the URB as failed. */
+static VOID SetUrbHeaderSuccess(WDFREQUEST Request)
+{
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (urb) urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+}
+
+/* ---- ClearHubFeature: nothing to do for OHCI; success. ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciClearHubFeature;
+_Use_decl_annotations_
+static VOID OhciPciClearHubFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    LOG("RootHub ClearHubFeature");
+    SetUrbHeaderSuccess(Request);
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- SetHubFeature: same. ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciSetHubFeature;
+_Use_decl_annotations_
+static VOID OhciPciSetHubFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    LOG("RootHub SetHubFeature");
+    SetUrbHeaderSuccess(Request);
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- GetHubStatus: 4-byte response, all zeros (no overcurrent/power events). ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciGetHubStatus;
+_Use_decl_annotations_
+static VOID OhciPciGetHubStatus(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (urb) {
+        PVOID buf = GetUrbTransferBuffer(urb);
+        ULONG len = GetUrbTransferBufferLength(urb);
+        if (buf && len >= 4) {
+            RtlZeroMemory(buf, 4);
+            if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX)
+                urb->UrbControlTransferEx.TransferBufferLength = 4;
+            else
+                urb->UrbControlTransfer.TransferBufferLength = 4;
+        }
+    }
+    LOG("RootHub GetHubStatus -> {0,0,0,0}");
+    if (urb) urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- GetPortErrorCount: 2-byte response, zero. ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciGetPortErrorCount;
+_Use_decl_annotations_
+static VOID OhciPciGetPortErrorCount(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (urb) {
+        PVOID buf = GetUrbTransferBuffer(urb);
+        ULONG len = GetUrbTransferBufferLength(urb);
+        if (buf && len >= 2) RtlZeroMemory(buf, 2);
+    }
+    LOG("RootHub GetPortErrorCount -> 0");
+    if (urb) urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- GetPortStatus: read HcRhPortStatus[wIndex-1], translate to USB-spec
+ *      4-byte port status (wPortStatus + wPortChange).
+ * USB 2.0 hub spec §11.24.2.7:
+ *   wPortStatus bits: 0=Connection 1=Enable 2=Suspend 3=OverCurrent 4=Reset
+ *                     8=Power 9=LowSpeed 10=HighSpeed
+ *   wPortChange bits: 0=ConnectionChange 1=EnableChange 2=SuspendChange
+ *                     3=OverCurrentChange 4=ResetChange
+ * ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciGetPortStatus;
+_Use_decl_annotations_
+static VOID OhciPciGetPortStatus(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (!dc || !urb) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    PUCHAR sp = GetUrbSetupPacket(urb);
+    USHORT wValue = *(USHORT *)&sp[2];
+    USHORT port   = *(USHORT *)&sp[4];
+    USHORT wLen   = *(USHORT *)&sp[6];
+    PVOID  buf    = GetUrbTransferBuffer(urb);
+    ULONG  len    = GetUrbTransferBufferLength(urb);
+
+    /* USB_STATUS_PORT_STATUS=0 → 4 bytes; USB_STATUS_EXT_PORT_STATUS=2 → 8 bytes. */
+    ULONG respLen = (wValue == 2) ? 8 : 4;
+
+    if (port == 0 || buf == NULL || len < respLen) {
+        LOG("RootHub GetPortStatus: bad params port=%u wValue=%u wLen=%u len=%lu",
+            port, wValue, wLen, len);
+        urb->UrbHeader.Status = USBD_STATUS_STALL_PID;
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    ULONG rhps = ReadRhPortStatus(dc, port - 1u);
+
+    USHORT wPortStatus = 0;
+    if (rhps & OHCI_RHPS_CCS)  wPortStatus |= 0x0001;
+    if (rhps & OHCI_RHPS_PES)  wPortStatus |= 0x0002;
+    if (rhps & OHCI_RHPS_PSS)  wPortStatus |= 0x0004;
+    if (rhps & OHCI_RHPS_POCI) wPortStatus |= 0x0008;
+    if (rhps & OHCI_RHPS_PRS)  wPortStatus |= 0x0010;
+    if (rhps & OHCI_RHPS_PPS)  wPortStatus |= 0x0100;
+    if (rhps & OHCI_RHPS_LSDA) wPortStatus |= 0x0200;
+
+    USHORT wPortChange = 0;
+    if (rhps & OHCI_RHPS_CSC)  wPortChange |= 0x0001;
+    if (rhps & OHCI_RHPS_PESC) wPortChange |= 0x0002;
+    if (rhps & OHCI_RHPS_PSSC) wPortChange |= 0x0004;
+    if (rhps & OHCI_RHPS_OCIC) wPortChange |= 0x0008;
+    if (rhps & OHCI_RHPS_PRSC) wPortChange |= 0x0010;
+
+    UCHAR resp[8] = {0};
+    resp[0] = (UCHAR)(wPortStatus & 0xFF);
+    resp[1] = (UCHAR)(wPortStatus >> 8);
+    resp[2] = (UCHAR)(wPortChange & 0xFF);
+    resp[3] = (UCHAR)(wPortChange >> 8);
+    /* Extended port status (USB 2.0 LPM) — bytes 4..7 are zero for OHCI (no LPM). */
+    RtlCopyMemory(buf, resp, respLen);
+    if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX)
+        urb->UrbControlTransferEx.TransferBufferLength = respLen;
+    else
+        urb->UrbControlTransfer.TransferBufferLength = respLen;
+
+    LOG("RootHub GetPortStatus port=%u wValue=%u wLen=%u rhps=0x%08X -> status=0x%04X change=0x%04X (respLen=%lu)",
+        port, wValue, wLen, rhps, wPortStatus, wPortChange, respLen);
+    urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- SetPortFeature: translate USB feature to OHCI W1S bit. ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciSetPortFeature;
+_Use_decl_annotations_
+static VOID OhciPciSetPortFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (!dc || !urb) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    PUCHAR sp = GetUrbSetupPacket(urb);
+    USHORT feature = *(USHORT *)&sp[2];
+    USHORT port    = *(USHORT *)&sp[4];
+
+    /* Diagnostic: hex-dump the entire setup packet + first ULONG of PipeHandle
+     * so we can confirm where UCX puts the port number for multi-port hubs. */
+    LOG("RootHub SetPortFeature port=%u feature=%u [setup=%02X %02X %02X %02X %02X %02X %02X %02X | PipeHandle=%p TransferFlags=0x%08X]",
+        port, feature,
+        sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7],
+        urb->UrbControlTransferEx.PipeHandle,
+        urb->UrbControlTransferEx.TransferFlags);
+
+    /* port==0 = "hub-global". For PORT_POWER, write HcRhStatus.LPSC (bit 16,
+     * W1S "Set Global Power"). On NPS=1 hubs this is a no-op in hardware,
+     * but UCX may still want to see us perform the write. */
+    if (port == 0) {
+        if (feature == USB_FEATURE_PORT_POWER) {
+            WRITE_REGISTER_ULONG(
+                (PULONG)((PUCHAR)dc->MmioBase + 0x50 /* HcRhStatus */),
+                (1u << 16) /* LPSC = Set Global Power */);
+            ULONG rhs = READ_REGISTER_ULONG(
+                (PULONG)((PUCHAR)dc->MmioBase + 0x50));
+            LOG("  -> wrote HcRhStatus.LPSC; HcRhStatus now=0x%08X", rhs);
+        }
+        /* Also iterate per-port to set PPS for paranoid UCX checks. */
+        ULONG rhDescA = READ_REGISTER_ULONG(
+            (PULONG)((PUCHAR)dc->MmioBase + REG_HcRhDescriptorA));
+        ULONG nports = rhDescA & 0xFFu;
+        for (ULONG i = 0; i < nports; i++) {
+            ULONG rhps = ReadRhPortStatus(dc, i);
+            LOG("  port %lu rhps=0x%08X", i + 1u, rhps);
+        }
+        urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+    }
+
+    ULONG portIdx = port - 1u;
+    ULONG bit = 0;
+    switch (feature) {
+        case USB_FEATURE_PORT_ENABLE:    bit = OHCI_RHPS_SET_PES; break;
+        case USB_FEATURE_PORT_SUSPEND:   bit = OHCI_RHPS_SET_PSS; break;
+        case USB_FEATURE_PORT_RESET:     bit = OHCI_RHPS_SET_PRS; break;
+        case USB_FEATURE_PORT_POWER:     bit = OHCI_RHPS_SET_PPS; break;
+        default:
+            LOG("RootHub SetPortFeature: unsupported feature %u", feature);
+            urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+            WdfRequestComplete(Request, STATUS_SUCCESS);
+            return;
+    }
+    WriteRhPortStatus(dc, portIdx, bit);
+    urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* ---- ClearPortFeature: W1C the change bits or clear the operational bit. ---- */
+static EVT_UCX_ROOTHUB_CONTROL_URB OhciPciClearPortFeature;
+_Use_decl_annotations_
+static VOID OhciPciClearPortFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+{
+    UNREFERENCED_PARAMETER(UcxRootHub);
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
+    PURB urb = (PURB)s->Parameters.Others.Argument1;
+    if (!dc || !urb) {
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    PUCHAR sp = GetUrbSetupPacket(urb);
+    USHORT feature = *(USHORT *)&sp[2];
+    USHORT port    = *(USHORT *)&sp[4];
+
+    LOG("RootHub ClearPortFeature port=%u feature=%u", port, feature);
+
+    if (port == 0) {
+        urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+    }
+    ULONG portIdx = port - 1u;
+    ULONG bit = 0;
+    switch (feature) {
+        case USB_FEATURE_PORT_ENABLE:        bit = (1u << 0); break;
+        case USB_FEATURE_PORT_SUSPEND:       bit = (1u << 3); break;
+        case USB_FEATURE_PORT_POWER:         bit = (1u << 9); break;
+        case USB_FEATURE_C_PORT_CONNECTION:  bit = OHCI_RHPS_CSC;  break;
+        case USB_FEATURE_C_PORT_ENABLE:      bit = OHCI_RHPS_PESC; break;
+        case USB_FEATURE_C_PORT_SUSPEND:     bit = OHCI_RHPS_PSSC; break;
+        case USB_FEATURE_C_PORT_OVER_CURRENT:bit = OHCI_RHPS_OCIC; break;
+        case USB_FEATURE_C_PORT_RESET:       bit = OHCI_RHPS_PRSC; break;
+        default:
+            urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+            WdfRequestComplete(Request, STATUS_SUCCESS);
+            return;
+    }
+    WriteRhPortStatus(dc, portIdx, bit);
+    urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+    WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
 /* --------------------------------------------------------------------------
@@ -494,9 +810,23 @@ OhciPci_RootHubCreate(
      * including a NULL USB3 arg; actual macro takes 5 non-config args and all
      * must be non-NULL.
      */
-    UCX_ROOTHUB_CONFIG_INIT_WITH_CONTROL_URB_HANDLER(
+    /* Switched from UCX_ROOTHUB_CONFIG_INIT_WITH_CONTROL_URB_HANDLER to the
+     * 7-individual-callbacks variant. The combined ControlUrb path was never
+     * invoked by UCX (StubControlUrb logs never appeared); UCX appears to
+     * dispatch hub-class requests to the per-feature handlers when those are
+     * non-NULL, even with the combined-handler config available. Using the
+     * individual-callback config makes that explicit. Each handler currently
+     * logs the URB function code and completes with STATUS_SUCCESS so we can
+     * see the dispatch sequence and identify which need real implementations. */
+    UCX_ROOTHUB_CONFIG_INIT(
         &cfg,
-        StubControlUrb,
+        OhciPciClearHubFeature,
+        OhciPciClearPortFeature,
+        OhciPciGetHubStatus,
+        OhciPciGetPortStatus,
+        OhciPciSetHubFeature,
+        OhciPciSetPortFeature,
+        OhciPciGetPortErrorCount,
         OhciPciInterruptTx,
         OhciPciGetInfo,
         OhciPciGet20PortInfo,
