@@ -1301,8 +1301,10 @@ OhciPci_EndpointAdd(
         WdfSpinLockAcquire(ep->Dc->CoreLock);
         rc = ohci_interrupt_endpoint_create(&ep->Dc->Hc, &icfg, &ep->Core.Interrupt);
         WdfSpinLockRelease(ep->Dc->CoreLock);
-        LOG("Interrupt EP created: addr=%u ep=%u dir=%s mps=%u (32ms slot) rc=%d",
-            funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc);
+        LOG("Interrupt EP created: addr=%u ep=%u dir=%s mps=%u "
+            "bInterval=%u scheduled=%ums rc=%d",
+            funcAddr, epNum, isIn ? "IN" : "OUT", mps,
+            bInterval, ep->Core.Interrupt.poll_interval_frames, rc);
     }
     if (rc != 0) {
         return STATUS_INSUFFICIENT_RESOURCES;
