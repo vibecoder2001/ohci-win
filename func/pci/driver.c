@@ -143,6 +143,10 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     ULONG ctrl = READ_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x04));
     LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
 
+    NTSTATUS bcStatus = OhciPci_BounceInit(dc);
+    LOG("OhciPci_BounceInit -> 0x%08X", bcStatus);
+    if (!NT_SUCCESS(bcStatus)) return bcStatus;
+
     NTSTATUS ucxCtrlStatus = OhciPci_UcxControllerCreate(dc);
     if (!NT_SUCCESS(ucxCtrlStatus)) {
         LOG("UcxControllerCreate failed; returning failure to refuse start");

@@ -7,6 +7,17 @@
 #include "ohci_dma.h"
 #include "ohci_hc.h"
 
+/* Bounce buffer pool sized for Plan 5 enumeration workload:
+ * 64 slabs × 4 KB = 256 KB of the DMA region reserved. */
+#define OHCIPCI_BOUNCE_SLAB_COUNT  64
+#define OHCIPCI_BOUNCE_SLAB_BYTES  4096
+
+struct ohcipci_bounce_pool {
+    uint8_t *base;       /* virtual base of the pool's chunk in DMA region */
+    uint32_t base_phys;  /* matching physical address */
+    uint32_t free_bitmap[(OHCIPCI_BOUNCE_SLAB_COUNT + 31) / 32];
+};
+
 /* Per-device state for one OhciPci instance. WDF gives us a typed pointer
  * to this struct via DeviceContextGet(device). */
 typedef struct _DEVICE_CONTEXT {
@@ -32,6 +43,8 @@ typedef struct _DEVICE_CONTEXT {
     struct ohci_hc           Hc;
 
     BOOLEAN                  HcInitialized;  /* Set after ohci_hc_init success. */
+
+    struct ohcipci_bounce_pool BouncePool;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
@@ -48,5 +61,14 @@ NTSTATUS OhciPci_CreateInterrupt(PDEVICE_CONTEXT dc);
 /* Defined in ucx_glue.c — UCX 1.6 controller registration helpers. */
 NTSTATUS OhciPci_UcxInitDeviceInit(PWDFDEVICE_INIT DeviceInit);
 NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
+
+/* Defined in bounce.c — per-URB bounce buffer slab pool. */
+NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);
+
+/* Allocate one slab. Returns NULL on exhaustion. *phys_out gets the
+ * physical address. Buffer size is OHCIPCI_BOUNCE_SLAB_BYTES. */
+void *OhciPci_BounceAlloc(PDEVICE_CONTEXT dc, uint32_t *phys_out);
+
+void  OhciPci_BounceFree(PDEVICE_CONTEXT dc, void *ptr);
 
 #endif /* OHCIPCI_DEVICE_CONTEXT_H */
