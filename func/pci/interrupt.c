@@ -60,6 +60,11 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
 
         WdfSpinLockAcquire(dc->CoreLock);
         ohci_drain_done(&dc->Hc);
+        /* Plan 8 Task 7 — refill isoch ED chains immediately after the
+         * drain so any URB whose tail just retired has a fresh window
+         * queued before the HC walks past. Already under CoreLock; the
+         * refill walker requires the caller to hold it. */
+        OhciPci_IsocRefillAll_Locked(dc);
         while (!IsListEmpty(&dc->DeferredCompletions)) {
             PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
             InsertTailList(&local, le);

@@ -73,6 +73,17 @@ static void decode_isoc_itd(struct ohci_urb *du, struct ohci_itd *itd) {
     }
 }
 
+/* True iff `phys` falls inside the ITD pool's slot range. The drain uses
+ * this to free retired descriptors back to the right pool — silence ITDs
+ * (Plan 8 Task 7) have no owning URB, so the urb-keyed dispatch in
+ * earlier tasks would route them to td_pool and corrupt both pools. */
+static int td_phys_is_itd(struct ohci_hc *hc, uint32_t phys) {
+    if (hc->itd_pool.elems == NULL) return 0;
+    uint32_t start = hc->itd_pool.elems_phys;
+    uint32_t end   = start + (uint32_t)hc->itd_pool.capacity * (uint32_t)sizeof(struct ohci_itd);
+    return (phys >= start && phys < end);
+}
+
 /* Match retired TDs against URBs by their tail TD phys — that TD is
  * unique per live URB and its slot stays allocated until we free it. */
 static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
@@ -174,7 +185,11 @@ void ohci_drain_done(struct ohci_hc *hc) {
             if (u->complete) u->complete(u);
         }
 
-        if (du && du->is_isoc) {
+        /* Pool dispatch keys on physical address range, not URB ownership,
+         * so orphan silence ITDs (no URB) free correctly back to itd_pool.
+         * decode_isoc_itd above is gated on (du && du->is_isoc) which
+         * silently skips orphans — they have no URB to write into. */
+        if (td_phys_is_itd(hc, cur)) {
             ohci_itd_pool_free(&hc->itd_pool, (struct ohci_itd *)td);
         } else {
             ohci_td_pool_free(&hc->td_pool, td);

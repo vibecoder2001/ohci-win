@@ -22,6 +22,12 @@
  * the periodic schedule. */
 #define OHCIPCI_PERIODIC_BUDGET_BYTES 1350
 
+/* Refill watermarks (frames). Keep >= OHCIPCI_ISOC_PRIME_LOOKAHEAD ahead
+ * of HcFmNumber so the HC always has dispatchable ITDs. */
+#define OHCIPCI_ISOC_REFILL_HIGH        16   /* refill up to this lead */
+#define OHCIPCI_ISOC_PRIME_LOOKAHEAD     4   /* first-prime sf = HcFmNumber + 4 */
+#define OHCIPCI_ISOC_BACKSTOP_TIMER_MS   1   /* 1 ms periodic backstop */
+
 struct ohcipci_bounce_pool {
     uint8_t *base;       /* virtual base of the pool's chunk in DMA region */
     uint32_t base_phys;  /* matching physical address */
@@ -88,6 +94,16 @@ typedef struct _DEVICE_CONTEXT {
      * Isoc + Interrupt EPs at period 1; rejected new EPs that would push
      * past 90% of the FS frame budget. */
     ULONG                    PeriodicBytesPerFrame;
+
+    /* Plan 8 Task 7 — isoch refill state.
+     * IsocEps is a list of OHCIPCI_EP_CONTEXT chained on IsocEpEntry,
+     * walked by OhciPci_IsocRefillAll_Locked from EvtDpc and from the
+     * 1 ms periodic IsocRefillTimer backstop. IsocEpsLock is INDEPENDENT
+     * of CoreLock; the refill walker holds CoreLock first, then briefly
+     * IsocEpsLock — no inversion since no other path takes both. */
+    WDFTIMER                 IsocRefillTimer;
+    LIST_ENTRY               IsocEps;
+    WDFSPINLOCK              IsocEpsLock;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
@@ -117,6 +133,17 @@ typedef struct _OHCIPCI_EP_CONTEXT {
         struct ohci_interrupt_endpoint Interrupt;
         struct ohci_isoc_endpoint      Isoc;
     } Core;                                  /* OHCI core EP state             */
+
+    /* Isoch refill state (Plan 8 Task 7). Used only when Kind==Isoc; left
+     * zero for other kinds. Silence buffer is a zero-filled PAGE_SIZE
+     * region from dc->DmaRegion that the refill DPC sources bytes from
+     * when no caller URB is queued. IsocEpEntry chains us on dc->IsocEps. */
+    PVOID                          IsocSilenceVa;
+    uint32_t                       IsocSilencePhys;
+    ULONG                          IsocUnderrunCount;
+    LIST_ENTRY                     IsocQueuedUrbs;   /* OHCIPCI_URB_CTX::QueueEntry */
+    WDFSPINLOCK                    IsocQueueLock;
+    LIST_ENTRY                     IsocEpEntry;     /* on dc->IsocEps */
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_EP_CONTEXT, OhciPci_EpContextGet)
@@ -150,6 +177,12 @@ typedef struct _OHCIPCI_URB_CTX {
     LIST_ENTRY                   DeferredEntry;
     NTSTATUS                     DeferredStatus;
     ULONG_PTR                    DeferredInfo;
+
+    /* Plan 8 Task 7 — pending-URB queue entry on EP->IsocQueuedUrbs.
+     * HandleIsocUrb queues here instead of executing the WdfDmaTransaction
+     * synchronously; the refill DPC drains entries when the ED chain has
+     * room (lead < OHCIPCI_ISOC_REFILL_HIGH frames ahead of HcFmNumber). */
+    LIST_ENTRY                   QueueEntry;
 } OHCIPCI_URB_CTX, *POHCIPCI_URB_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_URB_CTX, OhciPci_UrbCtxGet)
@@ -227,6 +260,16 @@ NTSTATUS OhciPci_EndpointAdd(UCXCONTROLLER                              UcxContr
                               ULONG                                      UsbEndpointDescriptorBufferLength,
                               PUSB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR SuperSpeedEndpointCompanionDescriptor,
                               PUCXENDPOINT_INIT                          UcxEndpointInit);
+
+/* Defined in ucx_endpoint.c (Plan 8 Task 7).
+ * Walks dc->IsocEps and refills each isoch ED chain with caller URBs
+ * (executed via WdfDmaTransactionExecute) or silence ITDs to maintain
+ * OHCIPCI_ISOC_REFILL_HIGH frames of lookahead beyond HcFmNumber.
+ * Caller MUST hold dc->CoreLock. */
+void OhciPci_IsocRefillAll_Locked(PDEVICE_CONTEXT dc);
+
+/* WDFTIMER callback for the periodic backstop. Defined in ucx_endpoint.c. */
+EVT_WDF_TIMER OhciPci_EvtIsocBackstopTimer;
 
 /* Defined in bounce.c — per-URB bounce buffer slab pool. */
 NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);

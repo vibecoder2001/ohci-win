@@ -61,6 +61,42 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     InitializeListHead(&dc->DeferredCompletions);
     dc->NextUsbAddress = 0;  /* InterlockedIncrement -> 1 for the first device. */
 
+    /* Plan 8 Task 7 — isoch refill state. The periodic backstop timer is
+     * created up front but not started; first isoch EP-create kicks it.
+     * IsocEpsLock guards the IsocEps list walked by
+     * OhciPci_IsocRefillAll_Locked. Both are non-fatal on failure
+     * (refill via EvtDpc still runs — backstop just won't catch
+     * caller stalls). */
+    InitializeListHead(&dc->IsocEps);
+    {
+        WDF_OBJECT_ATTRIBUTES iolAttrs;
+        WDF_OBJECT_ATTRIBUTES_INIT(&iolAttrs);
+        iolAttrs.ParentObject = device;
+        NTSTATUS iolSt = WdfSpinLockCreate(&iolAttrs, &dc->IsocEpsLock);
+        if (!NT_SUCCESS(iolSt)) {
+            LOG("WdfSpinLockCreate (IsocEpsLock) failed 0x%08X — refill disabled",
+                iolSt);
+            dc->IsocEpsLock = NULL;
+        }
+    }
+    {
+        WDF_TIMER_CONFIG tcfg;
+        /* Periodic timer; 1ms backstop tick. ExecutionLevel=Dispatch lets
+         * the callback hold WDFSPINLOCK (CoreLock). */
+        WDF_TIMER_CONFIG_INIT_PERIODIC(&tcfg, OhciPci_EvtIsocBackstopTimer,
+                                        OHCIPCI_ISOC_BACKSTOP_TIMER_MS);
+        WDF_OBJECT_ATTRIBUTES tattrs;
+        WDF_OBJECT_ATTRIBUTES_INIT(&tattrs);
+        tattrs.ParentObject  = device;
+        tattrs.ExecutionLevel = WdfExecutionLevelDispatch;
+        NTSTATUS ts = WdfTimerCreate(&tcfg, &tattrs, &dc->IsocRefillTimer);
+        if (!NT_SUCCESS(ts)) {
+            LOG("WdfTimerCreate (isoc backstop) failed 0x%08X — refill"
+                " runs only from EvtDpc", ts);
+            dc->IsocRefillTimer = NULL;
+        }
+    }
+
     /* Default WDFQUEUE that forwards URB IOCTLs (IOCTL_INTERNAL_USB_SUBMIT_URB
      * etc.) from UsbHub3 into UCX via UcxIoDeviceControl. Without this, UCX's
      * root-hub control-URB callback never fires and UsbHub3 keeps failing,

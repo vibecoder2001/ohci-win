@@ -238,3 +238,61 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
     }
     return 0;
 }
+
+int ohci_isoc_submit_silence_window(struct ohci_hc *hc,
+                                    struct ohci_isoc_endpoint *ep,
+                                    uint16_t sf,
+                                    uint8_t  pkt_count,
+                                    const uint16_t *pkt_lens,
+                                    uint32_t buf_phys,
+                                    uint32_t buf_len)
+{
+    if (pkt_count == 0 || pkt_count > 8) return -1;
+    if (buf_len == 0) return -1;
+
+    uint32_t bp0       = buf_phys & 0xFFFFF000u;
+    uint32_t last      = buf_phys + buf_len - 1;
+    uint32_t last_page = last & 0xFFFFF000u;
+    if (last_page != bp0 && last_page != bp0 + 0x1000u) return -1;
+
+    uint32_t data_phys = 0;
+    struct ohci_itd *data = ohci_itd_pool_alloc(&hc->itd_pool, &data_phys);
+    if (!data) return -1;
+
+    data->Control = ((uint32_t)sf & OHCI_ITD_SF_MASK)
+                  | (((uint32_t)(pkt_count - 1) << OHCI_ITD_FC_SHIFT) & OHCI_ITD_FC_MASK)
+                  | OHCI_ITD_DI_NO_INTR
+                  | ((uint32_t)OHCI_CC_NOTACCESSED << OHCI_ITD_CC_SHIFT);
+    data->BP0    = bp0;
+    data->BE     = last;
+    data->NextTD = 0;
+
+    uint32_t off = buf_phys - bp0;
+    for (uint8_t i = 0; i < pkt_count; i++) {
+        data->PSW[i] = (uint16_t)(off & 0x1FFFu);
+        off += pkt_lens[i];
+    }
+    for (uint8_t i = pkt_count; i < 8; i++) data->PSW[i] = 0;
+
+    uint32_t new_ph_phys = 0;
+    struct ohci_itd *new_ph = ohci_itd_pool_alloc(&hc->itd_pool, &new_ph_phys);
+    if (!new_ph) {
+        ohci_itd_pool_free(&hc->itd_pool, data);
+        return -1;
+    }
+    memset(new_ph, 0, sizeof(*new_ph));
+
+    /* Promote-tail dance — same as submit_window — but no URB linkage. */
+    *ep->tail_placeholder = *data;
+    ep->tail_placeholder->NextTD = new_ph_phys;
+    ohci_itd_pool_free(&hc->itd_pool, data);
+
+    ep->tail_placeholder      = new_ph;
+    ep->tail_placeholder_phys = new_ph_phys;
+    ep->ed_tail_frame         = (uint16_t)(sf + pkt_count);
+    /* primed stays as-is (silence presupposes a primed EP). */
+
+    hc->ops.barrier(hc->ops.context);
+    ep->ed->TailP = new_ph_phys;
+    return 0;
+}

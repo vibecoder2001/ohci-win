@@ -70,6 +70,26 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
                             uint32_t buf_len,
                             int first_window);
 
+/* Silence-window variant (Plan 8 Task 7).
+ *
+ * Emits an ITD with no URB tracking — used by the refill DPC to keep the
+ * isoch ED chain non-empty when no caller URB is queued. The HC sources
+ * `pkt_count` packets of bytes from buf_phys (typically a zero-filled
+ * page) and sends them on the wire; on retirement the orphan ITD is
+ * dispatched back to the ITD pool by the drain (which routes by
+ * phys-range, not by URB ownership). No URB is linked to hc->in_flight.
+ *
+ * Same windowing constraints as ohci_isoc_submit_window (≤8 packets,
+ * buffer fits in BP0 + BP0+0x1000). Returns 0 on success, -1 on bad
+ * input or pool exhaustion. */
+int ohci_isoc_submit_silence_window(struct ohci_hc *hc,
+                                    struct ohci_isoc_endpoint *ep,
+                                    uint16_t sf,
+                                    uint8_t  pkt_count,
+                                    const uint16_t *pkt_lens,
+                                    uint32_t buf_phys,
+                                    uint32_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

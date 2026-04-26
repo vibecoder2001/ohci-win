@@ -608,12 +608,18 @@ static EVT_WDF_PROGRAM_DMA OhciPci_IsocProgramDma;
 static VOID
 OhciPci_IsocProgramDmaFail(OHCIPCI_URB_CTX *uc, NTSTATUS status)
 {
+    /* Plan 8 Task 7: this runs from inside CoreLock (refill DPC executes
+     * the WdfDmaTransaction synchronously). WdfRequestComplete must not
+     * fire under CoreLock — defer onto DeferredCompletions and let the
+     * DPC/timer drain it. */
     NTSTATUS dmaSt;
     (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction, 0, &dmaSt);
     WdfObjectDelete(uc->DmaTransaction);
     uc->DmaTransaction = NULL;
     if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
-    WdfRequestComplete(uc->Request, status);
+    uc->DeferredStatus = status;
+    uc->DeferredInfo   = 0;
+    InsertTailList(&uc->EpCtx->Dc->DeferredCompletions, &uc->DeferredEntry);
 }
 
 static BOOLEAN
@@ -713,17 +719,20 @@ OhciPci_IsocProgramDma(
     uc->CoreUrb.complete  = OhciPci_UrbComplete;
     uc->CoreUrb.direction = uc->DataDirection;
 
-    WdfSpinLockAcquire(dc->CoreLock);
-
+    /* Plan 8 Task 7: caller (OhciPci_IsocRefillOne_Locked) holds CoreLock
+     * already. WDFSPINLOCK is non-recursive, so DO NOT acquire it here.
+     * WdfDmaTransactionExecute calls this synchronously from inside the
+     * refill loop, which itself runs under CoreLock. */
     struct ohci_isoc_endpoint *ie = &ep->Core.Isoc;
     uint16_t sf;
     if (ie->primed) {
         sf = ie->ed_tail_frame;
     } else {
         uint32_t fmNumber = dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu;
-        /* +4 frame lookahead so the HC starts in ~4 ms. Task 7's refill
-         * DPC will advance this further once it's wired. */
-        sf = (uint16_t)((fmNumber + 4u) & 0xFFFFu);
+        /* +OHCIPCI_ISOC_PRIME_LOOKAHEAD frame lookahead so the HC starts
+         * a few ms in the future. After prime, the refill DPC keeps the
+         * lead at OHCIPCI_ISOC_REFILL_HIGH frames. */
+        sf = (uint16_t)((fmNumber + OHCIPCI_ISOC_PRIME_LOOKAHEAD) & 0xFFFFu);
     }
 
     /* Greedy-pack packets into windows of ≤8 that share one BP0/BP0+0x1000
@@ -777,8 +786,6 @@ OhciPci_IsocProgramDma(
         firstWindow = 0;
     }
 
-    WdfSpinLockRelease(dc->CoreLock);
-
     if (rc != 0) {
         LOG("IsocProgramDma: ohci_isoc_submit_window rc=%d at packet %lu/%lu",
             rc, i, nPkts);
@@ -800,6 +807,148 @@ OhciPci_IsocProgramDma(
 
     /* Async completion via OhciPci_UrbComplete from the drain. */
     return TRUE;
+}
+
+/* --------------------------------------------------------------------------
+ * Plan 8 Task 7 — refill DPC + silence ITDs.
+ *
+ * The OHCI HC walks the periodic schedule per frame and dispatches whatever
+ * ITDs are currently in the chain. If the chain is empty (caller hasn't
+ * delivered the next URB yet) the HC silently skips the slot — audible click
+ * to the device. To prevent that we keep the chain extended at least
+ * OHCIPCI_ISOC_REFILL_HIGH frames ahead of HcFmNumber, padding with
+ * silence ITDs when no caller URB is queued.
+ *
+ * The refill walker runs from EvtDpc (after each WDH drain) AND from a
+ * 1ms WDFTIMER backstop, so caller stalls don't starve the chain.
+ * -------------------------------------------------------------------------- */
+static VOID
+OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    struct ohci_isoc_endpoint *ie = &ep->Core.Isoc;
+
+    /* Skip non-isoc EPs (defensive — shouldn't be on the list). */
+    if (ep->Kind != OhciPciEpKindIsoc) return;
+
+    uint16_t fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
+
+    /* Drain queued URBs first — they take precedence over silence. The
+     * very first URB on a fresh EP also primes the chain (sf = HcFmNumber
+     * + lookahead, set inside IsocProgramDma when ie->primed == 0). */
+    for (;;) {
+        SHORT lead = ie->primed ? (SHORT)(ie->ed_tail_frame - fmNumber) : 0;
+        if (ie->primed && lead >= (SHORT)OHCIPCI_ISOC_REFILL_HIGH) break;
+
+        OHCIPCI_URB_CTX *uc = NULL;
+        WdfSpinLockAcquire(ep->IsocQueueLock);
+        if (!IsListEmpty(&ep->IsocQueuedUrbs)) {
+            PLIST_ENTRY e = RemoveHeadList(&ep->IsocQueuedUrbs);
+            uc = CONTAINING_RECORD(e, OHCIPCI_URB_CTX, QueueEntry);
+        }
+        WdfSpinLockRelease(ep->IsocQueueLock);
+
+        if (uc == NULL) break;
+
+        /* Execute fires IsocProgramDma synchronously (HAL invokes inline
+         * on x86); CoreLock stays held across the call. On failure
+         * IsocProgramDma's helper stages a deferred completion. */
+        NTSTATUS s = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
+        if (!NT_SUCCESS(s)) {
+            LOG("IsocRefill: WdfDmaTransactionExecute failed 0x%08X", s);
+            NTSTATUS dmaSt;
+            (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction, 0, &dmaSt);
+            WdfObjectDelete(uc->DmaTransaction);
+            uc->DmaTransaction = NULL;
+            if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+            uc->DeferredStatus = s;
+            uc->DeferredInfo   = 0;
+            InsertTailList(&dc->DeferredCompletions, &uc->DeferredEntry);
+        }
+        /* Re-read fmNumber: synchronous Execute may have spent enough
+         * cycles that the frame counter advanced. */
+        fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
+    }
+
+    /* Silence-pad to OHCIPCI_ISOC_REFILL_HIGH frames of lookahead. Skip
+     * if the EP isn't primed yet (silence has no SF reference) or has no
+     * silence buffer. */
+    if (!ie->primed || ep->IsocSilenceVa == NULL) return;
+
+    /* Read MPS from the ED control word; clamp to packet-count budget. */
+    uint16_t mps = (uint16_t)((ie->ed->Control >> OHCI_ED_MPS_SHIFT) & 0x7FFu);
+    if (mps == 0) mps = 192;
+    /* Cap mps so 8 packets fit in the silence page (enforced by
+     * submit_silence's BP0/BP0+0x1000 window check, but better to clamp
+     * here than fail in a tight loop). PAGE_SIZE/8 = 512 bytes. */
+    if (mps > PAGE_SIZE / 8) mps = PAGE_SIZE / 8;
+
+    while (1) {
+        SHORT lead = (SHORT)(ie->ed_tail_frame - fmNumber);
+        if (lead >= (SHORT)OHCIPCI_ISOC_REFILL_HIGH) break;
+
+        uint16_t lens[8];
+        for (uint8_t k = 0; k < 8; k++) lens[k] = mps;
+        int rc = ohci_isoc_submit_silence_window(&dc->Hc, ie,
+                                                  ie->ed_tail_frame, 8, lens,
+                                                  ep->IsocSilencePhys,
+                                                  (uint32_t)8u * mps);
+        if (rc != 0) {
+            /* ITD pool exhausted or window failed — back off, retry next tick. */
+            break;
+        }
+        ep->IsocUnderrunCount++;
+        /* Don't refresh fmNumber here: silence_window is a few writes,
+         * frame counter unlikely to advance. The lead recompute uses the
+         * updated ed_tail_frame to terminate. */
+    }
+}
+
+VOID
+OhciPci_IsocRefillAll_Locked(PDEVICE_CONTEXT dc)
+{
+    /* CoreLock must be held by the caller (EvtDpc, IsocBackstopTimer, or
+     * HandleIsocUrb's queue-then-refill path). IsocEpsLock is acquired
+     * second; no path takes both in the opposite order. */
+    if (dc->IsocEpsLock == NULL) return;  /* not set up yet */
+    WdfSpinLockAcquire(dc->IsocEpsLock);
+    PLIST_ENTRY e;
+    for (e = dc->IsocEps.Flink; e != &dc->IsocEps; e = e->Flink) {
+        POHCIPCI_EP_CONTEXT ep =
+            CONTAINING_RECORD(e, OHCIPCI_EP_CONTEXT, IsocEpEntry);
+        OhciPci_IsocRefillOne_Locked(ep);
+    }
+    WdfSpinLockRelease(dc->IsocEpsLock);
+}
+
+/* WDFTIMER callback — periodic backstop. Acquires CoreLock, calls refill,
+ * then drains any DeferredCompletions outside CoreLock per the standard
+ * pattern (see EvtDpc + feedback_wdf_complete_under_spinlock.md). */
+EVT_WDF_TIMER OhciPci_EvtIsocBackstopTimer;
+VOID
+OhciPci_EvtIsocBackstopTimer(WDFTIMER Timer)
+{
+    PDEVICE_CONTEXT dc = DeviceContextGet(WdfTimerGetParentObject(Timer));
+
+    LIST_ENTRY local;
+    InitializeListHead(&local);
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    OhciPci_IsocRefillAll_Locked(dc);
+    while (!IsListEmpty(&dc->DeferredCompletions)) {
+        PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
+        InsertTailList(&local, le);
+    }
+    WdfSpinLockRelease(dc->CoreLock);
+
+    while (!IsListEmpty(&local)) {
+        PLIST_ENTRY le = RemoveHeadList(&local);
+        POHCIPCI_URB_CTX uc =
+            CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        WdfRequestCompleteWithInformation(uc->Request,
+                                           uc->DeferredStatus,
+                                           uc->DeferredInfo);
+    }
 }
 
 static VOID
@@ -892,14 +1041,40 @@ OhciPci_HandleIsocUrb(
         return;
     }
 
-    status = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
-    if (!NT_SUCCESS(status)) {
-        LOG("HandleIsocUrb: WdfDmaTransactionExecute failed: 0x%08X", status);
-        WdfObjectDelete(uc->DmaTransaction);
-        uc->DmaTransaction = NULL;
-        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
-        WdfRequestComplete(Request, status);
-        return;
+    /* Plan 8 Task 7: queue the URB onto the EP's pending list rather than
+     * executing the DMA transaction directly. The refill DPC drives
+     * WdfDmaTransactionExecute when the ED chain has headroom (lead <
+     * OHCIPCI_ISOC_REFILL_HIGH frames). Trigger one immediate refill cycle
+     * so single-shot callers drain right away if there's room.
+     *
+     * Note: completion is async — refill will either Execute the
+     * transaction (which fires IsocProgramDma synchronously while we hold
+     * CoreLock) or leave it queued; either way we return without touching
+     * the request further. Failures from Execute land on
+     * DeferredCompletions via OhciPci_IsocProgramDmaFail. */
+    WdfSpinLockAcquire(ep->IsocQueueLock);
+    InsertTailList(&ep->IsocQueuedUrbs, &uc->QueueEntry);
+    WdfSpinLockRelease(ep->IsocQueueLock);
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    OhciPci_IsocRefillAll_Locked(dc);
+    /* Drain any deferred completions/failures the synchronous Execute may
+     * have staged, mirroring EvtDpc's pattern. */
+    LIST_ENTRY local;
+    InitializeListHead(&local);
+    while (!IsListEmpty(&dc->DeferredCompletions)) {
+        PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
+        InsertTailList(&local, le);
+    }
+    WdfSpinLockRelease(dc->CoreLock);
+
+    while (!IsListEmpty(&local)) {
+        PLIST_ENTRY le = RemoveHeadList(&local);
+        POHCIPCI_URB_CTX duc =
+            CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        WdfRequestCompleteWithInformation(duc->Request,
+                                           duc->DeferredStatus,
+                                           duc->DeferredInfo);
     }
     /* Async completion via OhciPci_UrbComplete. */
 }
@@ -1654,6 +1829,52 @@ OhciPci_EndpointAdd(
              * on EP destroy. Bulk/Interrupt EPs aren't torn down mid-driver-
              * lifetime today, so the budget tracker is best-effort. */
             g_DeviceContext->PeriodicBytesPerFrame += mps;
+
+            /* Plan 8 Task 7 — refill state. Silence buffer is one
+             * zero-filled PAGE from the DMA region; alloc failure is
+             * non-fatal (caller URBs still work, just no underrun
+             * silence). IsocQueueLock is mandatory — HandleIsocUrb
+             * relies on it. */
+            InitializeListHead(&ep->IsocQueuedUrbs);
+            InitializeListHead(&ep->IsocEpEntry);
+
+            ep->IsocSilenceVa = ohci_dma_alloc(&ep->Dc->DmaRegion,
+                                                PAGE_SIZE, PAGE_SIZE,
+                                                &ep->IsocSilencePhys);
+            if (ep->IsocSilenceVa) {
+                RtlZeroMemory(ep->IsocSilenceVa, PAGE_SIZE);
+            } else {
+                LOG("Isoc EP: silence buffer alloc failed - underrun"
+                    " protection disabled for this EP");
+            }
+
+            WDF_OBJECT_ATTRIBUTES qlAttrs;
+            WDF_OBJECT_ATTRIBUTES_INIT(&qlAttrs);
+            qlAttrs.ParentObject = ucxEp;
+            NTSTATUS qlSt = WdfSpinLockCreate(&qlAttrs, &ep->IsocQueueLock);
+            if (!NT_SUCCESS(qlSt)) {
+                LOG("Isoc EP: WdfSpinLockCreate (IsocQueueLock) failed 0x%08X",
+                    qlSt);
+                /* Roll back the core EP. */
+                WdfSpinLockAcquire(ep->Dc->CoreLock);
+                ohci_isoc_endpoint_destroy(&ep->Dc->Hc, &ep->Core.Isoc);
+                WdfSpinLockRelease(ep->Dc->CoreLock);
+                g_DeviceContext->PeriodicBytesPerFrame -= mps;
+                return qlSt;
+            }
+
+            /* Splice onto dc->IsocEps so the refill walker sees us. */
+            WdfSpinLockAcquire(ep->Dc->IsocEpsLock);
+            InsertTailList(&ep->Dc->IsocEps, &ep->IsocEpEntry);
+            WdfSpinLockRelease(ep->Dc->IsocEpsLock);
+
+            /* Lazy-start the periodic backstop (idempotent — calling
+             * WdfTimerStart on an already-running periodic timer is a
+             * no-op per WDF docs). */
+            if (ep->Dc->IsocRefillTimer) {
+                WdfTimerStart(ep->Dc->IsocRefillTimer,
+                              WDF_REL_TIMEOUT_IN_MS(OHCIPCI_ISOC_BACKSTOP_TIMER_MS));
+            }
         }
         LOG("Isoc EP created: addr=%u ep=%u dir=%s mps=%u rc=%d budget=%lu/%u",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc,
