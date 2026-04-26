@@ -77,3 +77,7 @@ add_test(NAME teardown COMMAND test_teardown)
 add_executable(test_multi_endpoint_e2e test_multi_endpoint_e2e.c)
 target_link_libraries(test_multi_endpoint_e2e PRIVATE fake_hc)
 add_test(NAME multi_endpoint_e2e COMMAND test_multi_endpoint_e2e)
+
+add_executable(test_itd_pool test_itd_pool.c)
+target_link_libraries(test_itd_pool PRIVATE ohci_core)
+add_test(NAME itd_pool COMMAND test_itd_pool)
