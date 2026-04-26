@@ -82,6 +82,7 @@
     <ClCompile Include="..\..\core\src\ohci_drain.c" />
     <ClCompile Include="..\..\core\src\ohci_bulk.c" />
     <ClCompile Include="..\..\core\src\ohci_interrupt.c" />
+    <ClCompile Include="..\..\core\src\ohci_isoc.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="device_context.h" />

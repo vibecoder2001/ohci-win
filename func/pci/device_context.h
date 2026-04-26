@@ -10,12 +10,17 @@
 #include "ohci_control.h"
 #include "ohci_bulk.h"
 #include "ohci_interrupt.h"
+#include "ohci_isoc.h"
 #include "ohci_urb.h"
 
 /* Bounce buffer pool sized for Plan 5 enumeration workload:
  * 64 slabs × 4 KB = 256 KB of the DMA region reserved. */
 #define OHCIPCI_BOUNCE_SLAB_COUNT  64
 #define OHCIPCI_BOUNCE_SLAB_BYTES  4096
+
+/* OHCI 1.0a §5.4: HCD reserves <=90% of the 1500-byte FS frame for
+ * the periodic schedule. */
+#define OHCIPCI_PERIODIC_BUDGET_BYTES 1350
 
 struct ohcipci_bounce_pool {
     uint8_t *base;       /* virtual base of the pool's chunk in DMA region */
@@ -78,6 +83,11 @@ typedef struct _DEVICE_CONTEXT {
      * Plan 7 doesn't free addresses on disconnect so this just monotonically
      * increments; a future plan can do real allocation. */
     volatile LONG            NextUsbAddress;
+
+    /* Periodic budget tracker (Plan 8). Sum of MaxPacketSize across all
+     * Isoc + Interrupt EPs at period 1; rejected new EPs that would push
+     * past 90% of the FS frame budget. */
+    ULONG                    PeriodicBytesPerFrame;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceContextGet)
@@ -93,6 +103,7 @@ typedef enum _OHCIPCI_EP_KIND {
     OhciPciEpKindControl   = 0,
     OhciPciEpKindBulk      = 1,
     OhciPciEpKindInterrupt = 2,
+    OhciPciEpKindIsoc      = 3,
 } OHCIPCI_EP_KIND;
 
 typedef struct _OHCIPCI_EP_CONTEXT {
@@ -104,6 +115,7 @@ typedef struct _OHCIPCI_EP_CONTEXT {
         struct ohci_control_endpoint   Control;
         struct ohci_bulk_endpoint      Bulk;
         struct ohci_interrupt_endpoint Interrupt;
+        struct ohci_isoc_endpoint      Isoc;
     } Core;                                  /* OHCI core EP state             */
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 

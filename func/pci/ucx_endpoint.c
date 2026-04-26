@@ -630,6 +630,12 @@ EvtUrbDefault(
         OhciPci_HandleBulkOrInterruptUrb(ep, Request, urb);
         return;
     }
+    if (fn == URB_FUNCTION_ISOCH_TRANSFER) {
+        /* TODO(Plan 8 Task 6): wire OhciPci_HandleIsocUrb. */
+        LOG("EvtUrbDefault: isoch URB on EP kind=%d - not yet wired (Task 6)", ep->Kind);
+        WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
+        return;
+    }
     if (fn != URB_FUNCTION_CONTROL_TRANSFER &&
         fn != URB_FUNCTION_CONTROL_TRANSFER_EX)
     {
@@ -819,6 +825,7 @@ OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep)
     case OhciPciEpKindControl:   return ep->Core.Control.ed;
     case OhciPciEpKindBulk:      return ep->Core.Bulk.ed;
     case OhciPciEpKindInterrupt: return ep->Core.Interrupt.ed;
+    case OhciPciEpKindIsoc:      return ep->Core.Isoc.ed;
     }
     return NULL;
 }
@@ -1209,13 +1216,28 @@ OhciPci_EndpointAdd(
 
     LOG("EndpointAdd: addr=0x%02X attrs=0x%02X mps=%u", epAddr, attrs, mps);
 
-    if (attrs == 0x01) {
-        LOG("EndpointAdd: isochronous not supported (Plan 7+)");
-        return STATUS_NOT_SUPPORTED;
-    }
     if (attrs == 0x00) {
         LOG("EndpointAdd: non-default control endpoints not supported");
         return STATUS_NOT_SUPPORTED;
+    }
+    if (attrs == 0x01) {
+        /* Isochronous (Plan 8). v1: assume period 1 (one MPS-sized
+         * packet/frame). Refuse if the device is low-speed (USB spec
+         * forbids isoch on LS entirely). Budget-check BEFORE we touch
+         * any allocator so a rejection leaks nothing. */
+        OHCIPCI_USBDEV_CTX *udcCheck = OhciPci_UsbDevContextGet(UcxUsbDevice);
+        if (udcCheck && udcCheck->Speed == UsbLowSpeed) {
+            LOG("EndpointAdd: isoch rejected - low-speed devices have no isoch");
+            return STATUS_NOT_SUPPORTED;
+        }
+        if (g_DeviceContext->PeriodicBytesPerFrame + mps > OHCIPCI_PERIODIC_BUDGET_BYTES) {
+            LOG("EndpointAdd: isoch rejected - periodic budget exceeded "
+                "(%lu + %u > %u)",
+                g_DeviceContext->PeriodicBytesPerFrame, mps,
+                OHCIPCI_PERIODIC_BUDGET_BYTES);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        /* Fall through into the standard non-default EP creation flow. */
     }
 
     /* 1. Register non-default callbacks. */
@@ -1284,7 +1306,7 @@ OhciPci_EndpointAdd(
         WdfSpinLockRelease(ep->Dc->CoreLock);
         LOG("Bulk EP created: addr=%u ep=%u dir=%s mps=%u rc=%d",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc);
-    } else { /* attrs == 0x03 — Interrupt */
+    } else if (attrs == 0x03) { /* Interrupt */
         ep->Kind = OhciPciEpKindInterrupt;
         struct ohci_interrupt_endpoint_config icfg;
         icfg.func_addr            = funcAddr;
@@ -1305,6 +1327,26 @@ OhciPci_EndpointAdd(
             "bInterval=%u scheduled=%ums rc=%d",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps,
             bInterval, ep->Core.Interrupt.poll_interval_frames, rc);
+    } else { /* attrs == 0x01 - Isochronous */
+        ep->Kind = OhciPciEpKindIsoc;
+        struct ohci_isoc_endpoint_config cfg;
+        cfg.func_addr       = funcAddr;
+        cfg.ep_num          = epNum;
+        cfg.max_packet_size = mps;
+        cfg.direction       = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+        cfg.low_speed       = lowSpeed;
+        WdfSpinLockAcquire(ep->Dc->CoreLock);
+        rc = ohci_isoc_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core.Isoc);
+        WdfSpinLockRelease(ep->Dc->CoreLock);
+        if (rc == 0) {
+            /* TODO(Plan8 follow-up): subtract mps from PeriodicBytesPerFrame
+             * on EP destroy. Bulk/Interrupt EPs aren't torn down mid-driver-
+             * lifetime today, so the budget tracker is best-effort. */
+            g_DeviceContext->PeriodicBytesPerFrame += mps;
+        }
+        LOG("Isoc EP created: addr=%u ep=%u dir=%s mps=%u rc=%d budget=%lu/%u",
+            funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc,
+            g_DeviceContext->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
     }
     if (rc != 0) {
         return STATUS_INSUFFICIENT_RESOURCES;
