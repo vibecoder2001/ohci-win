@@ -155,11 +155,70 @@ typedef struct _OHCIPCI_TRANSFER_URB {
  * finishes. Copies IN data back to the caller's buffer and completes the
  * WDFREQUEST.
  * -------------------------------------------------------------------------- */
+/* Map an OHCI condition code to a per-packet USBD_STATUS for isoch
+ * IsoPacket[i].Status writeback. Used only by the isoch branch of
+ * OhciPci_UrbComplete. */
+static USBD_STATUS
+OhciPci_CcToUsbd(uint8_t cc)
+{
+    switch (cc) {
+    case OHCI_CC_NOERROR:             return USBD_STATUS_SUCCESS;
+    case OHCI_CC_STALL:               return USBD_STATUS_STALL_PID;
+    case OHCI_CC_CRC:                 return USBD_STATUS_CRC;
+    case OHCI_CC_DEVICENOTRESPONDING: return USBD_STATUS_DEV_NOT_RESPONDING;
+    case OHCI_CC_DATAOVERRUN:         return USBD_STATUS_DATA_OVERRUN;
+    case OHCI_CC_DATAUNDERRUN:        return USBD_STATUS_DATA_UNDERRUN;
+    case OHCI_CC_BUFFEROVERRUN:       return USBD_STATUS_BUFFER_OVERRUN;
+    case OHCI_CC_BUFFERUNDERRUN:      return USBD_STATUS_BUFFER_UNDERRUN;
+    case OHCI_CC_NOTACCESSED:         return USBD_STATUS_NOT_ACCESSED;
+    default:                          return USBD_STATUS_INTERNAL_HC_ERROR;
+    }
+}
+
 static VOID
 OhciPci_UrbComplete(struct ohci_urb *u)
 {
     OHCIPCI_URB_CTX *uc =
         CONTAINING_RECORD(u, OHCIPCI_URB_CTX, CoreUrb);
+
+    /* Isoch URBs (Plan 8 Task 8): no IN copy-back (DMA via
+     * WdfDmaTransaction goes straight to/from the caller's MDL); write
+     * per-packet IsoPacket[i].{Length,Status} from urb->isoc_pkts[],
+     * tally ErrorCount, then short-circuit through the standard
+     * txn/MDL teardown + deferred-completion path. Hdr.Status stays
+     * USBD_STATUS_SUCCESS — per-packet detail lives in IsoPacket[]. */
+    if (u->is_isoc) {
+        POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
+        ULONG totalErr = 0;
+        if (turb != NULL) {
+            ULONG nPkts = turb->u.Isoch.NumberOfPackets;
+            if (nPkts > u->isoc_pkt_count) nPkts = u->isoc_pkt_count;
+            for (ULONG i = 0; i < nPkts; i++) {
+                turb->u.Isoch.IsoPacket[i].Length = u->isoc_pkts[i].length;
+                turb->u.Isoch.IsoPacket[i].Status = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
+                    u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
+                    totalErr++;
+                }
+            }
+            turb->u.Isoch.ErrorCount   = totalErr;
+            turb->TransferBufferLength = u->transferred;
+            turb->Hdr.Status           = USBD_STATUS_SUCCESS;
+        }
+        if (uc->DmaTransaction) {
+            NTSTATUS dmaSt;
+            (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction,
+                                                     (size_t)u->transferred,
+                                                     &dmaSt);
+            WdfObjectDelete(uc->DmaTransaction);
+            uc->DmaTransaction = NULL;
+        }
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        uc->DeferredStatus = STATUS_SUCCESS;
+        uc->DeferredInfo   = (ULONG_PTR)u->transferred;
+        InsertTailList(&uc->EpCtx->Dc->DeferredCompletions, &uc->DeferredEntry);
+        return;
+    }
 
     /* IN data copy-back. If the destination map fails (low resources),
      * we MUST NOT complete the request as success — caller would read
