@@ -1237,7 +1237,12 @@ OhciPci_HandleIsocUrb(
 
     WDF_OBJECT_ATTRIBUTES txnAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT(&txnAttrs);
-    status = WdfDmaTransactionCreate(dc->DmaEnabler, &txnAttrs,
+    /* Use the packet-profile DMA enabler so HAL bounces page-fragmented
+     * audio buffers into a single contiguous physical chunk before
+     * EvtProgramDma fires. Avoids the "packet 7 spans non-contiguous SG
+     * runs" rejection on every other URB that scatter-gather profile
+     * triggered. */
+    status = WdfDmaTransactionCreate(dc->IsocDmaEnabler, &txnAttrs,
                                       &uc->DmaTransaction);
     if (!NT_SUCCESS(status)) {
         LOG("HandleIsocUrb: WdfDmaTransactionCreate failed: 0x%08X", status);

@@ -52,6 +52,9 @@ typedef struct _DEVICE_CONTEXT {
 
     /* DMA enabler + common buffer (Task 3). */
     WDFDMAENABLER            DmaEnabler;
+    /* Separate enabler for isoch with WdfDmaProfilePacket so HAL bounces
+     * page-fragmented audio buffers into a contiguous chunk (Plan 8). */
+    WDFDMAENABLER            IsocDmaEnabler;
     WDFCOMMONBUFFER          DmaBuffer;
 
     /* Wired into core lib (Tasks 2/3/5). */
