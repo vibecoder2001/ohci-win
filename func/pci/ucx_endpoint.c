@@ -218,7 +218,26 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                     pktLen = u->isoc_pkts[i].length;
                 }
                 turb->u.Isoch.IsoPacket[i].Length = pktLen;
-                turb->u.Isoch.IsoPacket[i].Status = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                /* OHCI 1.0a §4.3.2.4: PSW.CC is well-defined for IN packets
+                 * but NOT for OUT — qemu and many real HCs leave it as junk
+                 * (commonly DataUnderrun) on OUT retire. Reporting that
+                 * back to usbaudio.sys causes it to treat every successful
+                 * audio packet as "device under-consumed" and stall the
+                 * stream. For OUT, force SUCCESS unless the CC is one of
+                 * the unambiguous hard-error codes (STALL/CRC/timeout etc.).
+                 * Inbox usbohci.sys does the equivalent. */
+                USBD_STATUS pktStatus;
+                if (isOut) {
+                    switch (u->isoc_pkts[i].cc) {
+                    case OHCI_CC_STALL:               pktStatus = USBD_STATUS_STALL_PID;          break;
+                    case OHCI_CC_CRC:                 pktStatus = USBD_STATUS_CRC;                break;
+                    case OHCI_CC_DEVICENOTRESPONDING: pktStatus = USBD_STATUS_DEV_NOT_RESPONDING; break;
+                    default:                          pktStatus = USBD_STATUS_SUCCESS;            break;
+                    }
+                } else {
+                    pktStatus = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                }
+                turb->u.Isoch.IsoPacket[i].Status = pktStatus;
                 totalLen += pktLen;
                 if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
                     u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
