@@ -45,6 +45,10 @@ static void decode_isoc_itd(struct ohci_urb *du, struct ohci_itd *itd) {
         total += len;
         if (cc != OHCI_CC_NOERROR && cc != OHCI_CC_DATAUNDERRUN) hard_err = 1;
     }
+    /* Single-ITD-per-URB world (Task 3). When Task 6 enables multiple
+     * ITDs per URB this becomes `+= total` and isoc_pkts[] indexing must
+     * advance by a per-window base — otherwise the second ITD overwrites
+     * the first's bytes and slot-0 packet result. */
     du->transferred = total;
     if (du->status == OHCI_URB_STATUS_PENDING) {
         du->status = hard_err ? OHCI_URB_STATUS_OVERRUN : OHCI_URB_STATUS_OK;
