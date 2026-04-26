@@ -1076,9 +1076,15 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
         fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
     }
 
-    /* Silence-pad to OHCIPCI_ISOC_REFILL_HIGH frames of lookahead. Skip
-     * if the EP isn't primed yet (silence has no SF reference) or has no
-     * silence buffer. */
+    /* Silence-pad ONLY when the chain has truly underrun (lead <= 0).
+     * Eagerly emitting silence to fill up to OHCIPCI_ISOC_REFILL_HIGH
+     * inserts ~24 frames of zero-data between every caller URB while
+     * usbaudio is preparing the next one — which on a 10ms-URB cadence
+     * means the device receives 10ms of audio + 24ms of silence + 10ms
+     * audio + 24ms silence, breaking the audio stream. usbaudio expects
+     * back-to-back frames; we should only emit silence when the HC has
+     * literally caught up to ed_tail_frame and would otherwise dispatch
+     * dead air. */
     if (!ie->primed || ep->IsocSilenceVa == NULL) return;
 
     /* Read MPS from the ED control word; clamp to packet-count budget. */
@@ -1092,7 +1098,10 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
     ULONG silenceEmitted = 0;
     while (1) {
         SHORT lead = (SHORT)(ie->ed_tail_frame - fmNumber);
-        if (lead >= (SHORT)OHCIPCI_ISOC_REFILL_HIGH) break;
+        /* Only emit silence on genuine underrun: lead <= 0 means HC has
+         * reached or passed ed_tail_frame and would walk dead schedule
+         * slots without help. */
+        if (lead > 0) break;
 
         /* Cap silence emissions per refill call so a far-behind caller
          * stall can't drain the ITD pool in a single tick. The next
