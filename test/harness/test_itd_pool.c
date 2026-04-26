@@ -6,7 +6,7 @@
 
 int main(void) {
     /* 8 KB backing region — enough for 16 ITDs (32 B each) + free-list array */
-    static uint8_t backing[8192];
+    static _Alignas(32) uint8_t backing[8192];
     struct ohci_dma_region dma;
     /* phys_base chosen to be 32-byte aligned so bump-alloc stays aligned */
     ohci_dma_init(&dma, backing, 0x80000000u, sizeof(backing));

@@ -59,6 +59,7 @@ POOL_FREE (ohci_td_pool, struct ohci_td)
 int ohci_itd_pool_init(struct ohci_itd_pool *p, struct ohci_dma_region *r,
                        uint16_t count)
 {
+    memset(p, 0, sizeof(*p));
     if (count == 0 || count == 0xFFFF) return -1;
     uint32_t phys;
     void *mem = ohci_dma_alloc(r, sizeof(struct ohci_itd) * count, 32, &phys);
@@ -68,7 +69,14 @@ int ohci_itd_pool_init(struct ohci_itd_pool *p, struct ohci_dma_region *r,
     p->capacity   = count;
     p->next = (uint16_t *)ohci_dma_alloc(r,
         sizeof(uint16_t) * count, sizeof(uint16_t), NULL);
-    if (!p->next) return -1;
+    if (!p->next) {
+        p->elems      = NULL;
+        p->elems_phys = 0;
+        p->capacity   = 0;
+        p->next       = NULL;
+        p->free_head  = 0xFFFF;
+        return -1;
+    }
     for (uint16_t i = 0; i < count; i++) {
         p->next[i] = (uint16_t)(i + 1 < count ? i + 1 : 0xFFFF);
     }
@@ -91,6 +99,7 @@ struct ohci_itd *ohci_itd_pool_alloc(struct ohci_itd_pool *p, uint32_t *phys_out
 
 void ohci_itd_pool_free(struct ohci_itd_pool *p, struct ohci_itd *t)
 {
+    if (!t) return;
     uint16_t idx  = (uint16_t)(t - p->elems);
     p->next[idx]  = p->free_head;
     p->free_head  = idx;
