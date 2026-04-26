@@ -89,3 +89,7 @@ add_test(NAME isoc_endpoint COMMAND test_isoc_endpoint)
 add_executable(test_isoc_submit test_isoc_submit.c)
 target_link_libraries(test_isoc_submit PRIVATE fake_hc)
 add_test(NAME isoc_submit COMMAND test_isoc_submit)
+
+add_executable(test_isoc_drain test_isoc_drain.c)
+target_link_libraries(test_isoc_drain PRIVATE fake_hc)
+add_test(NAME isoc_drain COMMAND test_isoc_drain)

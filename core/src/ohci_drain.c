@@ -2,10 +2,13 @@
 #include "ohci_drain.h"
 #include "ohci_regs.h"
 #include "ohci_td.h"
+#include "ohci_itd.h"
+#include "ohci_isoc.h"
 #include "ohci_urb.h"
 #include "ohci_dma.h"
 #include "ohci_pool.h"
 #include "ohci_ed.h"
+#include "ohci_hc.h"
 
 static int cc_to_urb_status(uint8_t cc) {
     switch (cc) {
@@ -18,6 +21,33 @@ static int cc_to_urb_status(uint8_t cc) {
     case OHCI_CC_DATAUNDERRUN:
     case OHCI_CC_BUFFERUNDERRUN:      return OHCI_URB_STATUS_UNDERRUN;
     default:                          return OHCI_URB_STATUS_OTHER;
+    }
+}
+
+/* Decode per-packet PSW for an isoch URB whose ITD just retired.
+ * OHCI §4.3.2.4: each PSW out word holds CC[15:12] | size[11:0]. Sum
+ * sizes into urb->transferred; treat DataUnderrun as a normal short
+ * packet (URB stays OK). Any other non-NoError code -> URB-level
+ * OVERRUN. */
+static void decode_isoc_itd(struct ohci_urb *du, struct ohci_itd *itd) {
+    uint8_t fc = (uint8_t)((itd->Control & OHCI_ITD_FC_MASK) >> OHCI_ITD_FC_SHIFT);
+    uint8_t pkt_count = (uint8_t)(fc + 1);
+    if (pkt_count > du->isoc_pkt_count) pkt_count = du->isoc_pkt_count;
+
+    uint32_t total = 0;
+    int hard_err = 0;
+    for (uint8_t i = 0; i < pkt_count; i++) {
+        uint16_t psw = itd->PSW[i];
+        uint8_t  cc  = (uint8_t)((psw & OHCI_PSW_CC_MASK) >> OHCI_PSW_CC_SHIFT);
+        uint16_t len = (uint16_t)(psw & OHCI_PSW_SIZE_MASK);
+        du->isoc_pkts[i].cc     = cc;
+        du->isoc_pkts[i].length = len;
+        total += len;
+        if (cc != OHCI_CC_NOERROR && cc != OHCI_CC_DATAUNDERRUN) hard_err = 1;
+    }
+    du->transferred = total;
+    if (du->status == OHCI_URB_STATUS_PENDING) {
+        du->status = hard_err ? OHCI_URB_STATUS_OVERRUN : OHCI_URB_STATUS_OK;
     }
 }
 
@@ -96,19 +126,23 @@ void ohci_drain_done(struct ohci_hc *hc) {
         int td_idx = -1;
         struct ohci_urb *du = urb_for_data_td_phys(hc, cur, &td_idx);
         if (du && td_idx >= 0) {
-            uint32_t chunk_off = du->data_tds[td_idx].chunk_off;
-            uint32_t chunk_len = du->data_tds[td_idx].chunk_len;
-            uint32_t per_td_done;
-            if (td->CBP == 0) {
-                per_td_done = chunk_len;
-            } else if (td->CBP >= du->buffer_phys + chunk_off) {
-                per_td_done = td->CBP - (du->buffer_phys + chunk_off);
+            if (du->is_isoc) {
+                decode_isoc_itd(du, (struct ohci_itd *)td);
             } else {
-                per_td_done = 0;
-            }
-            du->transferred += per_td_done;
-            if (cc != OHCI_CC_NOERROR && du->status == OHCI_URB_STATUS_PENDING) {
-                du->status = s;
+                uint32_t chunk_off = du->data_tds[td_idx].chunk_off;
+                uint32_t chunk_len = du->data_tds[td_idx].chunk_len;
+                uint32_t per_td_done;
+                if (td->CBP == 0) {
+                    per_td_done = chunk_len;
+                } else if (td->CBP >= du->buffer_phys + chunk_off) {
+                    per_td_done = td->CBP - (du->buffer_phys + chunk_off);
+                } else {
+                    per_td_done = 0;
+                }
+                du->transferred += per_td_done;
+                if (cc != OHCI_CC_NOERROR && du->status == OHCI_URB_STATUS_PENDING) {
+                    du->status = s;
+                }
             }
         }
 
@@ -118,7 +152,11 @@ void ohci_drain_done(struct ohci_hc *hc) {
             if (u->complete) u->complete(u);
         }
 
-        ohci_td_pool_free(&hc->td_pool, td);
+        if (du && du->is_isoc) {
+            ohci_itd_pool_free(&hc->itd_pool, (struct ohci_itd *)td);
+        } else {
+            ohci_td_pool_free(&hc->td_pool, td);
+        }
         cur = next;
     }
 }
