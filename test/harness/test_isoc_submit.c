@@ -42,7 +42,7 @@ static int run_basic_submit(void) {
     uint16_t lens[4] = {192, 192, 192, 192};
     uint32_t buf_phys = 0xB0001000u;
     uint32_t buf_len  = 4 * 192;
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 100, 4, lens, buf_phys, buf_len) != 0)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 100, 4, lens, buf_phys, buf_len, 1) != 0)
         FAIL("submit returned non-zero");
 
     struct ohci_itd *itd = (struct ohci_itd *)ohci_dma_virt_from_phys(&dma, urb.data_tds[0].td_phys);
@@ -98,7 +98,7 @@ static int run_page_straddle_accept(void) {
     struct ohci_urb urb; memset(&urb, 0, sizeof(urb));
     uint16_t lens[1] = {32};
     uint32_t buf_phys = 0xB0001FF0u;     /* crosses one page boundary */
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 50, 1, lens, buf_phys, 32) != 0)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 50, 1, lens, buf_phys, 32, 1) != 0)
         FAIL("page-straddle (one boundary) should be accepted");
     struct ohci_itd *itd = (struct ohci_itd *)ohci_dma_virt_from_phys(&dma, urb.data_tds[0].td_phys);
     if (itd->BP0 != 0xB0001000u) FAIL("BP0=0x%08x expected 0xB0001000", itd->BP0);
@@ -133,7 +133,7 @@ static int run_two_page_straddle_reject(void) {
     struct ohci_urb urb; memset(&urb, 0, sizeof(urb));
     uint16_t lens[1] = {0x1020};
     uint32_t buf_phys = 0xB0001FF0u;
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 60, 1, lens, buf_phys, 0x1020) != -1)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 60, 1, lens, buf_phys, 0x1020, 1) != -1)
         FAIL("two-page straddle should be rejected");
 
     ohci_isoc_endpoint_destroy(&hc, &ep);
@@ -163,9 +163,9 @@ static int run_pkt_count_bounds(void) {
 
     struct ohci_urb urb; memset(&urb, 0, sizeof(urb));
     uint16_t lens[9] = {8,8,8,8,8,8,8,8,8};
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 0, 0, lens, 0xB0001000u, 0) != -1)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 0, 0, lens, 0xB0001000u, 0, 1) != -1)
         FAIL("pkt_count=0 should reject");
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 0, 9, lens, 0xB0001000u, 72) != -1)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 0, 9, lens, 0xB0001000u, 72, 1) != -1)
         FAIL("pkt_count=9 should reject");
 
     ohci_isoc_endpoint_destroy(&hc, &ep);
@@ -195,12 +195,12 @@ static int run_two_consecutive(void) {
 
     uint16_t lens[8] = {64,64,64,64,64,64,64,64};
     struct ohci_urb urb1; memset(&urb1, 0, sizeof(urb1));
-    if (ohci_isoc_submit_window(&hc, &ep, &urb1, 200, 8, lens, 0xB0002000u, 512) != 0)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb1, 200, 8, lens, 0xB0002000u, 512, 1) != 0)
         FAIL("submit1");
     if (ep.ed_tail_frame != 208) FAIL("after #1 ed_tail_frame=%u", ep.ed_tail_frame);
 
     struct ohci_urb urb2; memset(&urb2, 0, sizeof(urb2));
-    if (ohci_isoc_submit_window(&hc, &ep, &urb2, 208, 8, lens, 0xB0003000u, 512) != 0)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb2, 208, 8, lens, 0xB0003000u, 512, 1) != 0)
         FAIL("submit2");
     if (ep.ed_tail_frame != 216) FAIL("after #2 ed_tail_frame=%u", ep.ed_tail_frame);
 
@@ -240,7 +240,7 @@ static int run_zero_buf_len(void) {
 
     struct ohci_urb urb; memset(&urb, 0, sizeof(urb));
     uint16_t lens[1] = {0};
-    if (ohci_isoc_submit_window(&hc, &ep, &urb, 50, 1, lens, 0xB0001000u, 0) != -1)
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 50, 1, lens, 0xB0001000u, 0, 1) != -1)
         FAIL("buf_len=0 should be rejected");
 
     ohci_isoc_endpoint_destroy(&hc, &ep);
@@ -279,7 +279,7 @@ static int run_pool_exhaustion(void) {
         memset(&urbs[i], 0, sizeof(urbs[i]));
         rc = ohci_isoc_submit_window(&hc, &ep, &urbs[i],
                                      (uint16_t)(300 + i), 1, lens,
-                                     0xB0001000u + (uint32_t)i * 64u, 64);
+                                     0xB0001000u + (uint32_t)i * 64u, 64, 1);
         if (rc == 0) succeeded++;
         else break;
     }

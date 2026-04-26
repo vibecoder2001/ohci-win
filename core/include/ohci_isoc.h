@@ -50,6 +50,16 @@ void ohci_isoc_endpoint_destroy(struct ohci_hc *hc,
  * On success the URB is queued in_flight; complete() will fire when the
  * drain path retires the ITD. ep->ed_tail_frame advances to sf + pkt_count
  * and ep->primed becomes 1. */
+/* `first_window` selects URB-init semantics:
+ *   1: this is the first window of the URB — reset transferred,
+ *      isoc_pkts_filled, status=PENDING, isoc_pkt_count=pkt_count,
+ *      head_td/tail_td both point at the new ITD.
+ *   0: continuation — leave URB-level fields alone, only emit the new
+ *      ITD, append it to data_tds[], advance ep->ed_tail_frame, and
+ *      bump tail_td so URB completion fires from the LAST ITD. The
+ *      caller must have set urb->isoc_pkt_count to the URB-total
+ *      packet count before the first call (submit_window does that
+ *      when first_window=1). */
 int ohci_isoc_submit_window(struct ohci_hc *hc,
                             struct ohci_isoc_endpoint *ep,
                             struct ohci_urb *urb,
@@ -57,7 +67,8 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
                             uint8_t  pkt_count,
                             const uint16_t *pkt_lens,
                             uint32_t buf_phys,
-                            uint32_t buf_len);
+                            uint32_t buf_len,
+                            int first_window);
 
 #ifdef __cplusplus
 }

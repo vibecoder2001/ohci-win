@@ -81,6 +81,7 @@ Environment:
 #include "ohci_dma.h"
 #include "ohci_drain.h"
 #include "ohci_ed.h"
+#include "ohci_isoc.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -592,6 +593,308 @@ OhciPci_HandleBulkOrInterruptUrb(
 }
 
 /* --------------------------------------------------------------------------
+ * Isoch path (Plan 8 Task 6).
+ *
+ * HandleIsocUrb mirrors HandleBulkUrb's WdfDmaTransaction lifecycle. The
+ * OhciPci_IsocProgramDma callback (EVT_WDF_PROGRAM_DMA) walks the post-HAL
+ * SG list, builds a flat per-packet (phys, len) table from
+ * urb->u.Isoch.IsoPacket[i].Offset, then greedy-packs into ITD windows of
+ * up to 8 packets sharing one BP0+0x1000 page window. Each window is
+ * submitted via ohci_isoc_submit_window — first call carries first_window=1
+ * to initialize URB-level state; subsequent calls pass 0.
+ * -------------------------------------------------------------------------- */
+static EVT_WDF_PROGRAM_DMA OhciPci_IsocProgramDma;
+
+static VOID
+OhciPci_IsocProgramDmaFail(OHCIPCI_URB_CTX *uc, NTSTATUS status)
+{
+    NTSTATUS dmaSt;
+    (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction, 0, &dmaSt);
+    WdfObjectDelete(uc->DmaTransaction);
+    uc->DmaTransaction = NULL;
+    if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+    WdfRequestComplete(uc->Request, status);
+}
+
+static BOOLEAN
+OhciPci_IsocProgramDma(
+    WDFDMATRANSACTION    Transaction,
+    WDFDEVICE            Device,
+    PVOID                Context,
+    WDF_DMA_DIRECTION    Direction,
+    PSCATTER_GATHER_LIST SgList)
+{
+    UNREFERENCED_PARAMETER(Transaction);
+    UNREFERENCED_PARAMETER(Device);
+    UNREFERENCED_PARAMETER(Direction);
+
+    OHCIPCI_URB_CTX      *uc   = (OHCIPCI_URB_CTX *)Context;
+    OHCIPCI_EP_CONTEXT   *ep   = uc->EpCtx;
+    PDEVICE_CONTEXT       dc   = ep->Dc;
+    POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
+
+    if (SgList->NumberOfElements == 0) {
+        LOG("IsocProgramDma: empty SG list");
+        OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+        return TRUE;
+    }
+
+    ULONG nPkts = turb->u.Isoch.NumberOfPackets;
+    if (nPkts == 0) {
+        LOG("IsocProgramDma: zero packets");
+        OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+        return TRUE;
+    }
+    if (nPkts > OHCI_URB_MAX_ISOC_PACKETS) {
+        LOG("IsocProgramDma: %lu packets exceeds cap %u",
+            nPkts, OHCI_URB_MAX_ISOC_PACKETS);
+        OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+        return TRUE;
+    }
+
+    /* Per-packet (phys, len) table. */
+    typedef struct { uint32_t phys; uint16_t len; } isoc_pkt_t;
+    isoc_pkt_t pkt[OHCI_URB_MAX_ISOC_PACKETS];
+
+    ULONG urbLen   = turb->TransferBufferLength;
+    ULONG sgIdx    = 0;
+    ULONG sgConsumed = 0;     /* bytes already mapped in current SG element */
+    ULONG cursorOff  = 0;     /* URB-buffer offset of sgIdx start */
+
+    for (ULONG i = 0; i < nPkts; i++) {
+        ULONG pktOff = turb->u.Isoch.IsoPacket[i].Offset;
+        ULONG pktEnd = (i + 1 < nPkts)
+                        ? turb->u.Isoch.IsoPacket[i+1].Offset
+                        : urbLen;
+        if (pktEnd < pktOff || pktEnd > urbLen) {
+            LOG("IsocProgramDma: packet %lu offset/end out of range "
+                "(off=%lu end=%lu urbLen=%lu)", i, pktOff, pktEnd, urbLen);
+            OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+            return TRUE;
+        }
+        ULONG pktLen = pktEnd - pktOff;
+        /* PSW size field is 12 bits — packets larger than 0xFFF can't be
+         * represented in one ITD slot. */
+        if (pktLen > 0xFFFu) {
+            LOG("IsocProgramDma: packet %lu len=%lu exceeds 0xFFF", i, pktLen);
+            OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+            return TRUE;
+        }
+        /* Advance SG cursor until pktOff falls inside the current element. */
+        while (sgIdx < SgList->NumberOfElements &&
+               cursorOff + (SgList->Elements[sgIdx].Length - sgConsumed) <= pktOff)
+        {
+            cursorOff += SgList->Elements[sgIdx].Length - sgConsumed;
+            sgConsumed = 0;
+            sgIdx++;
+        }
+        if (sgIdx >= SgList->NumberOfElements) {
+            LOG("IsocProgramDma: ran off SG list at packet %lu", i);
+            OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+            return TRUE;
+        }
+        ULONG inElem = pktOff - cursorOff + sgConsumed;
+        if (inElem + pktLen > SgList->Elements[sgIdx].Length) {
+            /* Packet spans an SG element boundary — would require an
+             * intra-packet split that ITDs don't support. usbaudio
+             * doesn't do this in practice (each packet is well under
+             * PAGE_SIZE and aligned at the URB level). */
+            LOG("IsocProgramDma: packet %lu spans SG elements "
+                "(inElem=%lu len=%lu elemLen=%lu)", i, inElem, pktLen,
+                SgList->Elements[sgIdx].Length);
+            OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+            return TRUE;
+        }
+        pkt[i].phys = SgList->Elements[sgIdx].Address.LowPart + inElem;
+        pkt[i].len  = (uint16_t)pktLen;
+    }
+
+    /* CoreUrb is shared across all windows; populate before first submit. */
+    uc->CoreUrb.complete  = OhciPci_UrbComplete;
+    uc->CoreUrb.direction = uc->DataDirection;
+
+    WdfSpinLockAcquire(dc->CoreLock);
+
+    struct ohci_isoc_endpoint *ie = &ep->Core.Isoc;
+    uint16_t sf;
+    if (ie->primed) {
+        sf = ie->ed_tail_frame;
+    } else {
+        uint32_t fmNumber = dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu;
+        /* +4 frame lookahead so the HC starts in ~4 ms. Task 7's refill
+         * DPC will advance this further once it's wired. */
+        sf = (uint16_t)((fmNumber + 4u) & 0xFFFFu);
+    }
+
+    /* Greedy-pack packets into windows of ≤8 that share one BP0/BP0+0x1000
+     * page window AND are physically contiguous. */
+    ULONG i  = 0;
+    int   rc = 0;
+    int   firstWindow = 1;
+    while (i < nPkts && rc == 0) {
+        uint8_t  windowCount = 1;
+        uint32_t bp0     = pkt[i].phys & 0xFFFFF000u;
+        uint32_t winPhys = pkt[i].phys;
+        uint32_t winLen  = pkt[i].len;
+        uint32_t expectNext = pkt[i].phys + pkt[i].len;
+        while (windowCount < 8 && i + windowCount < nPkts) {
+            uint32_t nxtPhys = pkt[i + windowCount].phys;
+            if (nxtPhys != expectNext) break;
+            uint32_t nxtLen = pkt[i + windowCount].len;
+            if (nxtLen == 0) {
+                /* Zero-length packet — just append, no page-window change. */
+                winLen     += 0;
+                expectNext  = nxtPhys;
+                windowCount++;
+                continue;
+            }
+            uint32_t nxtEnd  = nxtPhys + nxtLen - 1;
+            uint32_t nxtPage = nxtEnd & 0xFFFFF000u;
+            if (nxtPage != bp0 && nxtPage != bp0 + 0x1000u) break;
+            winLen     += nxtLen;
+            expectNext  = nxtPhys + nxtLen;
+            windowCount++;
+        }
+
+        uint16_t lens[8];
+        for (uint8_t k = 0; k < windowCount; k++) lens[k] = pkt[i + k].len;
+
+        rc = ohci_isoc_submit_window(&dc->Hc, ie, &uc->CoreUrb,
+                                      sf, windowCount, lens,
+                                      winPhys, winLen, firstWindow);
+        sf  = (uint16_t)(sf + windowCount);
+        i  += windowCount;
+        firstWindow = 0;
+    }
+
+    WdfSpinLockRelease(dc->CoreLock);
+
+    if (rc != 0) {
+        LOG("IsocProgramDma: ohci_isoc_submit_window rc=%d at packet %lu/%lu",
+            rc, i, nPkts);
+        /* Partial-submit: any in-flight ITDs from earlier windows will
+         * still complete; CoreUrb stays on hc->in_flight and its
+         * completion callback fires when its tail_td retires. We can't
+         * cleanly retract them, so just propagate failure if NO windows
+         * were submitted (firstWindow still set means rc was non-zero
+         * on the very first call → URB never went on in_flight). */
+        if (i == 0 || firstWindow) {
+            OhciPci_IsocProgramDmaFail(uc, STATUS_INSUFFICIENT_RESOURCES);
+            return TRUE;
+        }
+        /* Otherwise: the URB is on in_flight; let it ride. The TRANSFER_URB
+         * will report whatever the partial set transferred. Log loudly. */
+        LOG("IsocProgramDma: partial submit (%lu of %lu packets queued)",
+            i, nPkts);
+    }
+
+    /* Async completion via OhciPci_UrbComplete from the drain. */
+    return TRUE;
+}
+
+static VOID
+OhciPci_HandleIsocUrb(
+    OHCIPCI_EP_CONTEXT   *ep,
+    WDFREQUEST            Request,
+    POHCIPCI_TRANSFER_URB urb)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    ULONG   length = urb->TransferBufferLength;
+    PVOID   bufVa  = urb->TransferBuffer;
+    PMDL    bufMdl = urb->TransferBufferMDL;
+    BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
+
+    LOG("EvtUrbIsoc: len=%lu nPkts=%lu dir=%s",
+        length, urb->u.Isoch.NumberOfPackets, isIn ? "IN" : "OUT");
+
+    if (length == 0 || urb->u.Isoch.NumberOfPackets == 0) {
+        urb->TransferBufferLength = 0;
+        urb->Hdr.Status = USBD_STATUS_SUCCESS;
+        WdfRequestComplete(Request, STATUS_SUCCESS);
+        return;
+    }
+
+    /* MDL handling — same shape as HandleBulkUrb. Cap MDL-less buffers
+     * tightly to defend against weaponised paged-VA URBs. */
+    PMDL ourMdl = NULL;
+    if (bufMdl == NULL) {
+        const ULONG OHCIPCI_ISOC_NO_MDL_MAX = 512;
+        if (bufVa == NULL || length > OHCIPCI_ISOC_NO_MDL_MAX) {
+            LOG("HandleIsocUrb: rejecting MDL-less URB len=%lu (max %lu)",
+                length, OHCIPCI_ISOC_NO_MDL_MAX);
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
+            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+            return;
+        }
+        ourMdl = IoAllocateMdl(bufVa, length, FALSE, FALSE, NULL);
+        if (ourMdl == NULL) {
+            urb->TransferBufferLength = 0;
+            urb->Hdr.Status = USBD_STATUS_INSUFFICIENT_RESOURCES;
+            WdfRequestComplete(Request, STATUS_INSUFFICIENT_RESOURCES);
+            return;
+        }
+        MmBuildMdlForNonPagedPool(ourMdl);
+        bufMdl = ourMdl;
+    }
+
+    /* Per-URB context. */
+    WDF_OBJECT_ATTRIBUTES reqAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&reqAttrs, OHCIPCI_URB_CTX);
+    NTSTATUS status = WdfObjectAllocateContext(Request, &reqAttrs, NULL);
+    if (!NT_SUCCESS(status)) {
+        if (ourMdl) IoFreeMdl(ourMdl);
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    OHCIPCI_URB_CTX *uc = OhciPci_UrbCtxGet(Request);
+    RtlZeroMemory(uc, sizeof(*uc));
+    uc->Request       = Request;
+    uc->EpCtx         = ep;
+    uc->TransferUrb   = urb;
+    uc->DataLength    = length;
+    uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
+    uc->OurMdl        = ourMdl;
+
+    WDF_OBJECT_ATTRIBUTES txnAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&txnAttrs);
+    status = WdfDmaTransactionCreate(dc->DmaEnabler, &txnAttrs,
+                                      &uc->DmaTransaction);
+    if (!NT_SUCCESS(status)) {
+        LOG("HandleIsocUrb: WdfDmaTransactionCreate failed: 0x%08X", status);
+        if (ourMdl) { IoFreeMdl(ourMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    PVOID va = bufVa ? bufVa : MmGetMdlVirtualAddress(bufMdl);
+    status = WdfDmaTransactionInitialize(uc->DmaTransaction,
+                                          OhciPci_IsocProgramDma,
+                                          isIn ? WdfDmaDirectionReadFromDevice
+                                               : WdfDmaDirectionWriteToDevice,
+                                          bufMdl, va, length);
+    if (!NT_SUCCESS(status)) {
+        LOG("HandleIsocUrb: WdfDmaTransactionInitialize failed: 0x%08X", status);
+        WdfObjectDelete(uc->DmaTransaction);
+        uc->DmaTransaction = NULL;
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    status = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
+    if (!NT_SUCCESS(status)) {
+        LOG("HandleIsocUrb: WdfDmaTransactionExecute failed: 0x%08X", status);
+        WdfObjectDelete(uc->DmaTransaction);
+        uc->DmaTransaction = NULL;
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(Request, status);
+        return;
+    }
+    /* Async completion via OhciPci_UrbComplete. */
+}
+
+/* --------------------------------------------------------------------------
  * EvtUrbDefault
  *
  * EvtIoDefault for the WDFQUEUE registered with UCX via
@@ -631,9 +934,7 @@ EvtUrbDefault(
         return;
     }
     if (fn == URB_FUNCTION_ISOCH_TRANSFER) {
-        /* TODO(Plan 8 Task 6): wire OhciPci_HandleIsocUrb. */
-        LOG("EvtUrbDefault: isoch URB on EP kind=%d - not yet wired (Task 6)", ep->Kind);
-        WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
+        OhciPci_HandleIsocUrb(ep, Request, urb);
         return;
     }
     if (fn != URB_FUNCTION_CONTROL_TRANSFER &&

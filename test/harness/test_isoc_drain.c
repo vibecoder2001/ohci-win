@@ -61,7 +61,7 @@ static int setup_and_submit(struct fake_hc *fake, struct ohci_dma_region *dma,
     uint32_t buf_len = 0;
     for (uint8_t i = 0; i < pkt_count; i++) buf_len += lens[i];
     if (ohci_isoc_submit_window(hc, ep, urb, 100, pkt_count, lens,
-                                0xC0001000u, buf_len) != 0) return 1;
+                                0xC0001000u, buf_len, 1) != 0) return 1;
 
     *out_itd_phys = urb->data_tds[0].td_phys;
     *out_itd = (struct ohci_itd *)ohci_dma_virt_from_phys(dma, *out_itd_phys);

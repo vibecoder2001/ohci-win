@@ -65,9 +65,16 @@ struct ohci_urb {
 
     /* Isochronous result tracking — one ITD covers up to 8 packets, with
      * per-packet length + CC decoded from PSW by the drain path (Task 4). */
-#define OHCI_URB_MAX_ISOC_PACKETS 8
+/* Cap of 64 packets per URB (8 ITDs × 8 packets). v1 audio queues
+ * ≤16-packet URBs; this gives plenty of headroom. */
+#define OHCI_URB_MAX_ISOC_PACKETS 64
     uint8_t  is_isoc;
     uint8_t  isoc_pkt_count;
+    /* Drain-side running pkt-index base. Each retired ITD's per-packet
+     * results land at isoc_pkts[isoc_pkts_filled .. +pkt_count-1]; the
+     * drain advances isoc_pkts_filled accordingly so multi-ITD URBs
+     * accumulate correctly. */
+    uint8_t  isoc_pkts_filled;
     struct ohci_isoc_packet_result {
         uint16_t length;     /* bytes transferred (HW-written, drain decodes from PSW) */
         uint8_t  cc;         /* OHCI condition code from PSW */

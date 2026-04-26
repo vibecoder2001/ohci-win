@@ -32,7 +32,20 @@ static int cc_to_urb_status(uint8_t cc) {
 static void decode_isoc_itd(struct ohci_urb *du, struct ohci_itd *itd) {
     uint8_t fc = (uint8_t)((itd->Control & OHCI_ITD_FC_MASK) >> OHCI_ITD_FC_SHIFT);
     uint8_t pkt_count = (uint8_t)(fc + 1);
-    if (pkt_count > du->isoc_pkt_count) pkt_count = du->isoc_pkt_count;
+
+    /* Per-window pkt base: each ITD covers a window of packets within
+     * the URB. isoc_pkts_filled is the running index of packets that
+     * have already been decoded from prior ITDs; this ITD's results
+     * land at [base .. base+pkt_count). Cap defensively against HW
+     * writing FC out of expected range. */
+    uint8_t base = du->isoc_pkts_filled;
+    if (base >= du->isoc_pkt_count) {
+        /* All packets already accounted for — nothing more to decode. */
+        return;
+    }
+    if ((uint16_t)base + pkt_count > du->isoc_pkt_count) {
+        pkt_count = (uint8_t)(du->isoc_pkt_count - base);
+    }
 
     uint32_t total = 0;
     int hard_err = 0;
@@ -40,18 +53,23 @@ static void decode_isoc_itd(struct ohci_urb *du, struct ohci_itd *itd) {
         uint16_t psw = itd->PSW[i];
         uint8_t  cc  = (uint8_t)((psw & OHCI_PSW_CC_MASK) >> OHCI_PSW_CC_SHIFT);
         uint16_t len = (uint16_t)(psw & OHCI_PSW_SIZE_MASK);
-        du->isoc_pkts[i].cc     = cc;
-        du->isoc_pkts[i].length = len;
+        du->isoc_pkts[base + i].cc     = cc;
+        du->isoc_pkts[base + i].length = len;
         total += len;
         if (cc != OHCI_CC_NOERROR && cc != OHCI_CC_DATAUNDERRUN) hard_err = 1;
     }
-    /* Single-ITD-per-URB world (Task 3). When Task 6 enables multiple
-     * ITDs per URB this becomes `+= total` and isoc_pkts[] indexing must
-     * advance by a per-window base — otherwise the second ITD overwrites
-     * the first's bytes and slot-0 packet result. */
-    du->transferred = total;
-    if (du->status == OHCI_URB_STATUS_PENDING) {
-        du->status = hard_err ? OHCI_URB_STATUS_OVERRUN : OHCI_URB_STATUS_OK;
+    du->isoc_pkts_filled = (uint8_t)(base + pkt_count);
+    du->transferred += total;
+    if (du->status == OHCI_URB_STATUS_PENDING && hard_err) {
+        du->status = OHCI_URB_STATUS_OVERRUN;
+    }
+    /* OK status: only flip when ALL packets have been filled. The URB-
+     * completion match (urb_for_td_phys via tail_td) fires off the
+     * LAST ITD's retirement, at which point isoc_pkts_filled ==
+     * isoc_pkt_count for a healthy URB. */
+    if (du->status == OHCI_URB_STATUS_PENDING &&
+        du->isoc_pkts_filled == du->isoc_pkt_count) {
+        du->status = OHCI_URB_STATUS_OK;
     }
 }
 

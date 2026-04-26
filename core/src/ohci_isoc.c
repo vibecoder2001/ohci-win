@@ -123,7 +123,8 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
                             uint8_t  pkt_count,
                             const uint16_t *pkt_lens,
                             uint32_t buf_phys,
-                            uint32_t buf_len)
+                            uint32_t buf_len,
+                            int first_window)
 {
     if (pkt_count == 0 || pkt_count > 8) return -1;
     if (buf_len == 0) return -1;
@@ -181,34 +182,59 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
     ep->ed_tail_frame         = (uint16_t)(sf + pkt_count);
     ep->primed                = 1;
 
-    urb->is_isoc        = 1;
-    urb->isoc_pkt_count = pkt_count;
-    urb->ed             = ep->ed;
-    urb->status         = OHCI_URB_STATUS_PENDING;
-    urb->transferred    = 0;
-    urb->buffer         = NULL;          /* per-packet phys is in the ITD itself */
-    urb->buffer_phys    = buf_phys;
-    urb->length         = buf_len;
-    urb->direction      = ep->direction;
     /* The pointer at head_phys is actually an ohci_itd, not an ohci_td.
      * Drain MUST dispatch on urb->is_isoc (or ed->Control & OHCI_ED_F)
      * before dereferencing — never reinterpret without checking. */
-    urb->head_td        = (struct ohci_td *)ohci_dma_virt_from_phys(hc->dma, head_phys);
-    urb->tail_td        = urb->head_td;
-    urb->data_tds[0].td_phys   = head_phys;
-    urb->data_tds[0].chunk_off = 0;
-    urb->data_tds[0].chunk_len = buf_len;
-    urb->data_td_count  = 1;
-    for (uint8_t i = 0; i < pkt_count; i++) {
-        urb->isoc_pkts[i].length = 0;
-        urb->isoc_pkts[i].cc     = 0;
+    struct ohci_td *new_td_virt =
+        (struct ohci_td *)ohci_dma_virt_from_phys(hc->dma, head_phys);
+
+    if (first_window) {
+        urb->is_isoc          = 1;
+        urb->isoc_pkt_count   = pkt_count;
+        urb->isoc_pkts_filled = 0;
+        urb->ed               = ep->ed;
+        urb->status           = OHCI_URB_STATUS_PENDING;
+        urb->transferred      = 0;
+        urb->buffer           = NULL;
+        urb->buffer_phys      = buf_phys;
+        urb->length           = buf_len;
+        urb->direction        = ep->direction;
+        urb->head_td          = new_td_virt;
+        urb->tail_td          = new_td_virt;
+        urb->data_tds[0].td_phys   = head_phys;
+        urb->data_tds[0].chunk_off = 0;
+        urb->data_tds[0].chunk_len = buf_len;
+        urb->data_td_count  = 1;
+        for (uint8_t i = 0; i < pkt_count; i++) {
+            urb->isoc_pkts[i].length = 0;
+            urb->isoc_pkts[i].cc     = 0;
+        }
+    } else {
+        /* Continuation: append ITD to data_tds[], advance tail_td so the
+         * URB-completion lookup fires only when the LAST ITD retires.
+         * URB-level fields (transferred, status, isoc_pkt_count, head_td)
+         * are left as-is. */
+        if (urb->data_td_count < OHCI_URB_MAX_DATA_TDS) {
+            uint8_t idx = urb->data_td_count;
+            urb->data_tds[idx].td_phys   = head_phys;
+            /* chunk_off/chunk_len are unused for isoc (decode_isoc_itd
+             * walks PSW directly), but populate sensibly anyway. */
+            urb->data_tds[idx].chunk_off = urb->length;
+            urb->data_tds[idx].chunk_len = buf_len;
+            urb->data_td_count = (uint8_t)(idx + 1);
+        }
+        urb->length += buf_len;
+        urb->tail_td = new_td_virt;
+        /* URB stays on hc->in_flight from the first window; do not relink. */
     }
 
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
     /* No doorbell — the HC visits the periodic schedule per frame. */
 
-    urb->next_pending = hc->in_flight;
-    hc->in_flight = urb;
+    if (first_window) {
+        urb->next_pending = hc->in_flight;
+        hc->in_flight = urb;
+    }
     return 0;
 }
