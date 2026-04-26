@@ -217,6 +217,36 @@ static int run_two_consecutive(void) {
     return 0;
 }
 
+static int run_zero_buf_len(void) {
+    struct fake_hc fake; fake_hc_init(&fake);
+    static uint8_t backing[64 * 1024];
+    struct ohci_dma_region dma;
+    ohci_dma_init(&dma, backing, 0xC0000000u, sizeof(backing));
+    fake_hc_set_dma(&fake, &dma);
+    struct ohci_mmio_ops ops; fake_hc_get_ops(&fake, &ops);
+    struct ohci_hc hc;
+    struct ohci_hc_config hcfg = {
+        .td_pool_size = 8, .control_ed_count = 1, .bulk_ed_count = 1,
+        .interrupt_ed_count = 1, .isoc_ed_count = 1, .itd_pool_size = 8,
+    };
+    if (ohci_hc_init(&hc, &ops, &dma, &hcfg) != 0) FAIL("hc_init");
+
+    struct ohci_isoc_endpoint ep;
+    struct ohci_isoc_endpoint_config cfg = {
+        .func_addr = 1, .ep_num = 1, .direction = OHCI_URB_DIR_OUT,
+        .low_speed = 0, .max_packet_size = 64,
+    };
+    if (ohci_isoc_endpoint_create(&hc, &cfg, &ep) != 0) FAIL("ep create");
+
+    struct ohci_urb urb; memset(&urb, 0, sizeof(urb));
+    uint16_t lens[1] = {0};
+    if (ohci_isoc_submit_window(&hc, &ep, &urb, 50, 1, lens, 0xB0001000u, 0) != -1)
+        FAIL("buf_len=0 should be rejected");
+
+    ohci_isoc_endpoint_destroy(&hc, &ep);
+    return 0;
+}
+
 static int run_pool_exhaustion(void) {
     /* itd_pool_size = 4: endpoint create consumes 1 placeholder, leaving 3.
      * Each submit nets +1 (alloc data + new_ph, free data, promote placeholder).
@@ -269,6 +299,7 @@ int main(void) {
     if (run_two_page_straddle_reject()) return 1;
     if (run_pkt_count_bounds())         return 1;
     if (run_two_consecutive())          return 1;
+    if (run_zero_buf_len())             return 1;
     if (run_pool_exhaustion())          return 1;
     printf("PASS: ohci_isoc_submit_window\n");
     return 0;

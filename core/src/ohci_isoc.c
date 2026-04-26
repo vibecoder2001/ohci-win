@@ -126,6 +126,7 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
                             uint32_t buf_len)
 {
     if (pkt_count == 0 || pkt_count > 8) return -1;
+    if (buf_len == 0) return -1;
 
     /* OHCI §4.3.2: BP0 = top 20 bits of buf_phys; the buffer may cross at
      * most one 4 KB page boundary (BP0 + 0x1000). Reject anything else;
@@ -185,6 +186,13 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
     urb->ed             = ep->ed;
     urb->status         = OHCI_URB_STATUS_PENDING;
     urb->transferred    = 0;
+    urb->buffer         = NULL;          /* per-packet phys is in the ITD itself */
+    urb->buffer_phys    = buf_phys;
+    urb->length         = buf_len;
+    urb->direction      = ep->direction;
+    /* The pointer at head_phys is actually an ohci_itd, not an ohci_td.
+     * Drain MUST dispatch on urb->is_isoc (or ed->Control & OHCI_ED_F)
+     * before dereferencing — never reinterpret without checking. */
     urb->head_td        = (struct ohci_td *)ohci_dma_virt_from_phys(hc->dma, head_phys);
     urb->tail_td        = urb->head_td;
     urb->data_tds[0].td_phys   = head_phys;
