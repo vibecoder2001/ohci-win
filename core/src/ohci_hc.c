@@ -76,9 +76,21 @@ int ohci_hc_init(struct ohci_hc *hc,
     if (ohci_ed_pool_init(&hc->bulk_ed_pool,      dma, cfg->bulk_ed_count)      != 0) return OHCI_ERR_NOMEM;
     if (ohci_ed_pool_init(&hc->interrupt_ed_pool, dma, cfg->interrupt_ed_count) != 0) return OHCI_ERR_NOMEM;
 
+    /* Isoch pools are optional — existing tests use zero-init configs and
+     * shouldn't fail to init just because they don't drive isoch. */
+    if (cfg->isoc_ed_count > 0) {
+        if (ohci_ed_pool_init(&hc->isoc_ed_pool, dma, cfg->isoc_ed_count) != 0)
+            return OHCI_ERR_NOMEM;
+    }
+    if (cfg->itd_pool_size > 0) {
+        if (ohci_itd_pool_init(&hc->itd_pool, dma, cfg->itd_pool_size) != 0)
+            return OHCI_ERR_NOMEM;
+    }
+
     hc->control_head   = NULL;
     hc->bulk_head      = NULL;
     hc->interrupt_head = NULL;
+    hc->isoc_head      = NULL;
     hc->in_flight      = NULL;
 
     /* 1) Reset. */

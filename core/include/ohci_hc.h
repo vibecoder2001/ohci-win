@@ -14,6 +14,7 @@ extern "C" {
 struct ohci_control_endpoint;
 struct ohci_bulk_endpoint;
 struct ohci_interrupt_endpoint;
+struct ohci_isoc_endpoint;
 struct ohci_urb;
 
 /* Capacity parameters for the HC's statically-sized internal pools. */
@@ -22,6 +23,8 @@ struct ohci_hc_config {
     uint16_t control_ed_count;
     uint16_t bulk_ed_count;
     uint16_t interrupt_ed_count;
+    uint16_t isoc_ed_count;
+    uint16_t itd_pool_size;
 };
 
 /* Software state for one OHCI controller. Zero-initialised by ohci_hc_init. */
@@ -37,6 +40,8 @@ struct ohci_hc {
     struct ohci_ed_pool     control_ed_pool;
     struct ohci_ed_pool     bulk_ed_pool;
     struct ohci_ed_pool     interrupt_ed_pool;
+    struct ohci_ed_pool     isoc_ed_pool;
+    struct ohci_itd_pool    itd_pool;
 
     /* Interrupt skeleton (Task 5 populates; zero-initialised for now). */
     struct ohci_ed         *interrupt_skeleton[63];
@@ -45,6 +50,7 @@ struct ohci_hc {
     struct ohci_control_endpoint   *control_head;
     struct ohci_bulk_endpoint      *bulk_head;
     struct ohci_interrupt_endpoint *interrupt_head;
+    struct ohci_isoc_endpoint      *isoc_head;
 
     struct ohci_urb        *in_flight;
 };

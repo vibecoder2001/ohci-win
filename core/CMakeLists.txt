@@ -7,5 +7,6 @@ add_library(ohci_core STATIC
   src/ohci_drain.c
   src/ohci_bulk.c
   src/ohci_interrupt.c
+  src/ohci_isoc.c
 )
 target_include_directories(ohci_core PUBLIC include)

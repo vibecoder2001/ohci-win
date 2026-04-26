@@ -81,3 +81,7 @@ add_test(NAME multi_endpoint_e2e COMMAND test_multi_endpoint_e2e)
 add_executable(test_itd_pool test_itd_pool.c)
 target_link_libraries(test_itd_pool PRIVATE ohci_core)
 add_test(NAME itd_pool COMMAND test_itd_pool)
+
+add_executable(test_isoc_endpoint test_isoc_endpoint.c)
+target_link_libraries(test_isoc_endpoint PRIVATE fake_hc)
+add_test(NAME isoc_endpoint COMMAND test_isoc_endpoint)

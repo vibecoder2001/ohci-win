@@ -153,6 +153,8 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
         .control_ed_count   = 16,
         .bulk_ed_count      = 16,
         .interrupt_ed_count = 16,
+        .isoc_ed_count      = 4,
+        .itd_pool_size      = 32,
     };
     int rc = ohci_hc_init(&dc->Hc, &dc->MmioOps, &dc->DmaRegion, &hccfg);
     LOG("ohci_hc_init -> %d", rc);
