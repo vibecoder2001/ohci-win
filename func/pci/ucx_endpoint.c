@@ -188,6 +188,8 @@ OhciPci_UrbComplete(struct ohci_urb *u)
      * txn/MDL teardown + deferred-completion path. Hdr.Status stays
      * USBD_STATUS_SUCCESS — per-packet detail lives in IsoPacket[]. */
     if (u->is_isoc) {
+        LOG("UrbComplete[isoc]: transferred=%u pkts_filled=%u/%u status=%d",
+            u->transferred, u->isoc_pkts_filled, u->isoc_pkt_count, u->status);
         POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
         ULONG totalErr = 0;
         if (turb != NULL) {
@@ -698,6 +700,7 @@ OhciPci_IsocProgramDma(
     PDEVICE_CONTEXT       dc   = ep->Dc;
     POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
 
+    LOG("IsocProgramDma: ENTER nElems=%lu", SgList->NumberOfElements);
     if (SgList->NumberOfElements == 0) {
         LOG("IsocProgramDma: empty SG list");
         OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
@@ -840,6 +843,8 @@ OhciPci_IsocProgramDma(
              * early-return. */
             uc->CoreUrb.isoc_pkt_count = (uint8_t)nPkts;
         }
+        LOG("IsocProgramDma: window sf=%u count=%u winPhys=0x%08X winLen=%lu rc=%d",
+            sf, windowCount, winPhys, winLen, rc);
         sf  = (uint16_t)(sf + windowCount);
         i  += windowCount;
         firstWindow = 0;
@@ -971,12 +976,19 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
         }
         WdfSpinLockRelease(ep->IsocQueueLock);
 
-        if (uc == NULL) break;
+        if (uc == NULL) {
+            LOG("IsocRefillOne: queue empty, lead=%d primed=%u — exiting URB loop",
+                (int)lead, ie->primed);
+            break;
+        }
+        LOG("IsocRefillOne: pulled URB, calling Execute (primed=%u lead=%d)",
+            ie->primed, (int)lead);
 
         /* Execute fires IsocProgramDma synchronously (HAL invokes inline
          * on x86); CoreLock stays held across the call. On failure
          * IsocProgramDma's helper stages a deferred completion. */
         NTSTATUS s = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
+        LOG("IsocRefillOne: Execute returned 0x%08X", s);
         if (!NT_SUCCESS(s)) {
             LOG("IsocRefill: WdfDmaTransactionExecute failed 0x%08X", s);
             NTSTATUS dmaSt;
@@ -1041,14 +1053,20 @@ OhciPci_IsocRefillAll_Locked(PDEVICE_CONTEXT dc)
     /* CoreLock must be held by the caller (EvtDpc, IsocBackstopTimer, or
      * HandleIsocUrb's queue-then-refill path). IsocEpsLock is acquired
      * second; no path takes both in the opposite order. */
-    if (dc->IsocEpsLock == NULL) return;  /* not set up yet */
+    if (dc->IsocEpsLock == NULL) {
+        LOG("IsocRefillAll: IsocEpsLock NULL — refill disabled");
+        return;
+    }
     WdfSpinLockAcquire(dc->IsocEpsLock);
     PLIST_ENTRY e;
+    ULONG nEps = 0;
     for (e = dc->IsocEps.Flink; e != &dc->IsocEps; e = e->Flink) {
+        nEps++;
         POHCIPCI_EP_CONTEXT ep =
             CONTAINING_RECORD(e, OHCIPCI_EP_CONTEXT, IsocEpEntry);
         OhciPci_IsocRefillOne_Locked(ep);
     }
+    LOG("IsocRefillAll: walked %lu EP(s)", nEps);
     WdfSpinLockRelease(dc->IsocEpsLock);
 }
 
@@ -1186,9 +1204,11 @@ OhciPci_HandleIsocUrb(
     WdfSpinLockAcquire(ep->IsocQueueLock);
     InsertTailList(&ep->IsocQueuedUrbs, &uc->QueueEntry);
     WdfSpinLockRelease(ep->IsocQueueLock);
+    LOG("HandleIsocUrb: queued; triggering refill");
 
     WdfSpinLockAcquire(dc->CoreLock);
     OhciPci_IsocRefillAll_Locked(dc);
+    LOG("HandleIsocUrb: refill returned; draining DeferredCompletions");
     /* Drain any deferred completions/failures the synchronous Execute may
      * have staged, mirroring EvtDpc's pattern. */
     LIST_ENTRY local;
