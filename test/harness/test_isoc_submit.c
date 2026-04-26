@@ -54,10 +54,14 @@ static int run_basic_submit(void) {
     if (fc != 3)   FAIL("FC=%u expected 3", fc);
     if (itd->BP0 != 0xB0001000u) FAIL("BP0=0x%08x", itd->BP0);
     if (itd->BE  != 0xB0001000u + buf_len - 1) FAIL("BE=0x%08x", itd->BE);
-    if (itd->PSW[0] != 0)   FAIL("PSW[0]=%u", itd->PSW[0]);
-    if (itd->PSW[1] != 192) FAIL("PSW[1]=%u", itd->PSW[1]);
-    if (itd->PSW[2] != 384) FAIL("PSW[2]=%u", itd->PSW[2]);
-    if (itd->PSW[3] != 576) FAIL("PSW[3]=%u", itd->PSW[3]);
+    /* PSW[i] = (NotAccessed << 12) | offset[12:0]. Initial CC must be
+     * NotAccessed per OHCI 1.0a §4.3.2.2 — the HC checks PSW.CC before
+     * sending and skips packets that already have a non-NotAccessed CC. */
+    uint16_t na = (uint16_t)(OHCI_CC_NOTACCESSED << OHCI_PSW_CC_SHIFT);
+    if (itd->PSW[0] != (na | 0))   FAIL("PSW[0]=0x%x", itd->PSW[0]);
+    if (itd->PSW[1] != (na | 192)) FAIL("PSW[1]=0x%x", itd->PSW[1]);
+    if (itd->PSW[2] != (na | 384)) FAIL("PSW[2]=0x%x", itd->PSW[2]);
+    if (itd->PSW[3] != (na | 576)) FAIL("PSW[3]=0x%x", itd->PSW[3]);
     for (int i = 4; i < 8; i++)
         if (itd->PSW[i] != 0) FAIL("PSW[%d]=%u expected 0", i, itd->PSW[i]);
 
@@ -103,7 +107,9 @@ static int run_page_straddle_accept(void) {
     struct ohci_itd *itd = (struct ohci_itd *)ohci_dma_virt_from_phys(&dma, urb.data_tds[0].td_phys);
     if (itd->BP0 != 0xB0001000u) FAIL("BP0=0x%08x expected 0xB0001000", itd->BP0);
     if (itd->BE  != 0xB000200Fu) FAIL("BE=0x%08x expected 0xB000200F", itd->BE);
-    if (itd->PSW[0] != 0xFF0)    FAIL("PSW[0]=0x%x expected 0xFF0", itd->PSW[0]);
+    if (itd->PSW[0] != ((OHCI_CC_NOTACCESSED << OHCI_PSW_CC_SHIFT) | 0xFF0))
+        FAIL("PSW[0]=0x%x expected 0x%x", itd->PSW[0],
+             (OHCI_CC_NOTACCESSED << OHCI_PSW_CC_SHIFT) | 0xFF0);
 
     ohci_isoc_endpoint_destroy(&hc, &ep);
     return 0;

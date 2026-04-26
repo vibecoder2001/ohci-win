@@ -188,8 +188,6 @@ OhciPci_UrbComplete(struct ohci_urb *u)
      * txn/MDL teardown + deferred-completion path. Hdr.Status stays
      * USBD_STATUS_SUCCESS — per-packet detail lives in IsoPacket[]. */
     if (u->is_isoc) {
-        LOG("UrbComplete[isoc]: transferred=%u pkts_filled=%u/%u status=%d",
-            u->transferred, u->isoc_pkts_filled, u->isoc_pkt_count, u->status);
         POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
         ULONG totalErr = 0;
         if (turb != NULL) {
@@ -210,10 +208,11 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                                     ? turb->u.Isoch.IsoPacket[i+1].Offset
                                     : urbLen;
                     pktLen = (pktEnd >= pktOff) ? (pktEnd - pktOff) : 0;
-                    if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
-                        u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
-                        pktLen = 0;
-                    }
+                    /* Don't zero pktLen on junk cc — PSW.CC is undefined
+                     * for OUT (§4.3.2.4). usbaudio.sys advances its
+                     * playback cursor by IsoPacket[i].Length, so reporting
+                     * zero stalls the stream even though the bytes were
+                     * actually shipped. */
                 } else {
                     pktLen = u->isoc_pkts[i].length;
                 }
@@ -239,13 +238,30 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                 }
                 turb->u.Isoch.IsoPacket[i].Status = pktStatus;
                 totalLen += pktLen;
-                if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
-                    u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
+                /* Match per-packet Status: only count real hard errors,
+                 * and for OUT only when the cc is unambiguously fatal.
+                 * Otherwise junk OUT cc inflates ErrorCount and trips
+                 * usbaudio's per-URB error threshold. */
+                if (pktStatus != USBD_STATUS_SUCCESS) {
                     totalErr++;
                 }
             }
             turb->u.Isoch.ErrorCount   = totalErr;
             turb->TransferBufferLength = totalLen;
+            {
+                static ULONG s_isocCompletes = 0;
+                ULONG n = ++s_isocCompletes;
+                if (n <= 8 || (n & 0x1F) == 0) {
+                    LOG("isoc[%lu] dir=%s urbLen=%lu totalLen=%lu err=%lu nPkts=%lu "
+                        "cc=%u %u %u %u %u %u %u %u %u %u",
+                        n, isOut ? "OUT" : "IN", urbLen, totalLen, totalErr, nPkts,
+                        u->isoc_pkts[0].cc, u->isoc_pkts[1].cc,
+                        u->isoc_pkts[2].cc, u->isoc_pkts[3].cc,
+                        u->isoc_pkts[4].cc, u->isoc_pkts[5].cc,
+                        u->isoc_pkts[6].cc, u->isoc_pkts[7].cc,
+                        u->isoc_pkts[8].cc, u->isoc_pkts[9].cc);
+                }
+            }
             turb->Hdr.Status           = USBD_STATUS_SUCCESS;
         }
         if (uc->DmaTransaction) {
@@ -284,24 +300,26 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         }
     }
 
-    NTSTATUS status = (u->status == OHCI_URB_STATUS_OK && !copyBackFailed)
-                          ? STATUS_SUCCESS
-                          : STATUS_DEVICE_DATA_ERROR;
-    ULONG_PTR info = (ULONG_PTR)u->transferred;
-    LOG("UrbComplete: core_status=%d transferred=%u dir=%u",
-        u->status, u->transferred, uc->DataDirection);
-    if (u->ed != NULL) {
-        LOG("  ED-done: Ctrl=0x%08X HeadP=0x%08X TailP=0x%08X",
-            u->ed->Control, u->ed->HeadP, u->ed->TailP);
+    /* For isoch, per-packet IsoPacket[i].Status is the source of truth
+     * (audio-class drivers aggregate it themselves and the URB-level
+     * status is widely ignored). PSW.CC is undefined for OUT per OHCI
+     * §4.3.2.4 and qemu writes garbage that flips du->status to OVERRUN
+     * even on a perfectly-shipped audio frame. Mapping that to
+     * STATUS_DEVICE_DATA_ERROR makes usbaudio drop the URB without
+     * advancing its playback cursor → permanent silence. Always report
+     * SUCCESS at the WdfRequest level for isoch. */
+    NTSTATUS status;
+    if (u->is_isoc) {
+        status = STATUS_SUCCESS;
+    } else {
+        status = (u->status == OHCI_URB_STATUS_OK && !copyBackFailed)
+                     ? STATUS_SUCCESS
+                     : STATUS_DEVICE_DATA_ERROR;
     }
-    if (u->head_td != NULL) {
-        struct ohci_td *td = u->head_td;
-        uint32_t ctrl = td->Control;
-        uint32_t cc   = (ctrl >> 28) & 0xF;
-        uint32_t ec   = (ctrl >> 26) & 0x3;
-        uint32_t tval = (ctrl >> 24) & 0x3;
-        LOG("  TD-done: Ctrl=0x%08X CC=%u EC=%u T=%u CBP=0x%08X BE=0x%08X",
-            ctrl, cc, ec, tval, td->CBP, td->BE);
+    ULONG_PTR info = (ULONG_PTR)u->transferred;
+    if (u->status != OHCI_URB_STATUS_OK) {
+        LOG("UrbComplete: core_status=%d transferred=%u dir=%u",
+            u->status, u->transferred, uc->DataDirection);
     }
 
     /* Write the result back into the TRANSFER_URB. UCX reads
@@ -610,8 +628,6 @@ OhciPci_HandleInterruptUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
-    LOG("EvtUrbInt: len=%lu dir=%s", length, isIn ? "IN" : "OUT");
-
     if (length == 0 || length > OHCIPCI_BOUNCE_SLAB_BYTES) {
         urb->TransferBufferLength = 0;
         urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
@@ -741,12 +757,44 @@ OhciPci_IsocProgramDma(
     PDEVICE_CONTEXT       dc   = ep->Dc;
     POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
 
-    LOG("IsocProgramDma: ENTER nElems=%lu", SgList->NumberOfElements);
     if (SgList->NumberOfElements == 0) {
         LOG("IsocProgramDma: empty SG list");
         OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
         return TRUE;
     }
+
+    /* DIAG: peek at the first 16 bytes of the URB's user buffer (NOT the
+     * bounce — MmGetVirtualForPhysical isn't safe at DISPATCH). usbaudio's
+     * PCM stream is signed 16-bit LE; pure silence is all zeros, real
+     * audio shows varying byte values. The URB has either a flat KVA
+     * (uc->UserVa, populated in HandleIsocUrb from urb->TransferBuffer)
+     * or an MDL (uc->UserMdl). Both are safe to read at DISPATCH if the
+     * MDL was already mapped or VA was non-paged. Use MmGetSystemAddress
+     * ForMdlSafe with NormalPagePriority — returns NULL if mapping
+     * would fault rather than crashing. */
+    {
+        static ULONG s_dmaCalls = 0;
+        ULONG n = ++s_dmaCalls;
+        if (n <= 8 || (n <= 256 && (n & 0x1F) == 0)) {
+            PUCHAR ua = NULL;
+            if (uc->UserMdl) {
+                ua = (PUCHAR)MmGetSystemAddressForMdlSafe(uc->UserMdl,
+                                                          NormalPagePriority);
+            } else if (uc->UserVa) {
+                ua = (PUCHAR)uc->UserVa;
+            }
+            if (ua != NULL) {
+                LOG("isoc-data[%lu] urbVA=%p len=%lu bytes=%02X %02X %02X %02X "
+                    "%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                    n, ua, SgList->Elements[0].Length,
+                    ua[0], ua[1], ua[2], ua[3], ua[4], ua[5], ua[6], ua[7],
+                    ua[8], ua[9], ua[10], ua[11], ua[12], ua[13], ua[14], ua[15]);
+            } else {
+                LOG("isoc-data[%lu] (no safe user VA available)", n);
+            }
+        }
+    }
+
 
     ULONG nPkts = turb->u.Isoch.NumberOfPackets;
     if (nPkts == 0) {
@@ -858,10 +906,24 @@ OhciPci_IsocProgramDma(
      * refill loop, which itself runs under CoreLock. */
     struct ohci_isoc_endpoint *ie = &ep->Core.Isoc;
     uint16_t sf;
+    uint16_t fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
     if (ie->primed) {
-        sf = ie->ed_tail_frame;
+        SHORT lead = (SHORT)(ie->ed_tail_frame - fmNumber);
+        if (lead > 0) {
+            /* Healthy: queue our packets right after the current tail. */
+            sf = ie->ed_tail_frame;
+        } else {
+            /* Underrun: usbaudio's submit cadence fell behind real-time
+             * (or this is a stream resume after pause) and ed_tail_frame
+             * is now in the past. If we used it as-is, every packet would
+             * land in HC's MissedFrame window — qemu silently drops them
+             * and audio renders as silence. Snap forward to "now plus a
+             * small lookahead" so the URB actually plays. The brief gap
+             * the HC walked while we were stalled is just dead air on the
+             * wire (no packets transmitted) — silently silent, no click. */
+            sf = (uint16_t)((fmNumber + OHCIPCI_ISOC_PRIME_LOOKAHEAD) & 0xFFFFu);
+        }
     } else {
-        uint32_t fmNumber = dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu;
         /* +OHCIPCI_ISOC_PRIME_LOOKAHEAD frame lookahead so the HC starts
          * a few ms in the future. After prime, the refill DPC keeps the
          * lead at OHCIPCI_ISOC_REFILL_HIGH frames. */
@@ -914,8 +976,6 @@ OhciPci_IsocProgramDma(
              * early-return. */
             uc->CoreUrb.isoc_pkt_count = (uint8_t)nPkts;
         }
-        LOG("IsocProgramDma: window sf=%u count=%u winPhys=0x%08X winLen=%lu rc=%d",
-            sf, windowCount, winPhys, winLen, rc);
         sf  = (uint16_t)(sf + windowCount);
         i  += windowCount;
         firstWindow = 0;
@@ -1048,22 +1108,21 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
         WdfSpinLockRelease(ep->IsocQueueLock);
 
         if (uc == NULL) {
-            LOG("IsocRefillOne: queue empty, lead=%d primed=%u — exiting URB loop",
-                (int)lead, ie->primed);
             break;
         }
-        LOG("IsocRefillOne: pulled URB, calling Execute (primed=%u lead=%d)",
-            ie->primed, (int)lead);
 
         /* Execute fires IsocProgramDma synchronously (HAL invokes inline
          * on x86); CoreLock stays held across the call. On failure
          * IsocProgramDma's helper stages a deferred completion. */
         NTSTATUS s = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
-        LOG("IsocRefillOne: Execute returned 0x%08X", s);
         if (!NT_SUCCESS(s)) {
             LOG("IsocRefill: WdfDmaTransactionExecute failed 0x%08X", s);
-            NTSTATUS dmaSt;
-            (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction, 0, &dmaSt);
+            /* Don't call WdfDmaTransactionDmaCompletedFinal here. Per
+             * KMDF docs CompletedFinal is only valid in Transferring
+             * state; if Execute failed the txn never reached that state
+             * and CompletedFinal triggers WDF_VIOLATION 0x10D sub-code 8
+             * ("DMA transaction in wrong state"). Just delete the txn —
+             * any HAL resources it allocated get released by the delete. */
             WdfObjectDelete(uc->DmaTransaction);
             uc->DmaTransaction = NULL;
             if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
@@ -1076,55 +1135,15 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
         fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
     }
 
-    /* Silence-pad ONLY when the chain has truly underrun (lead <= 0).
-     * Eagerly emitting silence to fill up to OHCIPCI_ISOC_REFILL_HIGH
-     * inserts ~24 frames of zero-data between every caller URB while
-     * usbaudio is preparing the next one — which on a 10ms-URB cadence
-     * means the device receives 10ms of audio + 24ms of silence + 10ms
-     * audio + 24ms silence, breaking the audio stream. usbaudio expects
-     * back-to-back frames; we should only emit silence when the HC has
-     * literally caught up to ed_tail_frame and would otherwise dispatch
-     * dead air. */
-    if (!ie->primed || ep->IsocSilenceVa == NULL) return;
-
-    /* Read MPS from the ED control word; clamp to packet-count budget. */
-    uint16_t mps = (uint16_t)((ie->ed->Control >> OHCI_ED_MPS_SHIFT) & 0x7FFu);
-    if (mps == 0) mps = 192;
-    /* Cap mps so 8 packets fit in the silence page (enforced by
-     * submit_silence's BP0/BP0+0x1000 window check, but better to clamp
-     * here than fail in a tight loop). PAGE_SIZE/8 = 512 bytes. */
-    if (mps > PAGE_SIZE / 8) mps = PAGE_SIZE / 8;
-
-    ULONG silenceEmitted = 0;
-    while (1) {
-        SHORT lead = (SHORT)(ie->ed_tail_frame - fmNumber);
-        /* Only emit silence on genuine underrun: lead <= 0 means HC has
-         * reached or passed ed_tail_frame and would walk dead schedule
-         * slots without help. */
-        if (lead > 0) break;
-
-        /* Cap silence emissions per refill call so a far-behind caller
-         * stall can't drain the ITD pool in a single tick. The next
-         * refill (DPC after the WDH drain, or 1 ms backstop timer)
-         * continues catching up. */
-        if (silenceEmitted >= OHCIPCI_ISOC_SILENCE_BURST_MAX) break;
-
-        uint16_t lens[8];
-        for (uint8_t k = 0; k < 8; k++) lens[k] = mps;
-        int rc = ohci_isoc_submit_silence_window(&dc->Hc, ie,
-                                                  ie->ed_tail_frame, 8, lens,
-                                                  ep->IsocSilencePhys,
-                                                  (uint32_t)8u * mps);
-        if (rc != 0) {
-            /* ITD pool exhausted or window failed — back off, retry next tick. */
-            break;
-        }
-        ep->IsocSilenceItdCount++;
-        silenceEmitted++;
-        /* Don't refresh fmNumber here: silence_window is a few writes,
-         * frame counter unlikely to advance. The lead recompute uses the
-         * updated ed_tail_frame to terminate. */
-    }
+    /* Don't emit silence ITDs at all. Earlier "silence-on-underrun" logic
+     * stretched ed_tail_frame 8 frames forward whenever lead<=0, which
+     * snowballed the per-URB cadence from 10ms to ~18ms (10ms audio +
+     * 8ms padded silence) and caused qemu's audio FIFO to perpetually
+     * starve — audible as total silence at the host. Fix: when a real
+     * URB arrives after the chain has stalled, IsocProgramDma above
+     * snaps sf to (fmNumber + lookahead) so it plays now, not 8ms late.
+     * Walking dead chain in the gap is harmless (HC sends nothing). */
+    (void)fmNumber;
 }
 
 VOID
@@ -1146,7 +1165,7 @@ OhciPci_IsocRefillAll_Locked(PDEVICE_CONTEXT dc)
             CONTAINING_RECORD(e, OHCIPCI_EP_CONTEXT, IsocEpEntry);
         OhciPci_IsocRefillOne_Locked(ep);
     }
-    LOG("IsocRefillAll: walked %lu EP(s)", nEps);
+    UNREFERENCED_PARAMETER(nEps);
     WdfSpinLockRelease(dc->IsocEpsLock);
 }
 
@@ -1192,8 +1211,14 @@ OhciPci_HandleIsocUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
-    LOG("EvtUrbIsoc: len=%lu nPkts=%lu dir=%s",
-        length, urb->u.Isoch.NumberOfPackets, isIn ? "IN" : "OUT");
+    {
+        static ULONG s_isocSubmits = 0;
+        ULONG n = ++s_isocSubmits;
+        if (n <= 8 || (n & 0x1F) == 0) {
+            LOG("isoc-submit[%lu] len=%lu nPkts=%lu dir=%s",
+                n, length, urb->u.Isoch.NumberOfPackets, isIn ? "IN" : "OUT");
+        }
+    }
 
     if (length == 0 || urb->u.Isoch.NumberOfPackets == 0) {
         urb->TransferBufferLength = 0;
@@ -1243,6 +1268,8 @@ OhciPci_HandleIsocUrb(
     uc->DataLength    = length;
     uc->DataDirection = isIn ? OHCI_URB_DIR_IN : OHCI_URB_DIR_OUT;
     uc->OurMdl        = ourMdl;
+    uc->UserMdl       = bufMdl;       /* may be ourMdl if caller had no MDL */
+    uc->UserVa        = bufVa;
 
     WDF_OBJECT_ATTRIBUTES txnAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT(&txnAttrs);
@@ -1289,11 +1316,9 @@ OhciPci_HandleIsocUrb(
     WdfSpinLockAcquire(ep->IsocQueueLock);
     InsertTailList(&ep->IsocQueuedUrbs, &uc->QueueEntry);
     WdfSpinLockRelease(ep->IsocQueueLock);
-    LOG("HandleIsocUrb: queued; triggering refill");
 
     WdfSpinLockAcquire(dc->CoreLock);
     OhciPci_IsocRefillAll_Locked(dc);
-    LOG("HandleIsocUrb: refill returned; draining DeferredCompletions");
     /* Drain any deferred completions/failures the synchronous Execute may
      * have staged, mirroring EvtDpc's pattern. */
     LIST_ENTRY local;
@@ -1997,7 +2022,21 @@ OhciPci_EndpointAdd(
     ep->Dc    = g_DeviceContext;
     ep->UcxEp = ucxEp;
 
-    /* 3. Per-EP WDFQUEUE (same recipe as default EP). */
+    /* 3. Per-EP WDFQUEUE. Sequential dispatch for all kinds.
+     *
+     * Tried Parallel for Isoch to let usbaudio pipeline 2-3 URBs ahead
+     * (would fix the ~50% playback-speed distortion caused by the strict
+     * 1:1 submit/complete cadence Sequential forces). It crashed with
+     * WDF_VIOLATION 0x10D sub-code 8 ("DMA transaction in wrong state")
+     * because our isoch DMA enabler uses WdfDmaProfilePacket — single
+     * channel, only one Execute outstanding. The 2nd concurrent
+     * HandleIsocUrb's WdfDmaTransactionExecute fails, the fail-path
+     * calls CompletedFinal on a transaction that never reached
+     * Transferring state, and KMDF bug-checks. Sticking with Sequential
+     * keeps the driver alive and audible. Pipelining + faster cadence is
+     * a follow-up: needs either a ScatterGather DMA enabler with the
+     * page-straddle handling, or bypassing WdfDmaTransaction entirely
+     * and walking the MDL ourselves. */
     WDF_IO_QUEUE_CONFIG qCfg;
     WDF_IO_QUEUE_CONFIG_INIT(&qCfg, WdfIoQueueDispatchSequential);
     qCfg.EvtIoDefault = EvtUrbDefault;

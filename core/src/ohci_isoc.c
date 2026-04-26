@@ -155,11 +155,18 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
     data->BE     = last;
     data->NextTD = 0;
 
-    /* Per-packet PSW: in = byte offset[12:0] from BP0. HW resolves the
-     * BP0/BP0+0x1000 page selection from bit 12 of the offset (§4.3.2.2). */
+    /* Per-packet PSW: bits[12:0] = byte offset from BP0 (HW selects BP0
+     * vs BP0+0x1000 from bit 12 per §4.3.2.2); bits[15:12] = CC, which
+     * software MUST initialize to NotAccessed (§4.3.2.2). qemu — and
+     * presumably real HCs — check CC == NotAccessed before sending the
+     * packet; if it's any other value the HC assumes "already processed"
+     * and skips, leaving stale CC for that frame and the device never
+     * receives the data. Symptom: only packet 0 of an 8-packet ITD goes
+     * out; 1..7 retire with whatever value we left in CC. */
     uint32_t off = buf_phys - bp0;
     for (uint8_t i = 0; i < pkt_count; i++) {
-        data->PSW[i] = (uint16_t)(off & 0x1FFFu);
+        data->PSW[i] = (uint16_t)((off & 0x1FFFu)
+                                  | ((uint32_t)OHCI_CC_NOTACCESSED << OHCI_PSW_CC_SHIFT));
         off += pkt_lens[i];
     }
     for (uint8_t i = pkt_count; i < 8; i++) data->PSW[i] = 0;
@@ -272,7 +279,8 @@ int ohci_isoc_submit_silence_window(struct ohci_hc *hc,
 
     uint32_t off = buf_phys - bp0;
     for (uint8_t i = 0; i < pkt_count; i++) {
-        data->PSW[i] = (uint16_t)(off & 0x1FFFu);
+        data->PSW[i] = (uint16_t)((off & 0x1FFFu)
+                                  | ((uint32_t)OHCI_CC_NOTACCESSED << OHCI_PSW_CC_SHIFT));
         off += pkt_lens[i];
     }
     for (uint8_t i = pkt_count; i < 8; i++) data->PSW[i] = 0;
