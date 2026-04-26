@@ -195,16 +195,38 @@ OhciPci_UrbComplete(struct ohci_urb *u)
         if (turb != NULL) {
             ULONG nPkts = turb->u.Isoch.NumberOfPackets;
             if (nPkts > u->isoc_pkt_count) nPkts = u->isoc_pkt_count;
+            BOOLEAN isOut = (uc->DataDirection == OHCI_URB_DIR_OUT);
+            ULONG urbLen = turb->TransferBufferLength;
+            ULONG totalLen = 0;
             for (ULONG i = 0; i < nPkts; i++) {
-                turb->u.Isoch.IsoPacket[i].Length = u->isoc_pkts[i].length;
+                /* PSW.Size is only defined for IN per OHCI 1.0a §4.3.2.4
+                 * — for OUT, qemu (and many real HCs) write garbage there.
+                 * Reconstruct the per-packet bytes-transferred from the
+                 * IsoPacket descriptor for OUT, trust the PSW for IN. */
+                ULONG pktLen;
+                if (isOut) {
+                    ULONG pktOff = turb->u.Isoch.IsoPacket[i].Offset;
+                    ULONG pktEnd = (i + 1 < nPkts)
+                                    ? turb->u.Isoch.IsoPacket[i+1].Offset
+                                    : urbLen;
+                    pktLen = (pktEnd >= pktOff) ? (pktEnd - pktOff) : 0;
+                    if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
+                        u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
+                        pktLen = 0;
+                    }
+                } else {
+                    pktLen = u->isoc_pkts[i].length;
+                }
+                turb->u.Isoch.IsoPacket[i].Length = pktLen;
                 turb->u.Isoch.IsoPacket[i].Status = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                totalLen += pktLen;
                 if (u->isoc_pkts[i].cc != OHCI_CC_NOERROR &&
                     u->isoc_pkts[i].cc != OHCI_CC_DATAUNDERRUN) {
                     totalErr++;
                 }
             }
             turb->u.Isoch.ErrorCount   = totalErr;
-            turb->TransferBufferLength = u->transferred;
+            turb->TransferBufferLength = totalLen;
             turb->Hdr.Status           = USBD_STATUS_SUCCESS;
         }
         if (uc->DmaTransaction) {
@@ -724,9 +746,38 @@ OhciPci_IsocProgramDma(
     typedef struct { uint32_t phys; uint16_t len; } isoc_pkt_t;
     isoc_pkt_t pkt[OHCI_URB_MAX_ISOC_PACKETS];
 
+    /* Coalesce physically-contiguous SG elements. HAL frequently splits a
+     * single contiguous run at page boundaries for SG bookkeeping (e.g.,
+     * a 1920-byte buffer crossing one page boundary comes back as 2
+     * elements like 736+1184 even though the physical bytes are adjacent).
+     * Without coalescing, any per-packet that spans the reported boundary
+     * gets falsely rejected as "spans SG elements" — which on a UAC1
+     * audio stream triggers usbaudio.sys EP abort/restart on every other
+     * URB, killing the stream. */
+    typedef struct { uint32_t phys; uint32_t length; } isoc_sg_t;
+    isoc_sg_t sg[OHCI_URB_MAX_ISOC_PACKETS + 1];   /* worst case 1 elem per pkt */
+    ULONG sgN = 0;
+    for (ULONG i = 0; i < SgList->NumberOfElements; i++) {
+        uint32_t base = SgList->Elements[i].Address.LowPart;
+        ULONG    len  = SgList->Elements[i].Length;
+        if (sgN > 0 && sg[sgN - 1].phys + sg[sgN - 1].length == base) {
+            sg[sgN - 1].length += len;
+        } else {
+            if (sgN >= sizeof(sg)/sizeof(sg[0])) {
+                LOG("IsocProgramDma: SG count %lu exceeds coalesce cap",
+                    SgList->NumberOfElements);
+                OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
+                return TRUE;
+            }
+            sg[sgN].phys   = base;
+            sg[sgN].length = len;
+            sgN++;
+        }
+    }
+
     ULONG urbLen   = turb->TransferBufferLength;
     ULONG sgIdx    = 0;
-    ULONG sgConsumed = 0;     /* bytes already mapped in current SG element */
+    ULONG sgConsumed = 0;     /* bytes already mapped in current coalesced element */
     ULONG cursorOff  = 0;     /* URB-buffer offset of sgIdx start */
 
     for (ULONG i = 0; i < nPkts; i++) {
@@ -748,32 +799,33 @@ OhciPci_IsocProgramDma(
             OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
             return TRUE;
         }
-        /* Advance SG cursor until pktOff falls inside the current element. */
-        while (sgIdx < SgList->NumberOfElements &&
-               cursorOff + (SgList->Elements[sgIdx].Length - sgConsumed) <= pktOff)
+        /* Advance SG cursor until pktOff falls inside the current
+         * coalesced element. */
+        while (sgIdx < sgN &&
+               cursorOff + (sg[sgIdx].length - sgConsumed) <= pktOff)
         {
-            cursorOff += SgList->Elements[sgIdx].Length - sgConsumed;
+            cursorOff += sg[sgIdx].length - sgConsumed;
             sgConsumed = 0;
             sgIdx++;
         }
-        if (sgIdx >= SgList->NumberOfElements) {
+        if (sgIdx >= sgN) {
             LOG("IsocProgramDma: ran off SG list at packet %lu", i);
             OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
             return TRUE;
         }
         ULONG inElem = pktOff - cursorOff + sgConsumed;
-        if (inElem + pktLen > SgList->Elements[sgIdx].Length) {
-            /* Packet spans an SG element boundary — would require an
-             * intra-packet split that ITDs don't support. usbaudio
-             * doesn't do this in practice (each packet is well under
-             * PAGE_SIZE and aligned at the URB level). */
-            LOG("IsocProgramDma: packet %lu spans SG elements "
-                "(inElem=%lu len=%lu elemLen=%lu)", i, inElem, pktLen,
-                SgList->Elements[sgIdx].Length);
+        if (inElem + pktLen > sg[sgIdx].length) {
+            /* Packet spans a non-contiguous boundary even after
+             * coalescing — the two phys runs are truly disjoint. ITDs
+             * can't represent this; would need to bounce the URB. Rare
+             * in practice for short audio packets. */
+            LOG("IsocProgramDma: packet %lu spans non-contiguous SG runs "
+                "(inElem=%lu len=%lu elemLen=%u)", i, inElem, pktLen,
+                sg[sgIdx].length);
             OhciPci_IsocProgramDmaFail(uc, STATUS_INVALID_PARAMETER);
             return TRUE;
         }
-        pkt[i].phys = SgList->Elements[sgIdx].Address.LowPart + inElem;
+        pkt[i].phys = sg[sgIdx].phys + inElem;
         pkt[i].len  = (uint16_t)pktLen;
     }
 
