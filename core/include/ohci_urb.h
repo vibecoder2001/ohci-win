@@ -62,6 +62,17 @@ struct ohci_urb {
         uint32_t chunk_len;   /* bytes this TD intended to move */
     } data_tds[OHCI_URB_MAX_DATA_TDS];
     uint8_t  data_td_count;
+
+    /* Isochronous result tracking — one ITD covers up to 8 packets, with
+     * per-packet length + CC decoded from PSW by the drain path (Task 4). */
+#define OHCI_URB_MAX_ISOC_PACKETS 8
+    uint8_t  is_isoc;
+    uint8_t  isoc_pkt_count;
+    struct ohci_isoc_packet_result {
+        uint16_t length;     /* bytes transferred (HW-written, drain decodes from PSW) */
+        uint8_t  cc;         /* OHCI condition code from PSW */
+    } isoc_pkts[OHCI_URB_MAX_ISOC_PACKETS];
+
     struct ohci_urb *next_pending;
 };
 

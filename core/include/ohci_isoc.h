@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 struct ohci_hc;
+struct ohci_urb;
 
 struct ohci_isoc_endpoint_config {
     uint8_t  func_addr;
@@ -37,6 +38,26 @@ int  ohci_isoc_endpoint_create(struct ohci_hc *hc,
                                struct ohci_isoc_endpoint *ep);
 void ohci_isoc_endpoint_destroy(struct ohci_hc *hc,
                                 struct ohci_isoc_endpoint *ep);
+
+/* Build one ITD covering pkt_count packets (1..8) starting at frame `sf`.
+ * Each packet's length is in pkt_lens[i]; the buffer at buf_phys/buf_len
+ * holds the concatenated packet payload (packets are placed back-to-back
+ * starting at buf_phys, so buf_len must equal sum of pkt_lens).
+ *
+ * Returns 0 on success, -1 if pkt_count is out of range, the buffer
+ * straddles more than one page boundary, or pool allocation fails.
+ *
+ * On success the URB is queued in_flight; complete() will fire when the
+ * drain path retires the ITD. ep->ed_tail_frame advances to sf + pkt_count
+ * and ep->primed becomes 1. */
+int ohci_isoc_submit_window(struct ohci_hc *hc,
+                            struct ohci_isoc_endpoint *ep,
+                            struct ohci_urb *urb,
+                            uint16_t sf,
+                            uint8_t  pkt_count,
+                            const uint16_t *pkt_lens,
+                            uint32_t buf_phys,
+                            uint32_t buf_len);
 
 #ifdef __cplusplus
 }
