@@ -157,8 +157,17 @@ StubGetCurrentFrameNumber(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    *FrameNumber = 0;
-    LOG("GetCurrentFrameNumber called");
+    /* Read the live OHCI HcFmNumber (offset 0x3C, 16-bit running counter
+     * that increments every 1ms). usbaudio uses this to pick StartFrame
+     * for the next isoch URB; returning a constant 0 makes every URB
+     * land in the past → HC silently skips frames → no audio. */
+    extern PDEVICE_CONTEXT g_DeviceContext;
+    if (g_DeviceContext && g_DeviceContext->MmioOps.read32) {
+        *FrameNumber = g_DeviceContext->MmioOps.read32(
+                            g_DeviceContext->MmioOps.context, 0x3C) & 0xFFFFu;
+    } else {
+        *FrameNumber = 0;
+    }
     return STATUS_SUCCESS;
 }
 
