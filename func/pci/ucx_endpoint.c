@@ -762,6 +762,16 @@ OhciPci_IsocProgramDma(
         rc = ohci_isoc_submit_window(&dc->Hc, ie, &uc->CoreUrb,
                                       sf, windowCount, lens,
                                       winPhys, winLen, firstWindow);
+        if (firstWindow && rc == 0) {
+            /* submit_window seeded isoc_pkt_count from this window's count;
+             * override with the URB-total so decode_isoc_itd's OK-flip
+             * waits until ALL windows' packets have retired, not just the
+             * first window's. Without this, a multi-window URB completes
+             * with status=OK after the first ITD and later windows' PSWs
+             * are silently discarded by decode_isoc_itd's base-bound
+             * early-return. */
+            uc->CoreUrb.isoc_pkt_count = (uint8_t)nPkts;
+        }
         sf  = (uint16_t)(sf + windowCount);
         i  += windowCount;
         firstWindow = 0;
