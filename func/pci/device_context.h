@@ -27,6 +27,7 @@
 #define OHCIPCI_ISOC_REFILL_HIGH        16   /* refill up to this lead */
 #define OHCIPCI_ISOC_PRIME_LOOKAHEAD     4   /* first-prime sf = HcFmNumber + 4 */
 #define OHCIPCI_ISOC_BACKSTOP_TIMER_MS   1   /* 1 ms periodic backstop */
+#define OHCIPCI_ISOC_SILENCE_BURST_MAX   4   /* silence ITDs (32 frames) per refill call */
 
 struct ohcipci_bounce_pool {
     uint8_t *base;       /* virtual base of the pool's chunk in DMA region */
@@ -140,7 +141,7 @@ typedef struct _OHCIPCI_EP_CONTEXT {
      * when no caller URB is queued. IsocEpEntry chains us on dc->IsocEps. */
     PVOID                          IsocSilenceVa;
     uint32_t                       IsocSilencePhys;
-    ULONG                          IsocUnderrunCount;
+    ULONG                          IsocSilenceItdCount;
     LIST_ENTRY                     IsocQueuedUrbs;   /* OHCIPCI_URB_CTX::QueueEntry */
     WDFSPINLOCK                    IsocQueueLock;
     LIST_ENTRY                     IsocEpEntry;     /* on dc->IsocEps */

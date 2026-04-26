@@ -810,6 +810,70 @@ OhciPci_IsocProgramDma(
 }
 
 /* --------------------------------------------------------------------------
+ * Plan 8 Task 7 — UCXENDPOINT context cleanup.
+ *
+ * Registered on epAttrs.EvtCleanupCallback for ALL EP kinds; no-ops for
+ * non-Isoc. Without this, when an isoch EP is torn down (UCX hot-unplug
+ * or driver unload) the EP context remains spliced into dc->IsocEps via
+ * IsocEpEntry. The next IsocRefillAll_Locked walks the freed memory =>
+ * use-after-free.
+ *
+ * Cleanup runs at PASSIVE with no CoreLock in scope, so it is safe to
+ * call WdfRequestComplete inline (no DeferredCompletions detour needed).
+ * The silence buffer is part of dc->DmaRegion — bump-allocator with no
+ * per-allocation free, so accept the bounded leak.
+ * -------------------------------------------------------------------------- */
+static EVT_WDF_OBJECT_CONTEXT_CLEANUP OhciPci_EpContextCleanup;
+static VOID
+OhciPci_EpContextCleanup(WDFOBJECT Object)
+{
+    POHCIPCI_EP_CONTEXT ep = OhciPci_EpContextGet((UCXENDPOINT)Object);
+    if (ep == NULL || ep->Kind != OhciPciEpKindIsoc) return;
+    PDEVICE_CONTEXT dc = ep->Dc;
+    if (dc == NULL) return;
+
+    /* Unlink from dc->IsocEps so the refill walker stops touching us.
+     * Defensive: if Flink is NULL we were never spliced (e.g. EP create
+     * failed before InsertTailList) — skip. */
+    if (dc->IsocEpsLock) {
+        WdfSpinLockAcquire(dc->IsocEpsLock);
+        if (ep->IsocEpEntry.Flink != NULL) {
+            RemoveEntryList(&ep->IsocEpEntry);
+            ep->IsocEpEntry.Flink = NULL;
+        }
+        WdfSpinLockRelease(dc->IsocEpsLock);
+    }
+
+    /* Drain queued URBs and complete each with STATUS_CANCELLED. */
+    if (ep->IsocQueueLock) {
+        LIST_ENTRY local;
+        InitializeListHead(&local);
+        WdfSpinLockAcquire(ep->IsocQueueLock);
+        while (!IsListEmpty(&ep->IsocQueuedUrbs)) {
+            PLIST_ENTRY le = RemoveHeadList(&ep->IsocQueuedUrbs);
+            InsertTailList(&local, le);
+        }
+        WdfSpinLockRelease(ep->IsocQueueLock);
+
+        while (!IsListEmpty(&local)) {
+            PLIST_ENTRY le = RemoveHeadList(&local);
+            POHCIPCI_URB_CTX uc =
+                CONTAINING_RECORD(le, OHCIPCI_URB_CTX, QueueEntry);
+            /* Tear down the WdfDmaTransaction allocated in HandleIsocUrb. */
+            if (uc->DmaTransaction) {
+                NTSTATUS dmaSt;
+                (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction,
+                                                         0, &dmaSt);
+                WdfObjectDelete(uc->DmaTransaction);
+                uc->DmaTransaction = NULL;
+            }
+            if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+            WdfRequestComplete(uc->Request, STATUS_CANCELLED);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Plan 8 Task 7 — refill DPC + silence ITDs.
  *
  * The OHCI HC walks the periodic schedule per frame and dispatches whatever
@@ -883,9 +947,16 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
      * here than fail in a tight loop). PAGE_SIZE/8 = 512 bytes. */
     if (mps > PAGE_SIZE / 8) mps = PAGE_SIZE / 8;
 
+    ULONG silenceEmitted = 0;
     while (1) {
         SHORT lead = (SHORT)(ie->ed_tail_frame - fmNumber);
         if (lead >= (SHORT)OHCIPCI_ISOC_REFILL_HIGH) break;
+
+        /* Cap silence emissions per refill call so a far-behind caller
+         * stall can't drain the ITD pool in a single tick. The next
+         * refill (DPC after the WDH drain, or 1 ms backstop timer)
+         * continues catching up. */
+        if (silenceEmitted >= OHCIPCI_ISOC_SILENCE_BURST_MAX) break;
 
         uint16_t lens[8];
         for (uint8_t k = 0; k < 8; k++) lens[k] = mps;
@@ -897,7 +968,8 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
             /* ITD pool exhausted or window failed — back off, retry next tick. */
             break;
         }
-        ep->IsocUnderrunCount++;
+        ep->IsocSilenceItdCount++;
+        silenceEmitted++;
         /* Don't refresh fmNumber here: silence_window is a few writes,
          * frame counter unlikely to advance. The lead recompute uses the
          * updated ed_tail_frame to terminate. */
@@ -1512,6 +1584,9 @@ OhciPci_DefaultEndpointAdd(
      *    UcxEndpointCreate takes PUCXENDPOINT_INIT* (double-pointer). */
     WDF_OBJECT_ATTRIBUTES epAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&epAttrs, OHCIPCI_EP_CONTEXT);
+    /* Cleanup unlinks isoch EPs from dc->IsocEps and cancels queued URBs.
+     * No-ops for Control/Bulk/Interrupt — safe to register universally. */
+    epAttrs.EvtCleanupCallback = OhciPci_EpContextCleanup;
 
     UCXENDPOINT ucxEp;
     NTSTATUS status = UcxEndpointCreate(UcxUsbDevice,
@@ -1744,6 +1819,9 @@ OhciPci_EndpointAdd(
     /* 2. Create UCXENDPOINT. */
     WDF_OBJECT_ATTRIBUTES epAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&epAttrs, OHCIPCI_EP_CONTEXT);
+    /* Cleanup unlinks isoch EPs from dc->IsocEps and cancels queued URBs.
+     * No-ops for Control/Bulk/Interrupt — safe to register universally. */
+    epAttrs.EvtCleanupCallback = OhciPci_EpContextCleanup;
     UCXENDPOINT ucxEp;
     NTSTATUS status = UcxEndpointCreate(UcxUsbDevice, &EpInit, &epAttrs, &ucxEp);
     if (!NT_SUCCESS(status)) {
@@ -1836,7 +1914,9 @@ OhciPci_EndpointAdd(
              * silence). IsocQueueLock is mandatory — HandleIsocUrb
              * relies on it. */
             InitializeListHead(&ep->IsocQueuedUrbs);
-            InitializeListHead(&ep->IsocEpEntry);
+            /* IsocEpEntry.Flink stays NULL (RtlZeroMemory above) until
+             * we splice onto dc->IsocEps below; the cleanup callback uses
+             * "Flink == NULL" as the "not on any list" sentinel. */
 
             ep->IsocSilenceVa = ohci_dma_alloc(&ep->Dc->DmaRegion,
                                                 PAGE_SIZE, PAGE_SIZE,
