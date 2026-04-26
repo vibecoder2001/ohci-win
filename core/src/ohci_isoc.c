@@ -141,12 +141,15 @@ int ohci_isoc_submit_window(struct ohci_hc *hc,
     struct ohci_itd *data = ohci_itd_pool_alloc(&hc->itd_pool, &data_phys);
     if (!data) return -1;
 
-    /* ITD Control: SF in low 16, FC = pkt_count-1 at [26:24], DI=NO_INTR,
-     * CC=NOTACCESSED until HW retires. Task 7 will toggle DI on a subset of
-     * ITDs so the refill DPC fires. */
+    /* ITD Control: SF in low 16, FC = pkt_count-1 at [26:24], DI=0 (immediate
+     * IOC), CC=NOTACCESSED until HW retires. DI=0 fires WDH on every retired
+     * data ITD so the drain runs and completes URBs in time for usbaudio to
+     * queue the next one. Without IOC, the URB never completes and the audio
+     * pipeline stalls forever. Optimization (fewer interrupts on multi-window
+     * URBs) deferred. */
     data->Control = ((uint32_t)sf & OHCI_ITD_SF_MASK)
                   | (((uint32_t)(pkt_count - 1) << OHCI_ITD_FC_SHIFT) & OHCI_ITD_FC_MASK)
-                  | OHCI_ITD_DI_NO_INTR
+                  | (0u << OHCI_ITD_DI_SHIFT)
                   | ((uint32_t)OHCI_CC_NOTACCESSED << OHCI_ITD_CC_SHIFT);
     data->BP0    = bp0;
     data->BE     = last;
