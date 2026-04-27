@@ -107,6 +107,23 @@ static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
     return NULL;
 }
 
+/* Match a retired TD against a URB's head_td. Used to catch SETUP-TD
+ * STALLs on control transfers — the SETUP TD is urb->head_td and is
+ * NOT in data_tds[] (control submit only records the DATA stage there),
+ * so urb_for_data_td_phys misses it and the URB orphans. Bulk URBs set
+ * head_td == data_tds[0]'s slot, so this only meaningfully fires on
+ * control SETUP STALLs (rare but legal — see OHCI §6.4.4). */
+static struct ohci_urb *urb_for_head_td_phys(struct ohci_hc *hc,
+                                              uint32_t td_phys) {
+    for (struct ohci_urb *u = hc->in_flight; u != NULL; u = u->next_pending) {
+        if (!u->head_td) continue;
+        uint32_t head_phys = hc->dma->phys_base +
+            (uint32_t)((uint8_t*)u->head_td - hc->dma->base);
+        if (head_phys == td_phys) return u;
+    }
+    return NULL;
+}
+
 /* Find the URB and TD-record-index for a retired data TD at td_phys. */
 static struct ohci_urb *urb_for_data_td_phys(struct ohci_hc *hc,
                                               uint32_t td_phys,
@@ -238,6 +255,49 @@ void ohci_drain_done(struct ohci_hc *hc) {
             }
 
             if (du->complete) du->complete(du);
+        } else if (cc != OHCI_CC_NOERROR) {
+            /* SETUP-TD STALL fallback. If the failing TD is a URB's
+             * head_td (SETUP, for control transfers) the data-TD match
+             * above doesn't see it (data_tds[] only holds the DATA
+             * stage). Without this branch the URB orphans on
+             * hc->in_flight. Devices very rarely STALL the SETUP packet
+             * itself but it is legal per USB §8.5.3. */
+            struct ohci_urb *hu = urb_for_head_td_phys(hc, cur);
+            if (hu && !hu->is_isoc) {
+                /* Splice URB out of in_flight. */
+                struct ohci_urb *prev = NULL;
+                for (struct ohci_urb *iter = hc->in_flight; iter; iter = iter->next_pending) {
+                    if (iter == hu) {
+                        if (prev) prev->next_pending = hu->next_pending;
+                        else      hc->in_flight       = hu->next_pending;
+                        break;
+                    }
+                    prev = iter;
+                }
+
+                /* Free orphan TDs the HC will never retire — entire
+                 * data_tds[] chain plus a separate tail_td. The failing
+                 * head TD itself is freed by the loop's tail. */
+                for (int j = 0; j < hu->data_td_count; j++) {
+                    uint32_t orphan_phys = hu->data_tds[j].td_phys & ~0xFu;
+                    if (orphan_phys == 0) continue;
+                    struct ohci_td *orphan =
+                        ohci_dma_virt_from_phys(hc->dma, orphan_phys);
+                    if (orphan) ohci_td_pool_free(&hc->td_pool, orphan);
+                }
+                if (hu->tail_td) {
+                    uint32_t tail_phys = hc->dma->phys_base +
+                        (uint32_t)((uint8_t*)hu->tail_td - hc->dma->base);
+                    int dup = (tail_phys == cur);
+                    for (int j = 0; !dup && j < hu->data_td_count; j++) {
+                        if ((hu->data_tds[j].td_phys & ~0xFu) == tail_phys) dup = 1;
+                    }
+                    if (!dup) ohci_td_pool_free(&hc->td_pool, hu->tail_td);
+                }
+
+                if (hu->status == OHCI_URB_STATUS_PENDING) hu->status = s;
+                if (hu->complete) hu->complete(hu);
+            }
         }
 
         /* Pool dispatch keys on physical address range, not URB ownership,
