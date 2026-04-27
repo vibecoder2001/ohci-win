@@ -302,8 +302,8 @@ typedef struct _OHCIPCI_USBDEV_CTX {
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_USBDEV_CTX, OhciPci_UsbDevContextGet)
 
 /* Per-UCXCONTROLLER and per-UCXROOTHUB back-pointers to the owning
- * DEVICE_CONTEXT. These replace the old g_DeviceContext module-static so
- * the driver works with multiple OHCI instances loaded simultaneously. */
+ * DEVICE_CONTEXT. The driver works with multiple OHCI instances loaded
+ * simultaneously (RK3588 ARM64 ships two OHCI controllers). */
 typedef struct _OHCIPCI_CONTROLLER_CTX {
     PDEVICE_CONTEXT Dc;
 } OHCIPCI_CONTROLLER_CTX, *POHCIPCI_CONTROLLER_CTX;
@@ -326,10 +326,6 @@ VOID OhciPci_HeadPSetMps(struct ohci_ed *ed, void *ctx);
 VOID OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
                               ohcipci_headp_edit_fn edit, void *ctx);
 struct ohci_ed *OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep);
-
-/* g_DeviceContext — single-instance shortcut. Defined in ucx_roothub.c;
- * set once in OhciPci_RootHubCreate before any UCX callbacks fire. */
-extern PDEVICE_CONTEXT g_DeviceContext;
 
 /* Defined in mmio.c — installs kernel read32/write32/barrier into dc->MmioOps. */
 void OhciPci_InitMmioOps(PDEVICE_CONTEXT dc);

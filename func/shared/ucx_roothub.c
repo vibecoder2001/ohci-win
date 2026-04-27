@@ -88,12 +88,10 @@ Environment:
  *   PortInfoArray is an array of PROOTHUB_20PORT_INFO (pointers), not inline.
  *   We allocate the per-port structs and pointer array from NonPagedPool.
  *
- * TASK 3 DEVIATIONS — context retrieval:
- *   Plan assumed OhciPci_RootHubGetContext(rh) or UCX context on UCXROOTHUB.
- *   ACTUAL: no such helper exists and we did not attach WDF context to the
- *   UCXROOTHUB object in Task 2.  We use a module-static pointer
- *   g_DeviceContext set at RootHubCreate time (valid for a single-instance
- *   OHCI PCI driver).
+ * Context retrieval: every callback resolves the owning DEVICE_CONTEXT
+ * via OhciPci_RootHubCtxGet(UcxRootHub)->Dc — a per-UCXROOTHUB WDF
+ * context attached at RootHubCreate time. Multi-instance safe (RK3588
+ * loads two OHCI controllers and both run in parallel).
  *
  * CONTROLLER_TYPE enum (no SoftOhci variant):
  *   ControllerTypeXhci = 0, ControllerTypeSoftXhci = 1.
@@ -118,15 +116,6 @@ Environment:
 #define REG_HcRhPortStatus_BASE  0x54u
 /* Bits 16-20: CSC|PESC|PSSC|OCIC|PRSC (OHCI spec §7.4.2) */
 #define OHCI_RHPS_CHANGE_MASK    0x001F0000u
-
-/*
- * Module-static device context pointer.
- *
- * Set once in OhciPci_RootHubCreate before UCX can invoke any callback.
- * Safe for a single-instance PCI driver; a multi-instance driver would need
- * WDF context attached to the UCXROOTHUB object instead.
- */
-PDEVICE_CONTEXT g_DeviceContext;  /* extern in device_context.h; shared across glue TUs */
 
 /* --------------------------------------------------------------------------
  * OhciPciInterruptTx — EVT_UCX_ROOTHUB_INTERRUPT_TX  (Task 4 real impl)
@@ -820,11 +809,9 @@ OhciPci_RootHubCreate(
     _In_ UCXCONTROLLER   controller
     )
 {
-    /* Per-instance back-pointer to dc lives in the UCXROOTHUB context;
-     * also keep g_DeviceContext mirrored so legacy single-instance call
-     * sites that haven't been migrated yet still work. With more than
-     * one OHCI controller loaded, only context-based lookups are safe. */
-    g_DeviceContext = dc;
+    /* The per-UCXROOTHUB context (attached below) carries dc back to
+     * each callback. Multi-instance safe — RK3588 routinely loads two
+     * OHCI controllers and both run their own dc through this path. */
 
     UCX_ROOTHUB_CONFIG cfg;
 

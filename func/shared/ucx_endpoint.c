@@ -8,11 +8,11 @@ Abstract:
 
     UCX 1.6 default Control endpoint (EP0) implementation for OhciPci.
 
-    Implements OhciPci_DefaultEndpointAdd and OhciPci_EndpointAdd.
-    The former is real (Task 6); the latter is a Plan 6 stub.
+    Implements OhciPci_DefaultEndpointAdd (EP0 control) and
+    OhciPci_EndpointAdd (Bulk / Interrupt / Isoch).
 
-    Also contains EvtUrbIoctl — the WDFQUEUE EvtIoInternalDeviceControl
-    callback that receives URBs from UCX and submits them to the OHCI core.
+    Also contains EvtUrbDefault — the WDFQUEUE EvtIoDefault callback
+    that receives URBs from UCX and submits them to the OHCI core.
 
 === UCX 1.6 Endpoint API surface (WDK 10.0.26100.0, ucxendpoint.h) ===
 
@@ -52,15 +52,10 @@ Abstract:
 
   Queue parent/context note:
     WDF does not have a WdfIoQueueGetParentObject API (only DPC, timer, and
-    workitem have typed GetParentObject helpers). To bridge from EvtUrbIoctl
+    workitem have typed GetParentObject helpers). To bridge from EvtUrbDefault
     (which receives only the WDFQUEUE) back to the per-EP context we attach a
     tiny ohcipci_queue_ctx to the WDFQUEUE object that holds a back-pointer to
     the owning ohcipci_ep_context.
-
-  g_DeviceContext:
-    Declared extern here; defined as non-static in ucx_roothub.c (Task 6
-    changes it from static to extern-linkage). This is the established single-
-    instance shortcut used by the existing root-hub callbacks.
 
 Environment:
 
@@ -84,9 +79,6 @@ Environment:
 #include "ohci_isoc.h"
 #include "isoc_mdl.h"
 #include "ohci_log.h"
-
-/* Declared in ucx_roothub.c; shared across glue modules for single-instance driver. */
-extern PDEVICE_CONTEXT g_DeviceContext;
 
 /* --------------------------------------------------------------------------
  * Forward declarations for UCX endpoint callbacks (default EP flavour).
@@ -1644,8 +1636,7 @@ OhciPci_DefaultEndpointAdd(
 
     /* Initialise per-EP context. dc comes from the UCXUSBDEVICE's
      * udc->Dc back-pointer (set in OhciPci_UsbDeviceAdd) — this is the
-     * multi-instance-safe source of truth, NOT the legacy
-     * g_DeviceContext module-static. */
+     * multi-instance-safe source of truth. */
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
     RtlZeroMemory(ep, sizeof(*ep));
     OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
@@ -1732,8 +1723,7 @@ OhciPci_DefaultEndpointAdd(
  * OhciPci_EndpointAdd
  *
  * EVT_UCX_USBDEVICE_ENDPOINT_ADD — non-default (Bulk/Interrupt/Isochronous)
- * endpoints. Implemented in Plan 6. Returns STATUS_NOT_IMPLEMENTED so UCX
- * fails gracefully during enumeration of multi-endpoint devices.
+ * endpoints. Dispatches by bmAttributes to per-kind core constructors.
  * -------------------------------------------------------------------------- */
 /* --------------------------------------------------------------------------
  * Non-default endpoint lifecycle callbacks. Same shape as default-EP
