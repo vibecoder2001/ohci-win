@@ -148,7 +148,8 @@ _Use_decl_annotations_
 static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     if (!dc || !dc->MmioBase) {
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
         return;
@@ -242,7 +243,8 @@ static VOID OhciPciGetInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
 
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     if (!dc || !dc->MmioBase) {
         LOG("RootHub GetInfo: no device context or MMIO not mapped");
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
@@ -348,7 +350,8 @@ static VOID OhciPciGet20PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
 
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     if (!dc || !dc->MmioBase) {
         LOG("RootHub Get20PortInfo: no device context or MMIO not mapped");
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
@@ -611,7 +614,8 @@ _Use_decl_annotations_
 static VOID OhciPciGetPortStatus(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     PIRP irp = WdfRequestWdmGetIrp(Request);
     PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
     PURB urb = (PURB)s->Parameters.Others.Argument1;
@@ -679,7 +683,8 @@ _Use_decl_annotations_
 static VOID OhciPciSetPortFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     PIRP irp = WdfRequestWdmGetIrp(Request);
     PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
     PURB urb = (PURB)s->Parameters.Others.Argument1;
@@ -760,7 +765,8 @@ _Use_decl_annotations_
 static VOID OhciPciClearPortFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    POHCIPCI_ROOTHUB_CTX rhctx = OhciPci_RootHubCtxGet(UcxRootHub);
+    PDEVICE_CONTEXT dc = rhctx ? rhctx->Dc : NULL;
     PIRP irp = WdfRequestWdmGetIrp(Request);
     PIO_STACK_LOCATION s = IoGetCurrentIrpStackLocation(irp);
     PURB urb = (PURB)s->Parameters.Others.Argument1;
@@ -810,11 +816,10 @@ OhciPci_RootHubCreate(
     _In_ UCXCONTROLLER   controller
     )
 {
-    /*
-     * Store the device context in the module-static so that the callbacks
-     * can retrieve it.  Must be done before UcxRootHubCreate, which may
-     * immediately invoke the callbacks.
-     */
+    /* Per-instance back-pointer to dc lives in the UCXROOTHUB context;
+     * also keep g_DeviceContext mirrored so legacy single-instance call
+     * sites that haven't been migrated yet still work. With more than
+     * one OHCI controller loaded, only context-based lookups are safe. */
     g_DeviceContext = dc;
 
     UCX_ROOTHUB_CONFIG cfg;
@@ -852,9 +857,14 @@ OhciPci_RootHubCreate(
         EvtRootHubGet30PortInfo
     );
 
+    WDF_OBJECT_ATTRIBUTES rhAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&rhAttrs, OHCIPCI_ROOTHUB_CTX);
     NTSTATUS status = UcxRootHubCreate(controller, &cfg,
-                                       WDF_NO_OBJECT_ATTRIBUTES, &dc->RootHub);
+                                       &rhAttrs, &dc->RootHub);
     LOG("UcxRootHubCreate -> 0x%08X", status);
+    if (NT_SUCCESS(status)) {
+        OhciPci_RootHubCtxGet(dc->RootHub)->Dc = dc;
+    }
     return status;
 }
 

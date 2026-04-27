@@ -1632,15 +1632,18 @@ OhciPci_DefaultEndpointAdd(
         return status;
     }
 
-    /* Initialise per-EP context. */
+    /* Initialise per-EP context. dc comes from the UCXUSBDEVICE's
+     * udc->Dc back-pointer (set in OhciPci_UsbDeviceAdd) — this is the
+     * multi-instance-safe source of truth, NOT the legacy
+     * g_DeviceContext module-static. */
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
     RtlZeroMemory(ep, sizeof(*ep));
-    ep->Dc    = g_DeviceContext;   /* module-static, set during RootHubCreate */
+    OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    ep->Dc    = (udc_link != NULL) ? udc_link->Dc : NULL;
     ep->UcxEp = ucxEp;
 
     /* Link this EP into the owning device's EndpointList for device-level
      * callbacks (Enable/Disable/Reset) to fan out. */
-    OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
     ep->Udc = udc_link;
     if (udc_link != NULL) {
         WdfSpinLockAcquire(udc_link->EndpointListLock);
@@ -1842,12 +1845,18 @@ OhciPci_EndpointAdd(
      * so a rejection leaks nothing. The matching charge happens at the
      * end of the per-kind branch on success and is refunded by
      * EpContextCleanup via ep->PeriodicBudgetCharged. */
+    OHCIPCI_USBDEV_CTX *udc_pre = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    PDEVICE_CONTEXT dc_pre = (udc_pre != NULL) ? udc_pre->Dc : NULL;
+    if (dc_pre == NULL) {
+        LOG("EndpointAdd: NULL device context");
+        return STATUS_INVALID_DEVICE_STATE;
+    }
     if (attrs == 0x01 || attrs == 0x03) {
-        if (g_DeviceContext->PeriodicBytesPerFrame + mps > OHCIPCI_PERIODIC_BUDGET_BYTES) {
+        if (dc_pre->PeriodicBytesPerFrame + mps > OHCIPCI_PERIODIC_BUDGET_BYTES) {
             LOG("EndpointAdd: %s rejected - periodic budget exceeded "
                 "(%lu + %u > %u)",
                 attrs == 0x01 ? "isoch" : "interrupt",
-                g_DeviceContext->PeriodicBytesPerFrame, mps,
+                dc_pre->PeriodicBytesPerFrame, mps,
                 OHCIPCI_PERIODIC_BUDGET_BYTES);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -1882,12 +1891,12 @@ OhciPci_EndpointAdd(
     }
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
     RtlZeroMemory(ep, sizeof(*ep));
-    ep->Dc    = g_DeviceContext;
+    ep->Dc    = dc_pre;
     ep->UcxEp = ucxEp;
 
     /* Link this EP into the owning device's EndpointList for device-level
      * callbacks (Enable/Disable/Reset) to fan out. */
-    OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    OHCIPCI_USBDEV_CTX *udc_link = udc_pre;
     ep->Udc = udc_link;
     if (udc_link != NULL) {
         WdfSpinLockAcquire(udc_link->EndpointListLock);
@@ -1963,14 +1972,14 @@ OhciPci_EndpointAdd(
         if (rc == 0) {
             /* Charge against the periodic-bandwidth budget. Refunded by
              * EpContextCleanup via ep->PeriodicBudgetCharged. */
-            g_DeviceContext->PeriodicBytesPerFrame += mps;
+            ep->Dc->PeriodicBytesPerFrame += mps;
             ep->PeriodicBudgetCharged = mps;
         }
         LOG("Interrupt EP created: addr=%u ep=%u dir=%s mps=%u "
             "bInterval=%u scheduled=%ums rc=%d budget=%lu/%u",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps,
             bInterval, ep->Core.Interrupt.poll_interval_frames, rc,
-            g_DeviceContext->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
+            ep->Dc->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
     } else { /* attrs == 0x01 - Isochronous */
         ep->Kind = OhciPciEpKindIsoc;
         /* Initialise the per-EP isoch lists BEFORE the create call.
@@ -1994,7 +2003,7 @@ OhciPci_EndpointAdd(
         if (rc == 0) {
             /* Charge against the periodic-bandwidth budget. Refunded by
              * EpContextCleanup via ep->PeriodicBudgetCharged. */
-            g_DeviceContext->PeriodicBytesPerFrame += mps;
+            ep->Dc->PeriodicBytesPerFrame += mps;
             ep->PeriodicBudgetCharged = mps;
 
             /* Plan 8 Task 7 — refill state. Silence buffer is one
@@ -2047,7 +2056,7 @@ OhciPci_EndpointAdd(
         }
         LOG("Isoc EP created: addr=%u ep=%u dir=%s mps=%u rc=%d budget=%lu/%u",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps, rc,
-            g_DeviceContext->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
+            ep->Dc->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
     }
     if (rc != 0) {
         return STATUS_INSUFFICIENT_RESOURCES;

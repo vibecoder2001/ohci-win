@@ -72,9 +72,9 @@ static VOID OhciPci_ResetCompleteWork(WDFWORKITEM WorkItem)
     /* Prime UCX with a port-change notification so it queries InterruptTx
      * and learns the current port-status bitmap. Without this, UCX may
      * be in a "waiting for first port event" watchdog and reset again. */
-    extern PDEVICE_CONTEXT g_DeviceContext;
-    if (g_DeviceContext && g_DeviceContext->RootHub) {
-        UcxRootHubPortChanged(g_DeviceContext->RootHub);
+    POHCIPCI_CONTROLLER_CTX cctx = OhciPci_ControllerCtxGet(ctx->UcxController);
+    if (cctx && cctx->Dc && cctx->Dc->RootHub) {
+        UcxRootHubPortChanged(cctx->Dc->RootHub);
         LOG("ResetCompleteWork: UcxRootHubPortChanged kicked");
     }
 
@@ -147,15 +147,14 @@ EvtControllerGetCurrentFrameNumber(
     _Out_ PULONG        FrameNumber
     )
 {
-    UNREFERENCED_PARAMETER(UcxController);
     /* Read the live OHCI HcFmNumber (offset 0x3C, 16-bit running counter
      * that increments every 1ms). usbaudio uses this to pick StartFrame
      * for the next isoch URB; returning a constant 0 makes every URB
      * land in the past → HC silently skips frames → no audio. */
-    extern PDEVICE_CONTEXT g_DeviceContext;
-    if (g_DeviceContext && g_DeviceContext->MmioOps.read32) {
-        *FrameNumber = g_DeviceContext->MmioOps.read32(
-                            g_DeviceContext->MmioOps.context, 0x3C) & 0xFFFFu;
+    POHCIPCI_CONTROLLER_CTX cctx = OhciPci_ControllerCtxGet(UcxController);
+    if (cctx && cctx->Dc && cctx->Dc->MmioOps.read32) {
+        *FrameNumber = cctx->Dc->MmioOps.read32(
+                            cctx->Dc->MmioOps.context, 0x3C) & 0xFFFFu;
     } else {
         *FrameNumber = 0;
     }
@@ -293,9 +292,14 @@ OhciPci_UcxControllerCreate(
     cfg.EvtControllerSetTransportCharacteristicsChangeNotification     = EvtControllerSetTransportCharsChange;
 
     UCXCONTROLLER controller;
+    WDF_OBJECT_ATTRIBUTES ctrlAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&ctrlAttrs, OHCIPCI_CONTROLLER_CTX);
     NTSTATUS status = UcxControllerCreate(dc->Device, &cfg,
-                                          WDF_NO_OBJECT_ATTRIBUTES, &controller);
+                                          &ctrlAttrs, &controller);
     LOG("UcxControllerCreate -> 0x%08X  (THIS IS THE GATE)", status);
+    if (NT_SUCCESS(status)) {
+        OhciPci_ControllerCtxGet(controller)->Dc = dc;
+    }
 
     /*
      * Deviation from task plan: UcxControllerSetReady does not exist in

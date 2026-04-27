@@ -178,9 +178,8 @@ _Use_decl_annotations_
 static VOID
 OhciPci_SetAddressWorker(WDFWORKITEM WorkItem)
 {
-    extern PDEVICE_CONTEXT g_DeviceContext;
     POHCIPCI_SETADDR_CTX ctx = OhciPci_SetAddrCtxGet(WorkItem);
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    PDEVICE_CONTEXT dc = (ctx->Udc != NULL) ? ctx->Udc->Dc : NULL;
 
     UCHAR setup[8] = { 0x00, 0x05, ctx->NewAddr, 0x00, 0x00, 0x00, 0x00, 0x00 };
     NTSTATUS s = OhciPci_SyncSetupOnly(dc, ctx->Ep0, setup);
@@ -473,7 +472,7 @@ EvtUsbDeviceReset(
      *
      * Pause CLE before editing ED.Control (OHCI §6.2.1). Mirrors the dance
      * in OhciPci_SetAddressWorker. */
-    PDEVICE_CONTEXT dc = g_DeviceContext;
+    PDEVICE_CONTEXT dc = udc->Dc;
     if (udc->Ep0 != NULL && dc != NULL) {
         struct ohci_ed *ed = udc->Ep0->Core.Control.ed;
         WdfSpinLockAcquire(dc->CoreLock);
@@ -508,7 +507,6 @@ EvtUsbDeviceAddress(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    extern PDEVICE_CONTEXT g_DeviceContext;
 
     WDF_REQUEST_PARAMETERS rp;
     WDF_REQUEST_PARAMETERS_INIT(&rp);
@@ -525,17 +523,18 @@ EvtUsbDeviceAddress(
     UCXUSBDEVICE usbDev = addrPkt->UsbDevice;
     OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(usbDev);
 
-    if (udc == NULL || udc->Ep0 == NULL) {
+    if (udc == NULL || udc->Ep0 == NULL || udc->Dc == NULL) {
         LOG("UsbDeviceAddress: per-device context or EP0 missing");
         WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
         return;
     }
+    PDEVICE_CONTEXT dc = udc->Dc;
 
     /* USBDEVICE_ADDRESS.Address is OUT, not IN — UCX expects the driver
      * to allocate a fresh USB address (1..127) and write it back into the
      * struct before completion. dwusb does the same via USBPORT_AllocateUsbAddress.
      * We use a simple monotonic allocator on the device context. */
-    LONG allocated = InterlockedIncrement(&g_DeviceContext->NextUsbAddress);
+    LONG allocated = InterlockedIncrement(&dc->NextUsbAddress);
     UCHAR newAddr = (UCHAR)(((allocated - 1) % 127) + 1);  /* 1..127 */
     addrPkt->Address = newAddr;
 
@@ -551,7 +550,7 @@ EvtUsbDeviceAddress(
 
     WDF_OBJECT_ATTRIBUTES wia;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&wia, OHCIPCI_SETADDR_CTX);
-    wia.ParentObject = g_DeviceContext->Device;
+    wia.ParentObject = dc->Device;
 
     WDFWORKITEM wi;
     NTSTATUS ws = WdfWorkItemCreate(&wic, &wia, &wi);
@@ -681,11 +680,12 @@ EvtUsbDeviceEndpointsConfigure(
      * for the new altsetting before disabling the old one) leaves the old
      * ED on hc->bulk_head / interrupt skeleton — the device sees two EDs
      * polling its EP and qemu's MSD STALLs the resulting confusion. */
-    PDEVICE_CONTEXT dc = g_DeviceContext;
     for (ULONG i = 0; i < ec->EndpointsToDisableCount; i++) {
         UCXENDPOINT ucxEp = ec->EndpointsToDisable[i];
         OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(ucxEp);
         if (ep == NULL) continue;
+        PDEVICE_CONTEXT dc = ep->Dc;
+        if (dc == NULL) continue;
         WdfSpinLockAcquire(dc->CoreLock);
         switch (ep->Kind) {
         case OhciPciEpKindBulk:
@@ -795,6 +795,10 @@ OhciPci_UsbDeviceAdd(
 
     OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(usbDevice);
     RtlZeroMemory(udc, sizeof(*udc));
+    {
+        POHCIPCI_CONTROLLER_CTX cctx = OhciPci_ControllerCtxGet(Controller);
+        udc->Dc = cctx ? cctx->Dc : NULL;
+    }
     udc->Speed    = UsbDeviceInfo->DeviceSpeed;
     udc->FuncAddr = 0;
 

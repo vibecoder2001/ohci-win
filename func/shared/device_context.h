@@ -280,6 +280,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_QUEUE_CTX, OhciPci_QueueCtxGet)
  * func_addr field on the existing OHCI ED after SET_ADDRESS completes.
  * -------------------------------------------------------------------------- */
 typedef struct _OHCIPCI_USBDEV_CTX {
+    PDEVICE_CONTEXT               Dc;           /* owning controller — set in UsbDeviceAdd */
     USB_DEVICE_SPEED              Speed;
     UCHAR                         FuncAddr;     /* 0 until EvtUsbDeviceAddress runs */
     struct _OHCIPCI_EP_CONTEXT   *Ep0;          /* set by OhciPci_DefaultEndpointAdd */
@@ -293,6 +294,19 @@ typedef struct _OHCIPCI_USBDEV_CTX {
 } OHCIPCI_USBDEV_CTX, *POHCIPCI_USBDEV_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_USBDEV_CTX, OhciPci_UsbDevContextGet)
+
+/* Per-UCXCONTROLLER and per-UCXROOTHUB back-pointers to the owning
+ * DEVICE_CONTEXT. These replace the old g_DeviceContext module-static so
+ * the driver works with multiple OHCI instances loaded simultaneously. */
+typedef struct _OHCIPCI_CONTROLLER_CTX {
+    PDEVICE_CONTEXT Dc;
+} OHCIPCI_CONTROLLER_CTX, *POHCIPCI_CONTROLLER_CTX;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_CONTROLLER_CTX, OhciPci_ControllerCtxGet)
+
+typedef struct _OHCIPCI_ROOTHUB_CTX {
+    PDEVICE_CONTEXT Dc;
+} OHCIPCI_ROOTHUB_CTX, *POHCIPCI_ROOTHUB_CTX;
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_ROOTHUB_CTX, OhciPci_RootHubCtxGet)
 
 /* Helpers exported from ucx_endpoint.c for ucx_usbdevice.c device-level
  * lifecycle callbacks. */
