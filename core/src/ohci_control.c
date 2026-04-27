@@ -224,9 +224,18 @@ int ohci_control_submit(struct ohci_hc *hc,
         urb->data_td_count = 0;
     }
 
-    /* Update ED.TailP — publishes the new chain to the HC. */
+    /* Publish the new chain to the HC. OHCI 1.0a §5.2.7.2 allows TailP
+     * modification without a K-toggle, but real silicon (observed on
+     * RK3588's OHCI) caches HeadP/TailP from the ED's first scan and
+     * never re-fetches after a TailP-only update — symptom: HC parks at
+     * the ED with CtlCur==CtlHead and never starts the SETUP TD.
+     * Bracket the TailP write with a K-toggle so the HC drops its
+     * cached ED snapshot and re-reads on the next frame. */
+    ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
+    hc->ops.barrier(hc->ops.context);
+    ep->ed->Control &= ~OHCI_ED_K;
 
     /* Doorbell: HcCommandStatus.CLF = 1 signals the HC to walk the list. */
     hc->ops.barrier(hc->ops.context);
