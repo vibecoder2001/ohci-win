@@ -195,13 +195,9 @@ void ohci_drain_done(struct ohci_hc *hc) {
              * STATUS control transfer) never retire. Without this branch
              * the URB sits in hc->in_flight forever — UCX never sees the
              * STALL and enumeration freezes. Symptom: Logitech mouse
-             * STALLing DEVICE_QUALIFIER (0x06) hangs the bus.
-             *
-             * Complete the URB on the failing data TD and remove it from
-             * in_flight. Surviving TDs (the unretired tail and any later
-             * data TDs) leak their pool slots; the next ohci_control_submit
-             * reuses the placeholder slot via the K-toggle bracket and
-             * the orphans get reclaimed when the ED itself is destroyed. */
+             * STALLing DEVICE_QUALIFIER (0x06) hangs the bus. */
+
+            /* Splice URB out of in_flight. */
             struct ohci_urb *prev = NULL;
             for (struct ohci_urb *iter = hc->in_flight; iter; iter = iter->next_pending) {
                 if (iter == du) {
@@ -211,6 +207,36 @@ void ohci_drain_done(struct ohci_hc *hc) {
                 }
                 prev = iter;
             }
+
+            /* Free the orphan TDs the HC will never retire — they're still
+             * linked from the (about-to-be-disconnected) chain but unreferenced
+             * once the next submit rewrites HeadP/TailP via the K-toggle
+             * bracket. Without this, td_pool slowly leaks: each STALL on a
+             * multi-TD URB strands every TD past the failing one until the
+             * pool is exhausted (control STALL leaks 1 STATUS TD; bulk STALL
+             * leaks N-1-k data TDs).
+             *
+             * Drain frees the failing TD itself at the bottom of this loop,
+             * so we start at td_idx+1. For control URBs urb->tail_td is the
+             * STATUS TD (separate from data_tds[]); for bulk URBs tail_td
+             * IS data_tds[last] and the dup check skips a double-free. */
+            for (int j = td_idx + 1; j < du->data_td_count; j++) {
+                uint32_t orphan_phys = du->data_tds[j].td_phys & ~0xFu;
+                if (orphan_phys == 0) continue;
+                struct ohci_td *orphan =
+                    ohci_dma_virt_from_phys(hc->dma, orphan_phys);
+                if (orphan) ohci_td_pool_free(&hc->td_pool, orphan);
+            }
+            if (du->tail_td) {
+                uint32_t tail_phys = hc->dma->phys_base +
+                    (uint32_t)((uint8_t*)du->tail_td - hc->dma->base);
+                int dup = (tail_phys == cur);
+                for (int j = td_idx + 1; !dup && j < du->data_td_count; j++) {
+                    if ((du->data_tds[j].td_phys & ~0xFu) == tail_phys) dup = 1;
+                }
+                if (!dup) ohci_td_pool_free(&hc->td_pool, du->tail_td);
+            }
+
             if (du->complete) du->complete(du);
         }
 
