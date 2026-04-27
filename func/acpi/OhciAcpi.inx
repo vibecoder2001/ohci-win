@@ -1,0 +1,50 @@
+; OhciAcpi.inx — OHCI UCX miniport (ACPI variant for ARM64 / RK3588)
+[Version]
+Signature    = "$Windows NT$"
+Class        = USB
+ClassGuid    = {36fc9e60-c465-11cf-8056-444553540000}
+Provider     = %ProviderName%
+CatalogFile  = OhciAcpi.cat
+DriverVer    = 01/01/2026,1.0.0.0
+PnpLockdown  = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+OhciAcpi.sys = 1
+
+[Manufacturer]
+%MfgName% = Standard,NTARM64.10.0...16299
+
+; Match the generic ACPI class-code HardwareID for any ACPI-enumerated
+; OHCI controller (CLS_000C=Serial Bus, SUBCLS_0003=USB, PI_10=OHCI
+; programming interface).
+[Standard.NTARM64.10.0...16299]
+%DeviceDesc% = OhciAcpi_Device, ACPI\VEN_PRP&CLS_000C&SUBCLS_0003&PI_10
+
+[OhciAcpi_Device.NT]
+CopyFiles = OhciAcpi_CopyFiles
+
+[OhciAcpi_CopyFiles]
+OhciAcpi.sys
+
+[OhciAcpi_Device.NT.Services]
+AddService = OhciAcpi, 0x00000002, OhciAcpi_Service
+
+[OhciAcpi_Service]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\OhciAcpi.sys
+
+[Strings]
+ProviderName = "Vibe Coder"
+MfgName      = "Vibe Coder"
+DiskName     = "OhciAcpi Installation Disk"
+DeviceDesc   = "OHCI USB Host Controller (ohci-win, ACPI)"
+ServiceDesc  = "OhciAcpi"
