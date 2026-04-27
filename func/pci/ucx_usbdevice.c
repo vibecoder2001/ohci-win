@@ -271,7 +271,7 @@ static EVT_UCX_USBDEVICE_ENABLE               EvtUsbDeviceEnable;
 static EVT_UCX_USBDEVICE_DISABLE              EvtUsbDeviceDisable;
 static EVT_UCX_USBDEVICE_RESET                EvtUsbDeviceReset;
 static EVT_UCX_USBDEVICE_ADDRESS              StubUsbDeviceAddress;
-static EVT_UCX_USBDEVICE_UPDATE               StubUsbDeviceUpdate;
+static EVT_UCX_USBDEVICE_UPDATE               EvtUsbDeviceUpdate;
 static EVT_UCX_USBDEVICE_HUB_INFO             StubUsbDeviceHubInfo;
 static EVT_UCX_USBDEVICE_ENDPOINTS_CONFIGURE  StubUsbDeviceEndpointsConfigure;
 
@@ -460,13 +460,54 @@ StubUsbDeviceAddress(
 
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceUpdate(
+EvtUsbDeviceUpdate(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceUpdate (stub)");
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_UPDATE upd =
+        (PUSBDEVICE_UPDATE)rp.Parameters.Others.Arg1;
+    if (upd == NULL) {
+        LOG("UsbDeviceUpdate: missing update packet");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    /* In C, USBDEVICE_MGMT_HEADER is an anonymous struct; fields are
+     * accessed directly (upd->UsbDevice, not upd->Header.UsbDevice). */
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(upd->UsbDevice);
+    if (udc == NULL || udc->Ep0 == NULL) {
+        LOG("UsbDeviceUpdate: NULL udc or Ep0");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+
+    /* The only field on this controller that warrants a host-side rewrite
+     * is EP0's MaxPacketSize. UCX delivers it after the host has read
+     * enough of the device descriptor to know it (typical case: enumeration
+     * starts with MPS=8, bumps to 64 after the first 8-byte read). All
+     * other fields (speed, hub TT, port path) are no-ops on OHCI. */
+    uint16_t newMps = (upd->DeviceDescriptor != NULL)
+                      ? (uint16_t)upd->DeviceDescriptor->bMaxPacketSize0
+                      : 0;
+    struct ohci_ed *ed = udc->Ep0->Core.Control.ed;
+    if (ed == NULL) {
+        LOG("UsbDeviceUpdate: EP0 ED missing");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    uint16_t curMps = (uint16_t)((ed->Control >> OHCI_ED_MPS_SHIFT) & 0x7FFu);
+    if (newMps != 0 && newMps != curMps) {
+        LOG("UsbDeviceUpdate: EP0 MPS %u -> %u", curMps, newMps);
+        OhciPci_EditHeadPSafely(udc->Ep0->Dc, ed,
+                                 OhciPci_HeadPSetMps, &newMps);
+    } else {
+        LOG("UsbDeviceUpdate: EP0 MPS unchanged (%u)", curMps);
+    }
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -580,7 +621,7 @@ OhciPci_UsbDeviceAdd(
         EvtUsbDeviceDisable,              /* EvtUsbDeviceDisable            */
         EvtUsbDeviceReset,                /* EvtUsbDeviceReset              */
         StubUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
-        StubUsbDeviceUpdate,              /* EvtUsbDeviceUpdate             */
+        EvtUsbDeviceUpdate,               /* EvtUsbDeviceUpdate             */
         StubUsbDeviceHubInfo,             /* EvtUsbDeviceHubInfo            */
         OhciPci_DefaultEndpointAdd,       /* EvtUsbDeviceDefaultEndpointAdd */
         OhciPci_EndpointAdd               /* EvtUsbDeviceEndpointAdd        */
