@@ -984,7 +984,18 @@ OhciPci_EvtIsocBackstopTimer(WDFTIMER Timer)
     /* TRANSFER_URB.Timeout watchdog. Walk hc->in_flight; for any URB
      * whose timeout has passed (uc->TimeoutMs > 0 && elapsed >= ms),
      * collect its ED for cancel below. We can't call cancel_for_ed
-     * inline because it mutates hc->in_flight under our walk. */
+     * inline because it mutates hc->in_flight under our walk.
+     *
+     * `ohci_urb_cancel_for_ed` cancels ALL URBs whose `u->ed` matches.
+     * That's safe here because non-isoch EPs use
+     * WdfIoQueueDispatchSequential (see queue config in EndpointAdd):
+     * UCX waits for WdfRequestComplete on URB N before dispatching
+     * URB N+1, and the drain splices URB N off hc->in_flight BEFORE
+     * staging on DeferredCompletions, so at most one URB per ED is
+     * ever in_flight. If the queue dispatch type changes to Parallel
+     * for any non-isoch EP kind, this cancel-by-ED becomes a
+     * collateral-cancellation hazard and needs a per-URB cancel
+     * helper instead. Isoch URBs are explicitly skipped here. */
     {
         ULONGLONG now = KeQueryInterruptTime();
         for (struct ohci_urb *u = dc->Hc.in_flight; u != NULL;

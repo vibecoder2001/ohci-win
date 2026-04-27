@@ -110,16 +110,30 @@ static struct ohci_urb *urb_for_td_phys(struct ohci_hc *hc, uint32_t td_phys,
 /* Match a retired TD against a URB's head_td. Used to catch SETUP-TD
  * STALLs on control transfers — the SETUP TD is urb->head_td and is
  * NOT in data_tds[] (control submit only records the DATA stage there),
- * so urb_for_data_td_phys misses it and the URB orphans. Bulk URBs set
- * head_td == data_tds[0]'s slot, so this only meaningfully fires on
- * control SETUP STALLs (rare but legal — see OHCI §6.4.4). */
+ * so urb_for_data_td_phys misses it and the URB orphans on a SETUP
+ * STALL.
+ *
+ * Today bulk submit (ohci_bulk_submit_sg) sets head_td equal to
+ * data_tds[0]'s slot, so a bulk hard error always matches the data-TD
+ * branch and never reaches this fallback. The `head_td_phys ==
+ * data_tds[0].td_phys` skip below makes that invariant explicit: if a
+ * future bulk refactor breaks it, the SETUP fallback won't silently
+ * activate with bulk-incompatible orphan-cleanup semantics (free
+ * entire data_tds[] chain, which is wrong for a partially-completed
+ * bulk SG). */
 static struct ohci_urb *urb_for_head_td_phys(struct ohci_hc *hc,
                                               uint32_t td_phys) {
     for (struct ohci_urb *u = hc->in_flight; u != NULL; u = u->next_pending) {
         if (!u->head_td) continue;
         uint32_t head_phys = hc->dma->phys_base +
             (uint32_t)((uint8_t*)u->head_td - hc->dma->base);
-        if (head_phys == td_phys) return u;
+        if (head_phys != td_phys) continue;
+        /* Skip bulk-shape URBs where head_td IS data_tds[0]; those are
+         * handled by the data-TD branch and the orphan-free pattern
+         * here would over-free. */
+        if (u->data_td_count > 0 &&
+            (u->data_tds[0].td_phys & ~0xFu) == head_phys) continue;
+        return u;
     }
     return NULL;
 }

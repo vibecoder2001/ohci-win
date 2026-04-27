@@ -219,10 +219,20 @@ static int test_ue_recovery(void) {
     if (ohci_control_submit(&hc, &ep, &urb2) != 0) FAIL("submit2");
     if (hc.in_flight == NULL) FAIL("expected in_flight after submits");
 
+    /* Snapshot SW-side chain state before reinit. The reinit's contract
+     * is that it rebuilds list-head registers from hc->control_head /
+     * hc->bulk_head — so post-reinit registers must match these
+     * snapshots. Comparing to ep.ed_phys alone is weaker because the
+     * test would still pass if reinit accidentally NULL'd
+     * hc->control_head and just happened to write the right value
+     * from somewhere else. */
+    struct ohci_control_endpoint *expected_control_head = hc.control_head;
+    uint32_t expected_control_head_phys = expected_control_head
+                                          ? expected_control_head->ed_phys
+                                          : 0;
+
     /* Scribble over the list-head registers so we can prove reinit
-     * actually rewrites them. (HCR also clears them, but injecting a
-     * known-bad value catches a future regression where reinit forgets
-     * the rewrite.) */
+     * actually rewrites them. */
     ops.write32(ops.context, 0x20 /* HcControlHeadED */, 0xDEADBEEFu);
     ops.write32(ops.context, 0x18 /* HcHCCA          */, 0xDEADBEEFu);
 
@@ -235,11 +245,19 @@ static int test_ue_recovery(void) {
         FAIL("ue urb status: %d %d", urb1.status, urb2.status);
     if (hc.in_flight != NULL) FAIL("in_flight not drained");
 
+    /* SW chain must survive reinit (URB completion shouldn't touch it). */
+    if (hc.control_head != expected_control_head)
+        FAIL("control_head changed across reinit: %p -> %p",
+             expected_control_head, hc.control_head);
+
+    /* Registers rebuilt FROM the SW chain, not from a stale snapshot or
+     * lucky coincidence. */
     if (ops.read32(ops.context, 0x18) != hc.hcca_phys)
         FAIL("HCCA reg not reprogrammed: 0x%08X", ops.read32(ops.context, 0x18));
-    if (ops.read32(ops.context, 0x20) != ep.ed_phys)
-        FAIL("HcControlHeadED not reprogrammed: 0x%08X",
-             ops.read32(ops.context, 0x20));
+    if (ops.read32(ops.context, 0x20) != expected_control_head_phys)
+        FAIL("HcControlHeadED not rebuilt from control_head: "
+             "got 0x%08X expected 0x%08X",
+             ops.read32(ops.context, 0x20), expected_control_head_phys);
     /* HcFmInterval must include FSMPS — RK3588 silently skips TDs without
      * it, so reinit MUST reprogram both fields, not just FrameInterval. */
     uint32_t fmi = ops.read32(ops.context, 0x34);
@@ -272,13 +290,18 @@ static int test_bulk_k_bracket(void) {
     };
     if (ohci_bulk_endpoint_create(&hc, &bcfg, &bep) != 0) FAIL("bulk_ep");
 
-    /* End state of K must be 0 so the HC walks the ED. The bracket sets
-     * K=1 transiently around HeadP/TailP writes — by the time submit
-     * returns, K is back to 0. (The real-silicon test of the bracket is
-     * cycle-accurate timing the HC dropping its cached ED snapshot;
-     * here we're verifying the surrounding invariant: K=0 on exit.) */
-    uint32_t before_k = bep.ed->Control & OHCI_ED_K;
-    if (before_k != 0) FAIL("K set before submit");
+    /* Pre-set K=1 and H=1 to simulate the post-STALL / post-cancel state
+     * the new bracket has to recover from. Old (pre-6609952) bulk submit
+     * cleared K once at the start and never re-set it; new submit must
+     * still arrive at K=0 / H=0 / valid TailP regardless of entry state.
+     * NOTE: this test verifies END-STATE invariants only — it cannot
+     * observe the K=1 *during* HeadP/TailP rewrites without a write-
+     * intercept hook on the fake HC. The real value of the bracket
+     * is cycle-accurate (HC's cached ED snapshot drop), which the fake
+     * HC doesn't model. End-state K=0 / H=0 plus a working happy-path
+     * is all this harness can prove. */
+    bep.ed->Control |= OHCI_ED_K;
+    bep.ed->HeadP   |= OHCI_ED_HEADP_H;
 
     uint32_t buf_phys;
     void *buf = ohci_dma_alloc(&dma, 64, 4, &buf_phys);
@@ -290,12 +313,9 @@ static int test_bulk_k_bracket(void) {
     if (ohci_bulk_submit_sg(&hc, &bep, &urb, pages, 1) != 0) FAIL("bulk submit");
 
     if ((bep.ed->Control & OHCI_ED_K) != 0)
-        FAIL("K bit still set after submit");
-    /* H must also be clear — the bracket explicitly clears it for STALL
-     * recovery. Even on a fresh ED with no prior STALL the result must
-     * still be H=0. */
+        FAIL("K bit still set after submit (entry-from-K=1 failed)");
     if ((bep.ed->HeadP & OHCI_ED_HEADP_H) != 0)
-        FAIL("H bit set after submit");
+        FAIL("H bit still set after submit (STALL recovery failed)");
 
     /* Now exec the HC and confirm normal completion still works (regression
      * guard: the bracket shouldn't break the happy path). */
@@ -305,7 +325,7 @@ static int test_bulk_k_bracket(void) {
     if (urb.status != OHCI_URB_STATUS_OK)
         FAIL("bulk happy-path status=%d", urb.status);
 
-    printf("PASS: bulk submit ends with K=0 / H=0 and completes normally\n");
+    printf("PASS: bulk submit recovers from K=1/H=1 entry and completes\n");
     return 0;
 }
 
