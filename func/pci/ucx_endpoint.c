@@ -1121,27 +1121,14 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
             break;
         }
 
-        /* Execute fires IsocProgramDma synchronously (HAL invokes inline
-         * on x86); CoreLock stays held across the call. On failure
-         * IsocProgramDma's helper stages a deferred completion. */
-        NTSTATUS s = WdfDmaTransactionExecute(uc->DmaTransaction, uc);
-        if (!NT_SUCCESS(s)) {
-            LOG("IsocRefill: WdfDmaTransactionExecute failed 0x%08X", s);
-            /* Don't call WdfDmaTransactionDmaCompletedFinal here. Per
-             * KMDF docs CompletedFinal is only valid in Transferring
-             * state; if Execute failed the txn never reached that state
-             * and CompletedFinal triggers WDF_VIOLATION 0x10D sub-code 8
-             * ("DMA transaction in wrong state"). Just delete the txn —
-             * any HAL resources it allocated get released by the delete. */
-            WdfObjectDelete(uc->DmaTransaction);
-            uc->DmaTransaction = NULL;
-            if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
-            uc->DeferredStatus = s;
-            uc->DeferredInfo   = 0;
-            InsertTailList(&dc->DeferredCompletions, &uc->DeferredEntry);
-        }
-        /* Re-read fmNumber: synchronous Execute may have spent enough
-         * cycles that the frame counter advanced. */
+        /* Spike (T7): walk the MDL and emit ITDs directly. CoreLock stays
+         * held across the call. On failure BuildAndSubmit stages the URB
+         * on dc->DeferredCompletions itself. */
+        NTSTATUS s = OhciPci_IsocBuildAndSubmit_Locked(ep, uc);
+        (void)s;   /* failure already routed onto DeferredCompletions */
+
+        /* Re-read fmNumber: BuildAndSubmit may have consumed enough cycles
+         * for the frame counter to advance. */
         fmNumber = (uint16_t)(dc->MmioOps.read32(dc->MmioOps.context, 0x3C) & 0xFFFFu);
     }
 
@@ -1281,48 +1268,19 @@ OhciPci_HandleIsocUrb(
     uc->UserMdl       = bufMdl;       /* may be ourMdl if caller had no MDL */
     uc->UserVa        = bufVa;
 
-    WDF_OBJECT_ATTRIBUTES txnAttrs;
-    WDF_OBJECT_ATTRIBUTES_INIT(&txnAttrs);
-    /* Use the packet-profile DMA enabler so HAL bounces page-fragmented
-     * audio buffers into a single contiguous physical chunk before
-     * EvtProgramDma fires. Avoids the "packet 7 spans non-contiguous SG
-     * runs" rejection on every other URB that scatter-gather profile
-     * triggered. */
-    status = WdfDmaTransactionCreate(dc->IsocDmaEnabler, &txnAttrs,
-                                      &uc->DmaTransaction);
-    if (!NT_SUCCESS(status)) {
-        LOG("HandleIsocUrb: WdfDmaTransactionCreate failed: 0x%08X", status);
-        if (ourMdl) { IoFreeMdl(ourMdl); uc->OurMdl = NULL; }
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    PVOID va = bufVa ? bufVa : MmGetMdlVirtualAddress(bufMdl);
-    status = WdfDmaTransactionInitialize(uc->DmaTransaction,
-                                          OhciPci_IsocProgramDma,
-                                          isIn ? WdfDmaDirectionReadFromDevice
-                                               : WdfDmaDirectionWriteToDevice,
-                                          bufMdl, va, length);
-    if (!NT_SUCCESS(status)) {
-        LOG("HandleIsocUrb: WdfDmaTransactionInitialize failed: 0x%08X", status);
-        WdfObjectDelete(uc->DmaTransaction);
-        uc->DmaTransaction = NULL;
-        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    /* Plan 8 Task 7: queue the URB onto the EP's pending list rather than
-     * executing the DMA transaction directly. The refill DPC drives
-     * WdfDmaTransactionExecute when the ED chain has headroom (lead <
-     * OHCIPCI_ISOC_REFILL_HIGH frames). Trigger one immediate refill cycle
-     * so single-shot callers drain right away if there's room.
+    /* Spike: no WdfDmaTransaction. The MDL-walk path
+     * (OhciPci_IsocBuildAndSubmit_Locked) emits ITDs against the user MDL
+     * directly. uc->DmaTransaction stays NULL (RtlZeroMemory cleared it),
+     * so OhciPci_UrbComplete's `if (uc->DmaTransaction)` block — which
+     * would otherwise call WdfDmaTransactionDmaCompletedFinal on a
+     * Created-state txn and bug-check WDF_VIOLATION 0x10D sub 8 — is
+     * skipped cleanly.
      *
-     * Note: completion is async — refill will either Execute the
-     * transaction (which fires IsocProgramDma synchronously while we hold
-     * CoreLock) or leave it queued; either way we return without touching
-     * the request further. Failures from Execute land on
-     * DeferredCompletions via OhciPci_IsocProgramDmaFail. */
+     * Queue the URB onto the EP's pending list. The refill walker drives
+     * OhciPci_IsocBuildAndSubmit_Locked when the ED chain has headroom
+     * (lead < OHCIPCI_ISOC_REFILL_HIGH frames). Trigger one immediate
+     * refill cycle so single-shot callers drain right away if there's room.
+     * Failures from BuildAndSubmit land on DeferredCompletions. */
     WdfSpinLockAcquire(ep->IsocQueueLock);
     InsertTailList(&ep->IsocQueuedUrbs, &uc->QueueEntry);
     WdfSpinLockRelease(ep->IsocQueueLock);
@@ -2032,23 +1990,22 @@ OhciPci_EndpointAdd(
     ep->Dc    = g_DeviceContext;
     ep->UcxEp = ucxEp;
 
-    /* 3. Per-EP WDFQUEUE. Sequential dispatch for all kinds.
+    /* 3. Per-EP WDFQUEUE.
      *
-     * Tried Parallel for Isoch to let usbaudio pipeline 2-3 URBs ahead
-     * (would fix the ~50% playback-speed distortion caused by the strict
-     * 1:1 submit/complete cadence Sequential forces). It crashed with
-     * WDF_VIOLATION 0x10D sub-code 8 ("DMA transaction in wrong state")
-     * because our isoch DMA enabler uses WdfDmaProfilePacket — single
-     * channel, only one Execute outstanding. The 2nd concurrent
-     * HandleIsocUrb's WdfDmaTransactionExecute fails, the fail-path
-     * calls CompletedFinal on a transaction that never reached
-     * Transferring state, and KMDF bug-checks. Sticking with Sequential
-     * keeps the driver alive and audible. Pipelining + faster cadence is
-     * a follow-up: needs either a ScatterGather DMA enabler with the
-     * page-straddle handling, or bypassing WdfDmaTransaction entirely
-     * and walking the MDL ourselves. */
+     * Sequential dispatch for Control/Bulk/Interrupt — the existing WDF
+     * DMA transaction lifecycle assumes one Execute outstanding per EP.
+     *
+     * Spike (T7): Parallel for Isoch. The previous Sequential setting
+     * forced a 1:1 submit/complete cadence that ran ~50% real-time.
+     * Parallel was previously unsafe because the isoch DMA enabler used
+     * WdfDmaProfilePacket (single channel) and a 2nd concurrent
+     * WdfDmaTransactionExecute would bug-check WDF_VIOLATION 0x10D sub 8.
+     * The MDL-walk path (OhciPci_IsocBuildAndSubmit_Locked) bypasses
+     * WdfDmaTransaction entirely, so depth-N is safe again. */
     WDF_IO_QUEUE_CONFIG qCfg;
-    WDF_IO_QUEUE_CONFIG_INIT(&qCfg, WdfIoQueueDispatchSequential);
+    WDF_IO_QUEUE_CONFIG_INIT(&qCfg,
+        (attrs == 0x01) ? WdfIoQueueDispatchParallel
+                        : WdfIoQueueDispatchSequential);
     qCfg.EvtIoDefault = EvtUrbDefault;
     qCfg.PowerManaged = WdfFalse;
     WDF_OBJECT_ATTRIBUTES qAttrs;
