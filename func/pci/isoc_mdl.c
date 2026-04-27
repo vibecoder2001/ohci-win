@@ -303,10 +303,6 @@ OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
     }
 }
 
-/* --------------------------------------------------------------------------
- * Forward stubs — Tasks 5/6 each fill in one body. Present here so the
- * unit links cleanly when isoc_mdl.h's full API is referenced.
- * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
 {
@@ -316,12 +312,28 @@ OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
     UNREFERENCED_PARAMETER(ep);
 }
 
+/* --------------------------------------------------------------------------
+ * Cancel callback — intentionally a no-op for the spike.
+ *
+ * OhciPci_IsocBuildAndSubmit_Locked deliberately does NOT call
+ * WdfRequestMarkCancelable, so WDF never invokes this callback. Per-URB
+ * cancellation isn't required by the spike GO criterion (start->stop->start
+ * of a usbaudio stream): usbaudio.sys "stops" by issuing SET_INTERFACE(alt=0),
+ * which triggers UcxEndpointPurge -> WDF queue purge (for URBs not yet
+ * handed to BuildAndSubmit) plus OhciPci_IsocEpTeardown_Locked (T6, for URBs
+ * with ITDs already linked into the ED). Those two paths cover stop/restart.
+ *
+ * If a future plan needs interruptible per-URB cancel, fill in here:
+ * pause via OhciPci_EditHeadPSafely, wait one SOF, unlink the URB's ITDs,
+ * complete USBD_STATUS_CANCELED, then clear Skip if more work remains.
+ * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocCancelEmitted(_In_ WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(Request);
 }
 
+/* T6 fills in OhciPci_IsocEpTeardown_Locked. */
 VOID
 OhciPci_IsocEpTeardown_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
 {
