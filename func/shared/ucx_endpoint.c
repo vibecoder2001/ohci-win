@@ -1251,11 +1251,26 @@ EvtUrbDefault(
         ULONG hcFmNumber    = READ_REGISTER_ULONG((PULONG)(mmio + 0x3C));
         ULONG hcCtlHeadED   = READ_REGISTER_ULONG((PULONG)(mmio + 0x20));
         ULONG hcCtlCurED    = READ_REGISTER_ULONG((PULONG)(mmio + 0x24));
+        ULONG hcFmInterval  = READ_REGISTER_ULONG((PULONG)(mmio + 0x34));
+        ULONG hcPerStart    = READ_REGISTER_ULONG((PULONG)(mmio + 0x40));
+        ULONG hcHccaReg     = READ_REGISTER_ULONG((PULONG)(mmio + 0x18));
         struct ohci_ed *ed  = ep->Core.Control.ed;
         LOG("post-submit: HcControl=0x%08X CmdStat=0x%08X IntSt=0x%08X "
             "IntEn=0x%08X FmNum=0x%04X CtlHead=0x%08X CtlCur=0x%08X",
             hcControl, hcCmdStatus, hcIntStatus, hcIntEnable,
             hcFmNumber & 0xFFFF, hcCtlHeadED, hcCtlCurED);
+        LOG("post-submit: HcFmInterval=0x%08X HcPeriodicStart=0x%08X HcHCCA=0x%08X",
+            hcFmInterval, hcPerStart, hcHccaReg);
+        /* HCCA.FrameNumber is written by HC every SOF. If it lags
+         * HcFmNumber, the HC's DMA-write path to memory is broken; if
+         * it matches, writes work and only TD/ED reads are suspect. */
+        if (dc->Hc.hcca) {
+            uint16_t hccaFn  = dc->Hc.hcca->FrameNumber;
+            uint16_t hccaPad = dc->Hc.hcca->PadFrameNumber;
+            uint32_t hccaDh  = dc->Hc.hcca->DoneHead;
+            LOG("post-submit HCCA: FrameNumber=0x%04X Pad=0x%04X DoneHead=0x%08X (HcFmNum=0x%04X)",
+                hccaFn, hccaPad, hccaDh, hcFmNumber & 0xFFFF);
+        }
         LOG("post-submit ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
             ed->Control, ed->TailP, ed->HeadP, ed->NextED);
         /* Walk the TD chain HeadP..TailP from CPU side and log raw dwords —
