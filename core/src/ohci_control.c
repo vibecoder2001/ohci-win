@@ -229,11 +229,25 @@ int ohci_control_submit(struct ohci_hc *hc,
      * RK3588's OHCI) caches HeadP/TailP from the ED's first scan and
      * never re-fetches after a TailP-only update — symptom: HC parks at
      * the ED with CtlCur==CtlHead and never starts the SETUP TD.
-     * Bracket the TailP write with a K-toggle so the HC drops its
-     * cached ED snapshot and re-reads on the next frame. */
+     * Bracket the writes with a K-toggle so the HC drops its cached ED
+     * snapshot and re-reads on the next frame.
+     *
+     * Also rewrite HeadP unconditionally to point at the freshly-built
+     * SETUP TD (head_td_phys, with H=0 C=0). This serves two purposes:
+     *  1. Recovers from a prior STALL: OHCI §6.4.4 sets HeadP[0] (H,
+     *     Halted) when a TD reports a non-zero CC. The HCD must clear
+     *     it before new TDs on this ED will dispatch. We never get an
+     *     EP0-level reset callback from UCX for control STALLs, so the
+     *     submit path itself has to clear the halt.
+     *  2. EP0 toggle always restarts at DATA0 on SETUP per USB §8.5.3,
+     *     so dropping the C (toggle Carry) bit by writing HeadP=head_td_phys
+     *     is correct for control endpoints. (NOT correct for bulk/interrupt
+     *     where toggle must persist — those EPs use the EditHeadPSafely
+     *     helper for selective edits.) */
     ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
     ep->ed->TailP = new_ph_phys;
+    ep->ed->HeadP = head_td_phys;
     hc->ops.barrier(hc->ops.context);
     ep->ed->Control &= ~OHCI_ED_K;
 
