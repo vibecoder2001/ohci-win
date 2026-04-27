@@ -369,6 +369,14 @@ DeviceWalk_ResetToggle(OHCIPCI_EP_CONTEXT *ep, void *ctx)
     UNREFERENCED_PARAMETER(ctx);
     /* Isoch has no toggle and no H bit semantics — skip. */
     if (ep->Kind == OhciPciEpKindIsoc) return;
+    /* Skip EP0 (Control). USB §9.2.6.5 says device-side toggles reset
+     * on port reset, but OHCI control endpoints reset their toggle at
+     * each SETUP phase anyway — clearing C on EP0 is unnecessary. And
+     * doing it after DefaultEp Purge has set K=1 and cancelled in-flight
+     * URBs leaves stale TDs hanging off HeadP that the post-reset
+     * GET_DEVICE_DESCRIPTOR can't retire — observed as Device-Manager
+     * disable+re-enable hanging the audio device until unplug/replug. */
+    if (ep->Kind == OhciPciEpKindControl) return;
     struct ohci_ed *ed = OhciPci_EpEd(ep);
     if (ed == NULL) return;
     OhciPci_EditHeadPSafely(ep->Dc, ed, OhciPci_HeadPClearHC, NULL);
