@@ -269,7 +269,7 @@ OhciPci_DeviceWalkEps(OHCIPCI_USBDEV_CTX *udc, ohcipci_dev_ep_fn fn, void *ctx)
 
 static EVT_UCX_USBDEVICE_ENABLE               EvtUsbDeviceEnable;
 static EVT_UCX_USBDEVICE_DISABLE              EvtUsbDeviceDisable;
-static EVT_UCX_USBDEVICE_RESET                StubUsbDeviceReset;
+static EVT_UCX_USBDEVICE_RESET                EvtUsbDeviceReset;
 static EVT_UCX_USBDEVICE_ADDRESS              StubUsbDeviceAddress;
 static EVT_UCX_USBDEVICE_UPDATE               StubUsbDeviceUpdate;
 static EVT_UCX_USBDEVICE_HUB_INFO             StubUsbDeviceHubInfo;
@@ -349,15 +349,44 @@ EvtUsbDeviceDisable(
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
+static VOID
+DeviceWalk_ResetToggle(OHCIPCI_EP_CONTEXT *ep, void *ctx)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    /* Isoch has no toggle and no H bit semantics — skip. */
+    if (ep->Kind == OhciPciEpKindIsoc) return;
+    struct ohci_ed *ed = OhciPci_EpEd(ep);
+    if (ed == NULL) return;
+    OhciPci_EditHeadPSafely(ep->Dc, ed, OhciPci_HeadPClearHC, NULL);
+}
+
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceReset(
+EvtUsbDeviceReset(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceReset (stub)");
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_MGMT_HEADER hdr =
+        (PUSBDEVICE_MGMT_HEADER)rp.Parameters.Others.Arg1;
+    if (hdr == NULL) {
+        LOG("UsbDeviceReset: missing mgmt header");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(hdr->UsbDevice);
+    if (udc == NULL) {
+        LOG("UsbDeviceReset: NULL device context");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    LOG("UsbDeviceReset — clearing toggles on all non-isoch EPs");
+    OhciPci_DeviceWalkEps(udc, DeviceWalk_ResetToggle, NULL);
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -549,7 +578,7 @@ OhciPci_UsbDeviceAdd(
         StubUsbDeviceEndpointsConfigure,  /* EvtUsbDeviceEndpointsConfigure */
         EvtUsbDeviceEnable,               /* EvtUsbDeviceEnable             */
         EvtUsbDeviceDisable,              /* EvtUsbDeviceDisable            */
-        StubUsbDeviceReset,               /* EvtUsbDeviceReset              */
+        EvtUsbDeviceReset,                /* EvtUsbDeviceReset              */
         StubUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
         StubUsbDeviceUpdate,              /* EvtUsbDeviceUpdate             */
         StubUsbDeviceHubInfo,             /* EvtUsbDeviceHubInfo            */
