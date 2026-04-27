@@ -236,34 +236,6 @@ OhciPci_UrbComplete(struct ohci_urb *u)
             }
             turb->u.Isoch.ErrorCount   = totalErr;
             turb->TransferBufferLength = totalLen;
-            {
-                static ULONG s_isocCompletes = 0;
-                ULONG n = ++s_isocCompletes;
-                /* Per-URB cadence delta in µs from QPC. First retire on
-                 * a fresh EP has LastTraceQpc==0 -> suppress the
-                 * meaningless huge delta on the first sample. */
-                LARGE_INTEGER freq;
-                LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(&freq);
-                ULONGLONG deltaUs = 0;
-                POHCIPCI_EP_CONTEXT epc = uc->EpCtx;
-                if (epc->IsocLastTraceQpc.QuadPart != 0 && freq.QuadPart != 0) {
-                    deltaUs =
-                        ((ULONGLONG)(nowQpc.QuadPart - epc->IsocLastTraceQpc.QuadPart)
-                         * 1000000ULL) / (ULONGLONG)freq.QuadPart;
-                }
-                epc->IsocLastTraceQpc = nowQpc;
-                if (n <= 8 || (n & 0x1F) == 0) {
-                    LOG("isoc[%lu] dir=%s urbLen=%lu totalLen=%lu err=%lu nPkts=%lu "
-                        "delta_us=%llu cc=%u %u %u %u %u %u %u %u %u %u",
-                        n, isOut ? "OUT" : "IN", urbLen, totalLen, totalErr, nPkts,
-                        deltaUs,
-                        u->isoc_pkts[0].cc, u->isoc_pkts[1].cc,
-                        u->isoc_pkts[2].cc, u->isoc_pkts[3].cc,
-                        u->isoc_pkts[4].cc, u->isoc_pkts[5].cc,
-                        u->isoc_pkts[6].cc, u->isoc_pkts[7].cc,
-                        u->isoc_pkts[8].cc, u->isoc_pkts[9].cc);
-                }
-            }
             turb->Hdr.Status           = USBD_STATUS_SUCCESS;
         }
         /* Unlink from EP's in-flight list and release the page-straddle
@@ -1061,15 +1033,6 @@ OhciPci_HandleIsocUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
-    {
-        static ULONG s_isocSubmits = 0;
-        ULONG n = ++s_isocSubmits;
-        if (n <= 8 || (n & 0x1F) == 0) {
-            LOG("isoc-submit[%lu] len=%lu nPkts=%lu dir=%s",
-                n, length, urb->u.Isoch.NumberOfPackets, isIn ? "IN" : "OUT");
-        }
-    }
-
     if (length == 0 || urb->u.Isoch.NumberOfPackets == 0) {
         urb->TransferBufferLength = 0;
         urb->Hdr.Status = USBD_STATUS_SUCCESS;
@@ -1216,11 +1179,6 @@ EvtUrbDefault(
     PVOID   bufVa      = urb->TransferBuffer;
     PMDL    bufMdl     = urb->TransferBufferMDL;
     BOOLEAN isIn       = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
-
-    LOG("EvtUrbDefault: fn=0x%X len=%lu dir=%s setup=%02X %02X %02X %02X %02X %02X %02X %02X",
-        fn, length, isIn ? "IN" : "OUT",
-        setupBytes[0], setupBytes[1], setupBytes[2], setupBytes[3],
-        setupBytes[4], setupBytes[5], setupBytes[6], setupBytes[7]);
 
     /* Intercept CLEAR_FEATURE(ENDPOINT_HALT) on a non-default EP so we
      * can clear the matching OHCI ED's H+C bits in lock-step with the
@@ -1570,7 +1528,7 @@ EvtDefaultEpOkToCancel(
     )
 {
     UNREFERENCED_PARAMETER(UcxEndpoint);
-    LOG("DefaultEp OkToCancel (Plan 5: no-op)");
+    LOG("DefaultEp OkToCancel");
 }
 
 _Use_decl_annotations_

@@ -214,8 +214,12 @@ static VOID OhciPciInterruptTx(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
         RtlZeroMemory((PUCHAR)outBuf + copyLen, outLen - copyLen);
     }
 
-    LOG("RootHub InterruptTx: bitmap[0]=0x%02X (anyChange=%d), ports=%lu, copied %zu bytes",
-        bitmap[0], anySet, ports, copyLen);
+    /* Log only when UCX learns something (anySet) — silent polls are
+     * the common case and just spam the trace. */
+    if (anySet) {
+        LOG("RootHub InterruptTx: bitmap[0]=0x%02X, ports=%lu, copied %zu bytes",
+            bitmap[0], ports, copyLen);
+    }
 
     urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
     WdfRequestComplete(Request, STATUS_SUCCESS);

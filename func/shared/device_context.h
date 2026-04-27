@@ -190,11 +190,6 @@ typedef struct _OHCIPCI_EP_CONTEXT {
      * a no-op in the refund path. */
     ULONG                          PeriodicBudgetCharged;
 
-    /* KeQueryPerformanceCounter timestamp of the previous isoc[N] retire
-     * trace, used to log per-URB cadence delta in µs. Zero on the first
-     * retire => suppresses the first delta print. */
-    LARGE_INTEGER                  IsocLastTraceQpc;
-
     /* Per-device membership — back-pointer to the owning UCXUSBDEVICE's
      * context, plus the LIST_ENTRY hanging us off udc->EndpointList.
      * DeviceEpEntry.Flink == NULL is the "not on any list" sentinel

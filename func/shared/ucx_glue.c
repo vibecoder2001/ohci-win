@@ -296,7 +296,7 @@ OhciPci_UcxControllerCreate(
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&ctrlAttrs, OHCIPCI_CONTROLLER_CTX);
     NTSTATUS status = UcxControllerCreate(dc->Device, &cfg,
                                           &ctrlAttrs, &controller);
-    LOG("UcxControllerCreate -> 0x%08X  (THIS IS THE GATE)", status);
+    LOG("UcxControllerCreate -> 0x%08X", status);
     if (NT_SUCCESS(status)) {
         OhciPci_ControllerCtxGet(controller)->Dc = dc;
     }
