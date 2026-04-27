@@ -93,3 +93,7 @@ add_test(NAME isoc_submit COMMAND test_isoc_submit)
 add_executable(test_isoc_drain test_isoc_drain.c)
 target_link_libraries(test_isoc_drain PRIVATE fake_hc)
 add_test(NAME isoc_drain COMMAND test_isoc_drain)
+
+add_executable(test_error_paths test_error_paths.c)
+target_link_libraries(test_error_paths PRIVATE fake_hc)
+add_test(NAME error_paths COMMAND test_error_paths)
