@@ -712,9 +712,25 @@ static VOID
 OhciPci_EpContextCleanup(WDFOBJECT Object)
 {
     POHCIPCI_EP_CONTEXT ep = OhciPci_EpContextGet((UCXENDPOINT)Object);
-    if (ep == NULL || ep->Kind != OhciPciEpKindIsoc) return;
+    if (ep == NULL) return;
     PDEVICE_CONTEXT dc = ep->Dc;
-    if (dc == NULL) return;
+
+    /* Unlink from owning device's EndpointList first. Cleanup runs at
+     * PASSIVE; spinlock is brief (one RemoveEntryList). The Flink-NULL
+     * check makes this safe for EPs whose create failed before insert. */
+    if (ep->Udc != NULL && ep->Udc->EndpointListLock != NULL &&
+        ep->DeviceEpEntry.Flink != NULL)
+    {
+        WdfSpinLockAcquire(ep->Udc->EndpointListLock);
+        if (ep->DeviceEpEntry.Flink != NULL) {
+            RemoveEntryList(&ep->DeviceEpEntry);
+            ep->DeviceEpEntry.Flink = NULL;
+        }
+        WdfSpinLockRelease(ep->Udc->EndpointListLock);
+    }
+
+    /* Isoch-only teardown follows. */
+    if (ep->Kind != OhciPciEpKindIsoc || dc == NULL) return;
 
     /* Unlink from dc->IsocEps so the refill walker stops touching us.
      * Defensive: if Flink is NULL we were never spliced (e.g. EP create
@@ -728,7 +744,20 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
         WdfSpinLockRelease(dc->IsocEpsLock);
     }
 
-    /* Drain queued URBs and complete each with STATUS_CANCELLED. */
+    /* Drain in-flight URBs (ITDs already linked into the ED) first.
+     * Defensive — OHCI core's destroy normally retires these via the
+     * per-URB complete callback, but Skip/halt edge cases can leave
+     * them stranded. */
+    OhciPci_IsocEpTeardown(ep);
+
+    /* Drain queued URBs (not yet handed to BuildAndSubmit) and complete
+     * each with STATUS_CANCELLED.
+     *
+     * Done AFTER teardown to close the parallel-dispatch race: with
+     * isoch on WdfIoQueueDispatchParallel, a HandleIsocUrb running on
+     * another CPU can insert into IsocQueuedUrbs while teardown is
+     * walking IsocInFlightUrbs. By draining queued last we catch
+     * anything inserted during the teardown window. */
     if (ep->IsocQueueLock) {
         LIST_ENTRY local;
         InitializeListHead(&local);
@@ -743,23 +772,12 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
             PLIST_ENTRY le = RemoveHeadList(&local);
             POHCIPCI_URB_CTX uc =
                 CONTAINING_RECORD(le, OHCIPCI_URB_CTX, QueueEntry);
-            /* Tear down the WdfDmaTransaction allocated in HandleIsocUrb. */
-            if (uc->DmaTransaction) {
-                NTSTATUS dmaSt;
-                (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction,
-                                                         0, &dmaSt);
-                WdfObjectDelete(uc->DmaTransaction);
-                uc->DmaTransaction = NULL;
-            }
+            /* Isoch path never allocates a WdfDmaTransaction (MDL-walk
+             * goes straight to ITDs), so no DMA teardown is needed here. */
             if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
             WdfRequestComplete(uc->Request, STATUS_CANCELLED);
         }
     }
-
-    /* Drain any URBs the MDL-walk path linked into the ED but didn't
-     * see retire (defensive — OHCI core's destroy normally drains them
-     * via the per-URB complete callback). */
-    OhciPci_IsocEpTeardown_Locked(ep);
 }
 
 /* --------------------------------------------------------------------------
@@ -1444,6 +1462,16 @@ OhciPci_DefaultEndpointAdd(
     ep->Dc    = g_DeviceContext;   /* module-static, set during RootHubCreate */
     ep->UcxEp = ucxEp;
 
+    /* Link this EP into the owning device's EndpointList for device-level
+     * callbacks (Enable/Disable/Reset) to fan out. */
+    OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    ep->Udc = udc_link;
+    if (udc_link != NULL) {
+        WdfSpinLockAcquire(udc_link->EndpointListLock);
+        InsertTailList(&udc_link->EndpointList, &ep->DeviceEpEntry);
+        WdfSpinLockRelease(udc_link->EndpointListLock);
+    }
+
     /* 3. Create WDF IO queue for URB delivery.
      *
      *    The queue's parent is the UCXENDPOINT so its lifetime is tied to the
@@ -1672,6 +1700,16 @@ OhciPci_EndpointAdd(
     RtlZeroMemory(ep, sizeof(*ep));
     ep->Dc    = g_DeviceContext;
     ep->UcxEp = ucxEp;
+
+    /* Link this EP into the owning device's EndpointList for device-level
+     * callbacks (Enable/Disable/Reset) to fan out. */
+    OHCIPCI_USBDEV_CTX *udc_link = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    ep->Udc = udc_link;
+    if (udc_link != NULL) {
+        WdfSpinLockAcquire(udc_link->EndpointListLock);
+        InsertTailList(&udc_link->EndpointList, &ep->DeviceEpEntry);
+        WdfSpinLockRelease(udc_link->EndpointListLock);
+    }
 
     /* 3. Per-EP WDFQUEUE.
      *
