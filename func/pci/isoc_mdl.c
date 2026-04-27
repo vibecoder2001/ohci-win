@@ -78,6 +78,16 @@ typedef struct _OHCIPCI_TRANSFER_URB {
 static VOID
 OhciPci_IsocBuildFail_Locked(OHCIPCI_URB_CTX *uc, NTSTATUS status)
 {
+    /* Failure path completes via DeferredCompletions, which bypasses
+     * OhciPci_UrbComplete — so this is the only place a bounce allocated
+     * by an earlier line in BuildAndSubmit can be freed before the URB
+     * is finalised. Safe to call on URBs that never allocated one
+     * (IsocBounceVa stays NULL). */
+    if (uc->IsocBounceVa) {
+        OhciPci_BounceFree(uc->EpCtx->Dc, uc->IsocBounceVa);
+        uc->IsocBounceVa   = NULL;
+        uc->IsocBouncePhys = 0;
+    }
     uc->DeferredStatus = status;
     uc->DeferredInfo   = 0;
     InsertTailList(&uc->EpCtx->Dc->DeferredCompletions, &uc->DeferredEntry);
@@ -131,6 +141,60 @@ OhciPci_IsocBuildAndSubmit_Locked(
                                     (PVOID)(ULONG_PTR)mdlByteOffset,
                                     mdlByteCount);
 
+    /* Detect non-contiguous PFNs once. usbaudio.sys URB buffers come from
+     * paged-pool and routinely fragment across non-adjacent physical pages
+     * (observed: pfn[0]=372319 pfn[1]=384391, delta +12072). When that
+     * happens we can't emit ITDs against the user pages directly — bounce
+     * the URB through OHCIPCI_BOUNCE_SLAB_BYTES of contiguous DMA memory.
+     *
+     * Also flag if the URB extends above 4 GB: OHCI is 32-bit phys, the
+     * bounce slab base lives below 4 GB so bouncing also resolves >4 GB. */
+    BOOLEAN fragmented = FALSE;
+    for (ULONG p = 0; p < mdlPageCount; p++) {
+        if (pfns[p] >= 0x100000ull) {
+            fragmented = TRUE;   /* >4 GB — bounce regardless */
+            break;
+        }
+        if (p > 0 && pfns[p] != pfns[p - 1] + 1) {
+            fragmented = TRUE;
+            break;
+        }
+    }
+
+    uint32_t bouncePhys = 0;
+    if (fragmented) {
+        if (urbLen > OHCIPCI_BOUNCE_SLAB_BYTES) {
+            LOG("IsocBuildAndSubmit: fragmented URB len=%lu exceeds bounce "
+                "slab %u", urbLen, OHCIPCI_BOUNCE_SLAB_BYTES);
+            OhciPci_IsocBuildFail_Locked(uc, STATUS_INSUFFICIENT_RESOURCES);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        void *bounceVa = OhciPci_BounceAlloc(dc, &bouncePhys);
+        if (bounceVa == NULL) {
+            LOG("IsocBuildAndSubmit: bounce pool exhausted");
+            OhciPci_IsocBuildFail_Locked(uc, STATUS_INSUFFICIENT_RESOURCES);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        /* OUT: copy URB bytes into bounce now. IN: leave bounce uninitialised;
+         * UrbComplete copies bounce -> MDL on retire. (Spike is OUT-only —
+         * IN copy-back left as a stub, see retire path.) */
+        if (uc->DataDirection == OHCI_URB_DIR_OUT) {
+            if (uc->MdlSysVa == NULL) {
+                uc->MdlSysVa = MmGetSystemAddressForMdlSafe(mdl,
+                                                            NormalPagePriority);
+            }
+            if (uc->MdlSysVa == NULL) {
+                OhciPci_BounceFree(dc, bounceVa);
+                LOG("IsocBuildAndSubmit: MmGetSystemAddressForMdlSafe failed");
+                OhciPci_IsocBuildFail_Locked(uc, STATUS_INSUFFICIENT_RESOURCES);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+            RtlCopyMemory(bounceVa, uc->MdlSysVa, urbLen);
+        }
+        uc->IsocBounceVa   = bounceVa;
+        uc->IsocBouncePhys = bouncePhys;
+    }
+
     /* Per-packet (phys, len) table — identical layout to the reference. */
     typedef struct { uint32_t phys; uint16_t len; } isoc_pkt_t;
     isoc_pkt_t pkt[OHCI_URB_MAX_ISOC_PACKETS];
@@ -154,6 +218,14 @@ OhciPci_IsocBuildAndSubmit_Locked(
             return STATUS_INVALID_PARAMETER;
         }
 
+        if (fragmented) {
+            /* Bounce path: per-packet phys is just bounce_phys + pkt_off.
+             * Bounce is contiguous so no straddle check needed. */
+            pkt[i].phys = bouncePhys + pktOff;
+            pkt[i].len  = (uint16_t)pktLen;
+            continue;
+        }
+
         ULONG absoluteOff = mdlByteOffset + pktOff;
         ULONG pageIdx     = absoluteOff >> PAGE_SHIFT;
         ULONG intraPage   = absoluteOff & (PAGE_SIZE - 1);
@@ -164,40 +236,9 @@ OhciPci_IsocBuildAndSubmit_Locked(
             OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
             return STATUS_INVALID_PARAMETER;
         }
-
-        /* OHCI is 32-bit phys. PFN >= 0x100000 means PA >= 4 GB. */
-        if (pfns[pageIdx] >= 0x100000ull) {
-            LOG("IsocBuildAndSubmit: pkt %lu pfn=%llu above 4 GB",
-                i, (unsigned long long)pfns[pageIdx]);
-            OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        /* Page-straddle check. If the packet crosses into pageIdx+1, the
-         * two physical pages must themselves be contiguous (PFN+1) or the
-         * packet can't fit in one ITD slot. The reference path falls into
-         * the same "spans non-contiguous SG runs" failure here. */
-        if (pktLen > 0 && intraPage + pktLen > PAGE_SIZE) {
-            if (pageIdx + 1 >= mdlPageCount) {
-                LOG("IsocBuildAndSubmit: pkt %lu straddles past MDL end", i);
-                OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-                return STATUS_INVALID_PARAMETER;
-            }
-            if (pfns[pageIdx + 1] != pfns[pageIdx] + 1) {
-                LOG("IsocBuildAndSubmit: pkt %lu spans non-contiguous PFNs "
-                    "(pfn[%lu]=%llu pfn[%lu]=%llu)",
-                    i, pageIdx, (unsigned long long)pfns[pageIdx],
-                    pageIdx + 1, (unsigned long long)pfns[pageIdx + 1]);
-                OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-                return STATUS_INVALID_PARAMETER;
-            }
-            if (pfns[pageIdx] + 1 >= 0x100000ull) {
-                LOG("IsocBuildAndSubmit: pkt %lu straddle past 4 GB", i);
-                OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-                return STATUS_INVALID_PARAMETER;
-            }
-        }
-
+        /* Contiguous-PFN path: PFN < 0x100000 and contiguity already
+         * verified above, so neither single-page packets nor 2-page
+         * straddles need re-checking. */
         pkt[i].phys = (uint32_t)((pfns[pageIdx] << PAGE_SHIFT) | intraPage);
         pkt[i].len  = (uint16_t)pktLen;
     }
@@ -301,6 +342,21 @@ OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
         uc->InFlightEntry.Flink = NULL;
         uc->InFlightEntry.Blink = NULL;
     }
+
+    /* Free the page-straddle bounce slab if BuildAndSubmit allocated one.
+     * IN copy-back is left as a TODO — spike is OUT-only (audio sink).
+     * Setting Va=NULL after free is required because UrbComplete and the
+     * teardown helper both consult IsocBounceVa as the "owns a bounce"
+     * sentinel, and the URB context can outlive the slab in the bounce
+     * pool's free bitmap. */
+    if (uc->IsocBounceVa) {
+        OHCIPCI_EP_CONTEXT *ep = uc->EpCtx;
+        if (ep && ep->Dc) {
+            OhciPci_BounceFree(ep->Dc, uc->IsocBounceVa);
+        }
+        uc->IsocBounceVa   = NULL;
+        uc->IsocBouncePhys = 0;
+    }
 }
 
 VOID
@@ -380,6 +436,11 @@ OhciPci_IsocEpTeardown_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
         PLIST_ENTRY le = RemoveHeadList(&local);
         OHCIPCI_URB_CTX *uc =
             CONTAINING_RECORD(le, OHCIPCI_URB_CTX, InFlightEntry);
+        if (uc->IsocBounceVa) {
+            OhciPci_BounceFree(dc, uc->IsocBounceVa);
+            uc->IsocBounceVa   = NULL;
+            uc->IsocBouncePhys = 0;
+        }
         if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
         WdfRequestComplete(uc->Request, STATUS_CANCELLED);
     }
