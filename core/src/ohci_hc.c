@@ -93,13 +93,46 @@ int ohci_hc_init(struct ohci_hc *hc,
     hc->isoc_head      = NULL;
     hc->in_flight      = NULL;
 
-    /* 1) Reset. */
-    w32(hc, REG_HcCommandStatus, OHCI_CMD_HCR);
-    barrier(hc);
-    for (int i = 0; i < 1000; i++) {
-        if (!(r32(hc, REG_HcCommandStatus) & OHCI_CMD_HCR)) break;
+    /* 1) Reset.
+     *
+     * On RK3588 (and likely other ARM SoCs that share USB PHY between
+     * EHCI/OHCI), UEFI brings the OHCI to USBOPERATIONAL with the
+     * companion USB PHY initialised. A subsequent HcCommandStatus.HCR
+     * (full HC reset) bounces the PHY's transmit FSM via internal
+     * coupling and the PHY doesn't re-arm — symptom: HC parks at the
+     * first ED forever, never starts the SETUP TD, no UE/DeviceNotResponding.
+     *
+     * Soft-takeover path: if HCFS is already past USBRESET (i.e. UEFI
+     * left HC running), skip HCR and instead pause the HC by parking
+     * HCFS at USBRESET briefly so we can rewrite HCCA/list-heads/IRQ
+     * mask cleanly. Cold-start (e.g. QEMU after PCI enumeration) still
+     * goes through HCR. */
+    uint32_t entry_ctrl = r32(hc, REG_HcControl);
+    uint32_t hcfs = entry_ctrl & OHCI_CTRL_HCFS_MASK;
+    if (hcfs == OHCI_CTRL_HCFS_RESET) {
+        /* Cold HC — UEFI didn't init it (or reset it on exit). Issue HCR. */
+        w32(hc, REG_HcCommandStatus, OHCI_CMD_HCR);
+        barrier(hc);
+        for (int i = 0; i < 1000; i++) {
+            if (!(r32(hc, REG_HcCommandStatus) & OHCI_CMD_HCR)) break;
+        }
+        if (r32(hc, REG_HcCommandStatus) & OHCI_CMD_HCR) return OHCI_ERR_RESET_FAIL;
+    } else {
+        /* Soft takeover from UEFI. Park HCFS at USBRESET and disable all
+         * lists so the HC stops following whatever EDs UEFI installed. */
+        uint32_t paused = (entry_ctrl & ~(OHCI_CTRL_HCFS_MASK |
+                                          OHCI_CTRL_CLE | OHCI_CTRL_BLE |
+                                          OHCI_CTRL_PLE | OHCI_CTRL_IE)) |
+                          OHCI_CTRL_HCFS_RESET;
+        w32(hc, REG_HcControl, paused);
+        barrier(hc);
+        /* HcFmNumber doesn't tick in USBRESET, so we can't pace by frames.
+         * A bounded HcControl readback spin gives the HC time to commit
+         * any in-flight DMA before we rewrite HCCA / list heads. */
+        for (int i = 0; i < 100000; i++) {
+            (void)r32(hc, REG_HcControl);
+        }
     }
-    if (r32(hc, REG_HcCommandStatus) & OHCI_CMD_HCR) return OHCI_ERR_RESET_FAIL;
 
     /* 2) Allocate HCCA, 256-byte aligned. */
     uint32_t phys;
