@@ -28,7 +28,7 @@ installed system-wide.
 Build a driver project:
 
 ```
-.\tools\build_driver.ps1 -Project spike\ucx_spike\OhciSpike.vcxproj -Arch x64 -Config Debug
+.\tools\build_driver.ps1 -Project func\pci\OhciPci.vcxproj -Arch x64 -Config Debug
 ```
 
 Supported `-Arch` values: `x64` (QEMU test VM), `ARM64` (RK3588 target).

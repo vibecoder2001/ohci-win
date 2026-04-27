@@ -29,7 +29,6 @@ Low and Full speed devices; no iso, no remote wakeup.
 - `test/harness/` — Tier 1 usermode harness
 - `test/devfuzz/` — AFL++-compatible fuzzer
 - `test/e2e/` — Tier 2 / 3 end-to-end tests
-- `spike/` — one-off investigations (not shipped)
 - `tools/` — build scripts, QEMU launcher, VM automation
 
 ## License

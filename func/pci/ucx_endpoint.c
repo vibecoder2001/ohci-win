@@ -729,6 +729,27 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
         WdfSpinLockRelease(ep->Udc->EndpointListLock);
     }
 
+    /* Refund any periodic-bandwidth budget this EP charged at create
+     * time. Done unconditionally (any Kind) — PeriodicBudgetCharged is
+     * 0 for EPs that never charged (Bulk/Control, or rolled-back creates),
+     * so the subtract is a no-op there. Read+clear under DeferredLock-free
+     * paths is fine: cleanup runs after UcxEndpointPurge so no concurrent
+     * EpAdd touches PeriodicBytesPerFrame for this EP. The summed counter
+     * itself is updated under no lock today (single-controller assumption);
+     * keep that invariant. */
+    if (dc != NULL && ep->PeriodicBudgetCharged != 0) {
+        ULONG charged = ep->PeriodicBudgetCharged;
+        ep->PeriodicBudgetCharged = 0;
+        if (dc->PeriodicBytesPerFrame >= charged) {
+            dc->PeriodicBytesPerFrame -= charged;
+        } else {
+            /* Defensive: shouldn't happen if charges/refunds are paired. */
+            LOG("EpCleanup: budget underflow refund=%lu sum=%lu",
+                charged, dc->PeriodicBytesPerFrame);
+            dc->PeriodicBytesPerFrame = 0;
+        }
+    }
+
     /* Isoch-only teardown follows. */
     if (ep->Kind != OhciPciEpKindIsoc || dc == NULL) return;
 
@@ -1691,21 +1712,29 @@ OhciPci_EndpointAdd(
     if (attrs == 0x01) {
         /* Isochronous (Plan 8). v1: assume period 1 (one MPS-sized
          * packet/frame). Refuse if the device is low-speed (USB spec
-         * forbids isoch on LS entirely). Budget-check BEFORE we touch
-         * any allocator so a rejection leaks nothing. */
+         * forbids isoch on LS entirely). */
         OHCIPCI_USBDEV_CTX *udcCheck = OhciPci_UsbDevContextGet(UcxUsbDevice);
         if (udcCheck && udcCheck->Speed == UsbLowSpeed) {
             LOG("EndpointAdd: isoch rejected - low-speed devices have no isoch");
             return STATUS_NOT_SUPPORTED;
         }
+    }
+
+    /* Periodic-bandwidth pre-check for Isoc (attrs==0x01) and Interrupt
+     * (attrs==0x03). Worst-case period-1 accounting; see device_context.h
+     * PeriodicBytesPerFrame comment. Done BEFORE we touch any allocator
+     * so a rejection leaks nothing. The matching charge happens at the
+     * end of the per-kind branch on success and is refunded by
+     * EpContextCleanup via ep->PeriodicBudgetCharged. */
+    if (attrs == 0x01 || attrs == 0x03) {
         if (g_DeviceContext->PeriodicBytesPerFrame + mps > OHCIPCI_PERIODIC_BUDGET_BYTES) {
-            LOG("EndpointAdd: isoch rejected - periodic budget exceeded "
+            LOG("EndpointAdd: %s rejected - periodic budget exceeded "
                 "(%lu + %u > %u)",
+                attrs == 0x01 ? "isoch" : "interrupt",
                 g_DeviceContext->PeriodicBytesPerFrame, mps,
                 OHCIPCI_PERIODIC_BUDGET_BYTES);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        /* Fall through into the standard non-default EP creation flow. */
     }
 
     /* 1. Register non-default callbacks. */
@@ -1815,10 +1844,17 @@ OhciPci_EndpointAdd(
         WdfSpinLockAcquire(ep->Dc->CoreLock);
         rc = ohci_interrupt_endpoint_create(&ep->Dc->Hc, &icfg, &ep->Core.Interrupt);
         WdfSpinLockRelease(ep->Dc->CoreLock);
+        if (rc == 0) {
+            /* Charge against the periodic-bandwidth budget. Refunded by
+             * EpContextCleanup via ep->PeriodicBudgetCharged. */
+            g_DeviceContext->PeriodicBytesPerFrame += mps;
+            ep->PeriodicBudgetCharged = mps;
+        }
         LOG("Interrupt EP created: addr=%u ep=%u dir=%s mps=%u "
-            "bInterval=%u scheduled=%ums rc=%d",
+            "bInterval=%u scheduled=%ums rc=%d budget=%lu/%u",
             funcAddr, epNum, isIn ? "IN" : "OUT", mps,
-            bInterval, ep->Core.Interrupt.poll_interval_frames, rc);
+            bInterval, ep->Core.Interrupt.poll_interval_frames, rc,
+            g_DeviceContext->PeriodicBytesPerFrame, OHCIPCI_PERIODIC_BUDGET_BYTES);
     } else { /* attrs == 0x01 - Isochronous */
         ep->Kind = OhciPciEpKindIsoc;
         /* Initialise the per-EP isoch lists BEFORE the create call.
@@ -1840,10 +1876,10 @@ OhciPci_EndpointAdd(
         rc = ohci_isoc_endpoint_create(&ep->Dc->Hc, &cfg, &ep->Core.Isoc);
         WdfSpinLockRelease(ep->Dc->CoreLock);
         if (rc == 0) {
-            /* TODO(Plan8 follow-up): subtract mps from PeriodicBytesPerFrame
-             * on EP destroy. Bulk/Interrupt EPs aren't torn down mid-driver-
-             * lifetime today, so the budget tracker is best-effort. */
+            /* Charge against the periodic-bandwidth budget. Refunded by
+             * EpContextCleanup via ep->PeriodicBudgetCharged. */
             g_DeviceContext->PeriodicBytesPerFrame += mps;
+            ep->PeriodicBudgetCharged = mps;
 
             /* Plan 8 Task 7 — refill state. Silence buffer is one
              * zero-filled PAGE from the DMA region; alloc failure is
@@ -1871,11 +1907,12 @@ OhciPci_EndpointAdd(
             if (!NT_SUCCESS(qlSt)) {
                 LOG("Isoc EP: WdfSpinLockCreate (IsocQueueLock) failed 0x%08X",
                     qlSt);
-                /* Roll back the core EP. */
+                /* Roll back the core EP. EpContextCleanup will refund
+                 * PeriodicBudgetCharged when UCX deletes the WDFOBJECT
+                 * on this non-success return. */
                 WdfSpinLockAcquire(ep->Dc->CoreLock);
                 ohci_isoc_endpoint_destroy(&ep->Dc->Hc, &ep->Core.Isoc);
                 WdfSpinLockRelease(ep->Dc->CoreLock);
-                g_DeviceContext->PeriodicBytesPerFrame -= mps;
                 return qlSt;
             }
 

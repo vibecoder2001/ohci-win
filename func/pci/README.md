@@ -1,8 +1,7 @@
 # OhciPci — PCI function driver
 
 KMDF driver that binds to QEMU's `pci-ohci` and drives it through the
-`OhciCore` library. This is the production driver path; `spike/ucx_spike/`
-remains as historical reference for the Plan 0 UCX gate experiment.
+`OhciCore` library.
 
 ## Build
 

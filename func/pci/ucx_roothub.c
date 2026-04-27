@@ -11,9 +11,9 @@ Abstract:
     Implements OhciPci_RootHubCreate, which registers callbacks with UCX and
     creates the UCXROOTHUB object.
 
-    Task 3 adds real implementations of GetInfo and Get20PortInfo, reading
-    HcRhDescriptorA/B to populate the actual hub topology.  StubGet30PortInfo
-    and StubInterruptTx remain as stubs (Tasks 4 and Plan-6+).
+    GetInfo and Get20PortInfo read HcRhDescriptorA/B to populate the real
+    hub topology. EvtRootHubGet30PortInfo returns NOT_IMPLEMENTED because
+    OHCI is USB 2.0 only.
 
 Environment:
 
@@ -426,20 +426,20 @@ static VOID OhciPciGet20PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 }
 
 /* --------------------------------------------------------------------------
- * StubGet30PortInfo — EVT_UCX_ROOTHUB_GET_30PORT_INFO
+ * EvtRootHubGet30PortInfo — EVT_UCX_ROOTHUB_GET_30PORT_INFO
  *
  * DEVIATION from plan: plan's skeleton guessed USB3 could be passed NULL.
  * Actual header marks EvtRootHubGet30PortInfo as __notnull — a non-NULL
  * pointer is always required.  OHCI is USB 2.0 only, so we provide a stub
  * that immediately completes with STATUS_NOT_IMPLEMENTED.
  * -------------------------------------------------------------------------- */
-static EVT_UCX_ROOTHUB_GET_30PORT_INFO StubGet30PortInfo;
+static EVT_UCX_ROOTHUB_GET_30PORT_INFO EvtRootHubGet30PortInfo;
 
 _Use_decl_annotations_
-static VOID StubGet30PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
+static VOID EvtRootHubGet30PortInfo(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
 {
     UNREFERENCED_PARAMETER(UcxRootHub);
-    LOG("RootHub StubGet30PortInfo — OHCI is USB 2.0 only; not implemented");
+    LOG("RootHub EvtRootHubGet30PortInfo — OHCI is USB 2.0 only; not implemented");
     WdfRequestComplete(Request, STATUS_NOT_IMPLEMENTED);
 }
 
@@ -835,12 +835,10 @@ OhciPci_RootHubCreate(
      */
     /* Switched from UCX_ROOTHUB_CONFIG_INIT_WITH_CONTROL_URB_HANDLER to the
      * 7-individual-callbacks variant. The combined ControlUrb path was never
-     * invoked by UCX (StubControlUrb logs never appeared); UCX appears to
-     * dispatch hub-class requests to the per-feature handlers when those are
-     * non-NULL, even with the combined-handler config available. Using the
-     * individual-callback config makes that explicit. Each handler currently
-     * logs the URB function code and completes with STATUS_SUCCESS so we can
-     * see the dispatch sequence and identify which need real implementations. */
+     * invoked by UCX; UCX appears to dispatch hub-class requests to the
+     * per-feature handlers when those are non-NULL, even with the combined-
+     * handler config available. Using the individual-callback config makes
+     * that explicit. */
     UCX_ROOTHUB_CONFIG_INIT(
         &cfg,
         OhciPciClearHubFeature,
@@ -853,7 +851,7 @@ OhciPci_RootHubCreate(
         OhciPciInterruptTx,
         OhciPciGetInfo,
         OhciPciGet20PortInfo,
-        StubGet30PortInfo
+        EvtRootHubGet30PortInfo
     );
 
     NTSTATUS status = UcxRootHubCreate(controller, &cfg,

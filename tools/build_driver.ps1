@@ -3,7 +3,7 @@
   Build a driver project under an EWDK or VS+WDK environment.
 
 .EXAMPLE
-  .\tools\build_driver.ps1 -Project spike\ucx_spike\OhciSpike.vcxproj -Arch x64 -Config Debug
+  .\tools\build_driver.ps1 -Project func\pci\OhciPci.vcxproj -Arch x64 -Config Debug
 #>
 [CmdletBinding()]
 param(

@@ -184,6 +184,12 @@ typedef struct _OHCIPCI_EP_CONTEXT {
      * Drained by OhciPci_IsocOnUrbRetire_Locked / EP teardown. */
     LIST_ENTRY                     IsocInFlightUrbs;
 
+    /* Bytes this EP contributed to dc->PeriodicBytesPerFrame at create
+     * time. Refunded on EpContextCleanup. Zero for Control/Bulk and for
+     * EPs whose create rolled back before charging — those entries are
+     * a no-op in the refund path. */
+    ULONG                          PeriodicBudgetCharged;
+
     /* KeQueryPerformanceCounter timestamp of the previous isoc[N] retire
      * trace, used to log per-URB cadence delta in µs. Zero on the first
      * retire => suppresses the first delta print. */

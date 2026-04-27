@@ -12,11 +12,10 @@ Abstract:
     EvtDriverDeviceAdd) and OhciPci_UcxControllerCreate (called from
     EvtDevicePrepareHardware after ohci_hc_init succeeds).
 
-    All UCX event callbacks are stubs returning STATUS_NOT_IMPLEMENTED or VOID.
-    Plan 5 fills in the real implementations.
+    All UCX event callbacks below are stubs returning STATUS_NOT_IMPLEMENTED
+    or VOID; the per-USB-device callbacks live in ucx_usbdevice.c.
 
-    Callback signatures are taken from the confirmed-working spike at
-    spike/ucx_spike/driver.c (WDK 10.0.26100.0, UCX 1.6).
+    Callback signatures match the WDK 10.0.26100.0 / UCX 1.6 typedefs.
 
 Environment:
 
@@ -31,9 +30,9 @@ Environment:
 
 /*
  * UCX 1.6 headers: UcxClass.h pulls in UcxGlobals, UcxFuncEnum, UcxObjects,
- * UcxController, UcxRootHub, UcxUsbDevice, UcxEndpoint, UcxSStreams.
- * Deviation from plan skeleton: plan used <ucx.h> + <ucxcontroller.h>;
- * spike confirmed the correct single-header include is <UcxClass.h>.
+ * UcxController, UcxRootHub, UcxUsbDevice, UcxEndpoint, UcxSStreams. The
+ * older <ucx.h> + <ucxcontroller.h> split is not how WDK 10.0.26100.0
+ * exposes UCX 1.6 — UcxClass.h is the correct single-header include.
  */
 #include <UcxClass.h>
 
@@ -43,14 +42,13 @@ Environment:
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
 
 /* --------------------------------------------------------------------------
- * Stub UCX controller event callbacks.
+ * UCX controller event callbacks.
  *
- * Signatures are matched to the EVT_UCX_CONTROLLER_* typedefs confirmed in
- * spike/ucx_spike/driver.c. Deviations from the plan skeleton are noted.
+ * Signatures match the EVT_UCX_CONTROLLER_* typedefs in WDK 10.0.26100.0.
  * -------------------------------------------------------------------------- */
 
 /*
- * StubReset — matches EVT_UCX_CONTROLLER_RESET (VOID return).
+ * EvtControllerReset — matches EVT_UCX_CONTROLLER_RESET (VOID return).
  *
  * Defers UcxControllerResetComplete to a workitem so the callback returns
  * before ResetComplete fires. Synchronous completion appears to leave UCX
@@ -86,11 +84,11 @@ static VOID OhciPci_ResetCompleteWork(WDFWORKITEM WorkItem)
 }
 
 static VOID
-StubReset(
+EvtControllerReset(
     _In_ UCXCONTROLLER UcxController
     )
 {
-    LOG("StubReset (deferring completion to workitem)");
+    LOG("EvtControllerReset (deferring completion to workitem)");
 
     WDF_WORKITEM_CONFIG wic;
     WDF_WORKITEM_CONFIG_INIT(&wic, OhciPci_ResetCompleteWork);
@@ -102,7 +100,7 @@ StubReset(
     WDFWORKITEM wi;
     NTSTATUS st = WdfWorkItemCreate(&wic, &attrs, &wi);
     if (!NT_SUCCESS(st)) {
-        LOG("StubReset: WdfWorkItemCreate failed 0x%08X — falling back to sync", st);
+        LOG("EvtControllerReset: WdfWorkItemCreate failed 0x%08X — falling back to sync", st);
         UCX_CONTROLLER_RESET_COMPLETE_INFO rci;
         UCX_CONTROLLER_RESET_COMPLETE_INFO_INIT(&rci, UcxControllerStateLost, TRUE);
         UcxControllerResetComplete(UcxController, &rci);
@@ -114,17 +112,13 @@ StubReset(
 }
 
 /*
- * StubQueryUsbCapability — matches EVT_UCX_CONTROLLER_QUERY_USB_CAPABILITY.
- *
- * Deviation from plan skeleton: the plan listed parameters as
- *   (c, g, l, ll, b) i.e. ResultLength before OutputBuffer.
- * Spike (and the WDK typedef) use:
- *   OutputBufferLength, OutputBuffer, ResultLength
- * i.e. OutputBuffer before ResultLength. Corrected here.
- * Also: spike sets *ResultLength = 0, not UNREFERENCED on the out-param.
+ * EvtControllerQueryUsbCapability — matches EVT_UCX_CONTROLLER_QUERY_USB_CAPABILITY.
+ * Parameter order per the WDK typedef is OutputBufferLength, OutputBuffer,
+ * ResultLength — and *ResultLength = 0 must be assigned (it's an out-param,
+ * not UNREFERENCED).
  */
 static NTSTATUS
-StubQueryUsbCapability(
+EvtControllerQueryUsbCapability(
     _In_                                         UCXCONTROLLER UcxController,
     _In_                                         PGUID         CapabilityType,
     _In_                                         ULONG         OutputBufferLength,
@@ -147,11 +141,10 @@ StubQueryUsbCapability(
 }
 
 /*
- * StubGetCurrentFrameNumber — matches EVT_UCX_CONTROLLER_GET_CURRENT_FRAMENUMBER.
- * Signature identical to plan skeleton; spike confirms it.
+ * EvtControllerGetCurrentFrameNumber — matches EVT_UCX_CONTROLLER_GET_CURRENT_FRAMENUMBER.
  */
 static NTSTATUS
-StubGetCurrentFrameNumber(
+EvtControllerGetCurrentFrameNumber(
     _In_  UCXCONTROLLER UcxController,
     _Out_ PULONG        FrameNumber
     )
@@ -172,13 +165,13 @@ StubGetCurrentFrameNumber(
 }
 
 /*
- * StubGetTransportCharacteristics — matches
+ * EvtControllerGetTransportCharacteristics — matches
  *   EVT_UCX_CONTROLLER_GET_TRANSPORT_CHARACTERISTICS.
- * Spike confirms the out-param is PUCX_CONTROLLER_TRANSPORT_CHARACTERISTICS
- * (pointer); plan skeleton matched. Zero the struct via RtlZeroMemory.
+ * Out-param is PUCX_CONTROLLER_TRANSPORT_CHARACTERISTICS (pointer); zero
+ * the struct via RtlZeroMemory.
  */
 static NTSTATUS
-StubGetTransportCharacteristics(
+EvtControllerGetTransportCharacteristics(
     _In_  UCXCONTROLLER                          UcxController,
     _Out_ PUCX_CONTROLLER_TRANSPORT_CHARACTERISTICS UcxControllerTransportCharacteristics
     )
@@ -191,17 +184,13 @@ StubGetTransportCharacteristics(
 }
 
 /*
- * StubSetTransportCharsChange — matches
+ * EvtControllerSetTransportCharsChange — matches
  *   EVT_UCX_CONTROLLER_SET_TRANSPORT_CHARACTERISTICS_CHANGE_NOTIFICATION.
- *
- * Deviation from plan skeleton: the plan declared the second parameter as
- *   PUCX_CONTROLLER_TRANSPORT_CHARACTERISTICS_CHANGE_FLAGS (pointer).
- * Spike and WDK typedef pass it by VALUE:
+ * The second parameter is passed BY VALUE per the WDK typedef:
  *   UCX_CONTROLLER_TRANSPORT_CHARACTERISTICS_CHANGE_FLAGS ChangeNotificationFlags
- * Corrected here to match spike.
  */
 static VOID
-StubSetTransportCharsChange(
+EvtControllerSetTransportCharsChange(
     _In_ UCXCONTROLLER                                        UcxController,
     _In_ UCX_CONTROLLER_TRANSPORT_CHARACTERISTICS_CHANGE_FLAGS ChangeNotificationFlags
     )
@@ -338,11 +327,11 @@ OhciPci_UcxControllerCreate(
     }
 
     cfg.EvtControllerUsbDeviceAdd                                      = OhciPci_UsbDeviceAdd;
-    cfg.EvtControllerQueryUsbCapability                                = StubQueryUsbCapability;
-    cfg.EvtControllerGetCurrentFrameNumber                             = StubGetCurrentFrameNumber;
-    cfg.EvtControllerReset                                             = StubReset;
-    cfg.EvtControllerGetTransportCharacteristics                       = StubGetTransportCharacteristics;
-    cfg.EvtControllerSetTransportCharacteristicsChangeNotification     = StubSetTransportCharsChange;
+    cfg.EvtControllerQueryUsbCapability                                = EvtControllerQueryUsbCapability;
+    cfg.EvtControllerGetCurrentFrameNumber                             = EvtControllerGetCurrentFrameNumber;
+    cfg.EvtControllerReset                                             = EvtControllerReset;
+    cfg.EvtControllerGetTransportCharacteristics                       = EvtControllerGetTransportCharacteristics;
+    cfg.EvtControllerSetTransportCharacteristicsChangeNotification     = EvtControllerSetTransportCharsChange;
 
     UCXCONTROLLER controller;
     NTSTATUS status = UcxControllerCreate(dc->Device, &cfg,

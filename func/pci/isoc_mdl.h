@@ -1,8 +1,8 @@
 /*  isoc_mdl.h — MDL-walk ITD builder for OHCI isochronous OUT.
  *
- *  All functions named *_Locked require dc->CoreLock held by the caller
- *  (except OhciPci_IsocEpTeardown_Locked, which acquires CoreLock itself
- *  because it runs at PASSIVE from EP cleanup).
+ *  All functions named *_Locked require dc->CoreLock held by the caller.
+ *  OhciPci_IsocEpTeardown is the one outlier — it acquires CoreLock itself
+ *  because it runs at PASSIVE from EP cleanup, hence no _Locked suffix.
  */
 #pragma once
 
@@ -33,23 +33,13 @@ OhciPci_IsocBuildAndSubmit_Locked(
 VOID
 OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc);
 
-/*  Walk the EP's done-queue ITDs that this module emitted, accumulate
- *  per-PSW status into the owning URB, and when an URB is fully retired
- *  defer its WdfRequestComplete via dc->DeferredCompletions (so the lock
- *  release path completes it OUTSIDE CoreLock — see
- *  feedback_wdf_complete_under_spinlock.md).
- *
- *  Called from the existing retire DPC after the WDH drain.
- */
-VOID
-OhciPci_IsocRetireEmitted_Locked(
-    _In_ POHCIPCI_EP_CONTEXT ep);
-
-/*  WDF cancel callback for an isoch Request. Pauses the EP via
- *  OhciPci_EditHeadPSafely (mandatory per feedback_ohci_headp_edit_helper.md),
- *  waits one SOF, unlinks any not-yet-retired ITDs belonging to this URB,
- *  completes the Request USBD_STATUS_CANCELED, and clears Skip if more
- *  URBs remain queued (per feedback_ohci_ed_skip_clear_on_start.md).
+/*  WDF cancel callback for an isoch Request. Currently a no-op stub —
+ *  OhciPci_IsocBuildAndSubmit_Locked deliberately does NOT call
+ *  WdfRequestMarkCancelable, so WDF never invokes this callback. The
+ *  usbaudio stop/restart cycle is covered by UcxEndpointPurge (drains
+ *  IsocQueuedUrbs) plus OhciPci_IsocEpTeardown (drains
+ *  IsocInFlightUrbs). See isoc_mdl.c for the implementation rationale
+ *  and a sketch of what a real per-URB cancel would look like.
  */
 EVT_WDF_REQUEST_CANCEL OhciPci_IsocCancelEmitted;
 
@@ -58,5 +48,5 @@ EVT_WDF_REQUEST_CANCEL OhciPci_IsocCancelEmitted;
  *  feedback_ohci_destroy_must_pause_list.md.
  */
 VOID
-OhciPci_IsocEpTeardown_Locked(
+OhciPci_IsocEpTeardown(
     _In_ POHCIPCI_EP_CONTEXT ep);

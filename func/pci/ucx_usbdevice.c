@@ -235,11 +235,11 @@ extern EVT_UCX_USBDEVICE_DEFAULT_ENDPOINT_ADD  OhciPci_DefaultEndpointAdd;
 extern EVT_UCX_USBDEVICE_ENDPOINT_ADD          OhciPci_EndpointAdd;
 
 /* --------------------------------------------------------------------------
- * Stubs for WDFREQUEST-based per-device callbacks.
+ * WDFREQUEST-based per-device callbacks.
  *
- * All VOID return; they complete the request with STATUS_SUCCESS.
- * Data exchange is through WdfRequestRetrieveOutputBuffer on the request
- * (same pattern as root-hub callbacks confirmed in Plan 5 Tasks 2-4).
+ * All VOID return; they complete the request via WdfRequestComplete.
+ * Data exchange is through WdfRequestRetrieveOutputBuffer / Arg1 on the
+ * request, same pattern as the root-hub callbacks in ucx_roothub.c.
  * -------------------------------------------------------------------------- */
 
 /* Per-EP function pointer used by OhciPci_DeviceWalkEps. */
@@ -270,10 +270,12 @@ OhciPci_DeviceWalkEps(OHCIPCI_USBDEV_CTX *udc, ohcipci_dev_ep_fn fn, void *ctx)
 static EVT_UCX_USBDEVICE_ENABLE               EvtUsbDeviceEnable;
 static EVT_UCX_USBDEVICE_DISABLE              EvtUsbDeviceDisable;
 static EVT_UCX_USBDEVICE_RESET                EvtUsbDeviceReset;
-static EVT_UCX_USBDEVICE_ADDRESS              StubUsbDeviceAddress;
+static EVT_UCX_USBDEVICE_ADDRESS              EvtUsbDeviceAddress;
 static EVT_UCX_USBDEVICE_UPDATE               EvtUsbDeviceUpdate;
 static EVT_UCX_USBDEVICE_HUB_INFO             EvtUsbDeviceHubInfo;
-static EVT_UCX_USBDEVICE_ENDPOINTS_CONFIGURE  StubUsbDeviceEndpointsConfigure;
+static EVT_UCX_USBDEVICE_ENDPOINTS_CONFIGURE  EvtUsbDeviceEndpointsConfigure;
+static EVT_UCX_USBDEVICE_SUSPEND              EvtUsbDeviceSuspend;
+static EVT_UCX_USBDEVICE_RESUME               EvtUsbDeviceResume;
 
 static VOID
 DeviceWalk_StartEp(OHCIPCI_EP_CONTEXT *ep, void *ctx)
@@ -363,6 +365,59 @@ EvtUsbDeviceDisable(
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
+/* --------------------------------------------------------------------------
+ * EvtUsbDeviceSuspend / EvtUsbDeviceResume
+ *
+ * UCX selective-suspend per device. With these NULL the OS still suspends
+ * but UCX has no way to ask the controller to actually pause traffic to
+ * the device, so URBs keep flowing and selective suspend silently fails.
+ *
+ * OHCI doesn't expose a per-device suspend primitive (only per-port via
+ * HcRhPortStatus, and we don't track which port a UCXUSBDEVICE landed
+ * on). The functional requirement is "no transfers reach the device
+ * while suspended" — set Skip on the device's non-control EDs to halt
+ * them, mirroring the Disable/Enable dance. Resume clears Skip so
+ * queued URBs drain.
+ *
+ * EP0 is left live: UCX may issue control traffic (status queries,
+ * remote-wake plumbing) during the suspend window, same rationale as
+ * Disable above. Both callbacks return VOID — no completion needed.
+ * Both run at PASSIVE.
+ * -------------------------------------------------------------------------- */
+_Use_decl_annotations_
+static VOID
+EvtUsbDeviceSuspend(
+    UCXCONTROLLER UcxController,
+    UCXUSBDEVICE  UcxUsbDevice
+    )
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    if (udc == NULL) {
+        LOG("UsbDeviceSuspend: NULL device context");
+        return;
+    }
+    LOG("UsbDeviceSuspend addr=%u", udc->FuncAddr);
+    OhciPci_DeviceWalkEps(udc, DeviceWalk_HaltEp, NULL);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtUsbDeviceResume(
+    UCXCONTROLLER UcxController,
+    UCXUSBDEVICE  UcxUsbDevice
+    )
+{
+    UNREFERENCED_PARAMETER(UcxController);
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(UcxUsbDevice);
+    if (udc == NULL) {
+        LOG("UsbDeviceResume: NULL device context");
+        return;
+    }
+    LOG("UsbDeviceResume addr=%u", udc->FuncAddr);
+    OhciPci_DeviceWalkEps(udc, DeviceWalk_StartEp, NULL);
+}
+
 static VOID
 DeviceWalk_ResetToggle(OHCIPCI_EP_CONTEXT *ep, void *ctx)
 {
@@ -449,7 +504,7 @@ EvtUsbDeviceReset(
 
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceAddress(
+EvtUsbDeviceAddress(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
@@ -600,7 +655,7 @@ EvtUsbDeviceHubInfo(
 
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceEndpointsConfigure(
+EvtUsbDeviceEndpointsConfigure(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
@@ -705,24 +760,27 @@ OhciPci_UsbDeviceAdd(
     /*
      * Build the per-device event callbacks struct.
      *
-     * UCX_USBDEVICE_EVENT_CALLBACKS_INIT requires exactly 9 named callbacks
-     * (EndpointsConfigure through EndpointAdd). The three optional callbacks
-     * (Suspend, Resume, GetCharacteristic) are zeroed by RtlZeroMemory inside
-     * the macro and left NULL — UCX treats NULL as "not implemented."
+     * UCX_USBDEVICE_EVENT_CALLBACKS_INIT initialises exactly 9 named callbacks
+     * (EndpointsConfigure through EndpointAdd). Suspend/Resume and
+     * GetCharacteristic are not parameters of the macro; assign them
+     * explicitly after INIT. GetCharacteristic remains NULL — UCX treats
+     * NULL as "not implemented" and falls back to its defaults.
      */
     UCX_USBDEVICE_EVENT_CALLBACKS cbs;
     UCX_USBDEVICE_EVENT_CALLBACKS_INIT(
         &cbs,
-        StubUsbDeviceEndpointsConfigure,  /* EvtUsbDeviceEndpointsConfigure */
+        EvtUsbDeviceEndpointsConfigure,  /* EvtUsbDeviceEndpointsConfigure */
         EvtUsbDeviceEnable,               /* EvtUsbDeviceEnable             */
         EvtUsbDeviceDisable,              /* EvtUsbDeviceDisable            */
         EvtUsbDeviceReset,                /* EvtUsbDeviceReset              */
-        StubUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
+        EvtUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
         EvtUsbDeviceUpdate,               /* EvtUsbDeviceUpdate             */
         EvtUsbDeviceHubInfo,              /* EvtUsbDeviceHubInfo            */
         OhciPci_DefaultEndpointAdd,       /* EvtUsbDeviceDefaultEndpointAdd */
         OhciPci_EndpointAdd               /* EvtUsbDeviceEndpointAdd        */
     );
+    cbs.EvtUsbDeviceSuspend = EvtUsbDeviceSuspend;
+    cbs.EvtUsbDeviceResume  = EvtUsbDeviceResume;
 
     UcxUsbDeviceInitSetEventCallbacks(UsbDeviceInit, &cbs);
 
