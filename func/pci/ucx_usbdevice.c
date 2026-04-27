@@ -242,6 +242,31 @@ extern EVT_UCX_USBDEVICE_ENDPOINT_ADD          OhciPci_EndpointAdd;
  * (same pattern as root-hub callbacks confirmed in Plan 5 Tasks 2-4).
  * -------------------------------------------------------------------------- */
 
+/* Per-EP function pointer used by OhciPci_DeviceWalkEps. */
+typedef VOID (*ohcipci_dev_ep_fn)(OHCIPCI_EP_CONTEXT *ep, void *ctx);
+
+/* Walk every EP belonging to the given device, calling fn(ep, ctx) for
+ * each. udc->EndpointListLock is held across the walk; fn may take
+ * dc->CoreLock (lock order: EndpointListLock -> CoreLock) and may busy-
+ * wait briefly inside EditHeadPSafely. fn must NOT block on a wait
+ * object, take a sleeping lock, or delete the EP. */
+static VOID
+OhciPci_DeviceWalkEps(OHCIPCI_USBDEV_CTX *udc, ohcipci_dev_ep_fn fn, void *ctx)
+{
+    if (udc == NULL || udc->EndpointListLock == NULL) return;
+    WdfSpinLockAcquire(udc->EndpointListLock);
+    PLIST_ENTRY le;
+    for (le = udc->EndpointList.Flink;
+         le != &udc->EndpointList;
+         le = le->Flink)
+    {
+        OHCIPCI_EP_CONTEXT *ep =
+            CONTAINING_RECORD(le, OHCIPCI_EP_CONTEXT, DeviceEpEntry);
+        fn(ep, ctx);
+    }
+    WdfSpinLockRelease(udc->EndpointListLock);
+}
+
 static EVT_UCX_USBDEVICE_ENABLE               StubUsbDeviceEnable;
 static EVT_UCX_USBDEVICE_DISABLE              StubUsbDeviceDisable;
 static EVT_UCX_USBDEVICE_RESET                StubUsbDeviceReset;

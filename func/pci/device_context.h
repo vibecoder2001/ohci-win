@@ -288,6 +288,18 @@ typedef struct _OHCIPCI_USBDEV_CTX {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_USBDEV_CTX, OhciPci_UsbDevContextGet)
 
+/* Helpers exported from ucx_endpoint.c for ucx_usbdevice.c device-level
+ * lifecycle callbacks. */
+typedef VOID (*ohcipci_headp_edit_fn)(struct ohci_ed *ed, void *ctx);
+
+VOID OhciPci_StartEp(OHCIPCI_EP_CONTEXT *ep);
+VOID OhciPci_HaltEp(OHCIPCI_EP_CONTEXT *ep);
+VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx);
+VOID OhciPci_HeadPSetMps(struct ohci_ed *ed, void *ctx);
+VOID OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
+                              ohcipci_headp_edit_fn edit, void *ctx);
+struct ohci_ed *OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep);
+
 /* g_DeviceContext — single-instance shortcut. Defined in ucx_roothub.c;
  * set once in OhciPci_RootHubCreate before any UCX callbacks fire. */
 extern PDEVICE_CONTEXT g_DeviceContext;

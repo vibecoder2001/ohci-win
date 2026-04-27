@@ -1234,7 +1234,7 @@ EvtUrbDefault(
  * we drain the list under CoreLock then complete the WDFREQUESTs outside
  * the lock — same pattern as EvtDpc.
  * -------------------------------------------------------------------------- */
-static struct ohci_ed *
+struct ohci_ed *
 OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep)
 {
     switch (ep->Kind) {
@@ -1251,8 +1251,7 @@ OhciPci_EpEd(OHCIPCI_EP_CONTEXT *ep)
  * its current walk past this ED, edit HeadP via the supplied callback,
  * then clear K. CoreLock alone is insufficient because it doesn't pause
  * the HC's schedule walker. Caller must NOT hold CoreLock (we acquire). */
-typedef VOID (*ohcipci_headp_edit_fn)(struct ohci_ed *ed, void *ctx);
-static VOID
+VOID
 OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
                          ohcipci_headp_edit_fn edit, void *ctx)
 {
@@ -1270,16 +1269,26 @@ OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
     WdfSpinLockRelease(dc->CoreLock);
 }
 
-static VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx)
+VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx)
 {
     UNREFERENCED_PARAMETER(ctx);
     ed->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
 }
 
+/* HeadP-edit callback for OhciPci_EditHeadPSafely. ctx is a pointer to a
+ * uint16_t carrying the new MaxPacketSize. Rewrites the MPS field
+ * (OHCI §4.2.1, bits OHCI_ED_MPS_SHIFT+10..OHCI_ED_MPS_SHIFT in ed->Control). */
+VOID OhciPci_HeadPSetMps(struct ohci_ed *ed, void *ctx)
+{
+    uint16_t mps = *(uint16_t *)ctx;
+    ed->Control = (ed->Control & ~((uint32_t)0x7FFu << OHCI_ED_MPS_SHIFT)) |
+                  (((uint32_t)mps & 0x7FFu) << OHCI_ED_MPS_SHIFT);
+}
+
 /* Re-enable an EP whose ED was halted by a prior purge/abort. UCX will
  * call Start after Purge — without clearing Skip, the HC ignores the
  * ED and the next URB on it sits forever (HC never raises WDH → timeout). */
-static VOID
+VOID
 OhciPci_StartEp(OHCIPCI_EP_CONTEXT *ep)
 {
     PDEVICE_CONTEXT dc = ep->Dc;
@@ -1287,6 +1296,22 @@ OhciPci_StartEp(OHCIPCI_EP_CONTEXT *ep)
     if (ed == NULL) return;
     WdfSpinLockAcquire(dc->CoreLock);
     ed->Control &= ~OHCI_ED_K;
+    dc->MmioOps.barrier(dc->MmioOps.context);
+    WdfSpinLockRelease(dc->CoreLock);
+}
+
+/* Symmetric to OhciPci_StartEp: set ED.K so the HC stops scheduling new
+ * TDs from this ED. In-flight TDs already submitted retire normally.
+ * Unlike EditHeadPSafely we do NOT busy-wait one frame here — caller
+ * is the device-level Disable path which doesn't immediately edit HeadP. */
+VOID
+OhciPci_HaltEp(OHCIPCI_EP_CONTEXT *ep)
+{
+    PDEVICE_CONTEXT dc = ep->Dc;
+    struct ohci_ed *ed = OhciPci_EpEd(ep);
+    if (ed == NULL) return;
+    WdfSpinLockAcquire(dc->CoreLock);
+    ed->Control |= OHCI_ED_K;
     dc->MmioOps.barrier(dc->MmioOps.context);
     WdfSpinLockRelease(dc->CoreLock);
 }
