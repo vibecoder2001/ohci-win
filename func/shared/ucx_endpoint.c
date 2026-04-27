@@ -753,6 +753,43 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
         }
     }
 
+    /* Release OHCI ED back to its pool for non-Isoch EPs. UCX destroys
+     * the UCXENDPOINT object on device disable / reconfigure, and
+     * without this the ED leaks — after a few enumeration retries the
+     * 16-slot control_ed_pool is empty and DefaultEndpointAdd fails
+     * with ohci_control_endpoint_create returning -1. The
+     * EvtUsbDeviceEndpointsConfigure path destroys non-default EPs
+     * explicitly when UCX hands them in EndpointsToDisable[]; this
+     * cleanup catches the default EP plus any non-default EP whose
+     * UCXENDPOINT outlived its core ED for any reason. */
+    if (dc != NULL && ep->Kind != OhciPciEpKindIsoc) {
+        WdfSpinLockAcquire(dc->CoreLock);
+        switch (ep->Kind) {
+        case OhciPciEpKindControl:
+            if (ep->Core.Control.ed != NULL) {
+                ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
+                ep->Core.Control.ed = NULL;
+            }
+            break;
+        case OhciPciEpKindBulk:
+            if (ep->Core.Bulk.ed != NULL) {
+                ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
+                ep->Core.Bulk.ed = NULL;
+            }
+            break;
+        case OhciPciEpKindInterrupt:
+            if (ep->Core.Interrupt.ed != NULL) {
+                ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
+                ep->Core.Interrupt.ed = NULL;
+            }
+            break;
+        default:
+            break;
+        }
+        WdfSpinLockRelease(dc->CoreLock);
+        return;
+    }
+
     /* Isoch-only teardown follows. */
     if (ep->Kind != OhciPciEpKindIsoc || dc == NULL) return;
 
