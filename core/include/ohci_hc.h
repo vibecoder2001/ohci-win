@@ -60,6 +60,23 @@ int ohci_hc_init(struct ohci_hc *hc,
                  struct ohci_dma_region *dma,
                  const struct ohci_hc_config *cfg);
 
+/* OHCI §6.5.1: UE (Unrecoverable Error) leaves the HC in a fatal state
+ * that requires HCR + full re-initialisation. Steps performed:
+ *   1. Splice every URB off hc->in_flight, mark non-PENDING ones, and
+ *      invoke urb->complete so callers (UCX glue) can stage WDFREQUEST
+ *      completions onto their Deferred lists.
+ *   2. Issue HcCommandStatus.HCR and wait for the reset to clear.
+ *   3. Re-publish HCCA, list head registers (rebuilt from hc->control_head
+ *      / hc->bulk_head), HcFmInterval (with FSMPS), HcPeriodicStart,
+ *      HcInterruptEnable (WDH|MIE), and HcControl in OPERATIONAL with
+ *      CLE|BLE|PLE|IE.
+ * Caller is responsible for any extra HcInterruptEnable bits the driver
+ * glue normally sets (RHSC|UE|SO) and for re-running CLEAR_PORT if the
+ * UE took down a port reset mid-flight. TDs hanging off EDs at UE time
+ * leak their pool slots — acceptable since UE forces device-level
+ * re-enumeration anyway. */
+void ohci_hc_reinit_after_ue(struct ohci_hc *hc);
+
 #ifdef __cplusplus
 }
 #endif

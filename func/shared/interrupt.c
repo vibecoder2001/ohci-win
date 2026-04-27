@@ -99,12 +99,45 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
             OHCI_INT_SO);
     }
     if (istat & OHCI_INT_UE) {
-        LOG("UE (Unrecoverable Error) — HC needs reset; acknowledging to break IRQ loop");
+        LOG("UE (Unrecoverable Error) — HCR + re-init; failing in-flight URBs");
+        /* W1C the UE bit first so the IRQ doesn't keep re-firing while
+         * we sit in the recovery path. */
         WRITE_REGISTER_ULONG(
             (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus),
             OHCI_INT_UE);
-        /* Real recovery requires HCR + re-init; we just log for now and
-         * let UCX surface a controller failure if URBs start timing out. */
+
+        /* Reinit. Splices URBs out of in_flight and calls their
+         * complete callbacks, which (via OhciPci_UrbComplete) stage
+         * WDFREQUEST completions on dc->DeferredCompletions while we
+         * still hold CoreLock. After HCR + register reprogramming, we
+         * still need to W1S the driver-glue interrupt bits (RHSC|UE|SO)
+         * that aren't part of ohci_hc_reinit_after_ue's WDH|MIE set. */
+        LIST_ENTRY ueLocal;
+        InitializeListHead(&ueLocal);
+
+        WdfSpinLockAcquire(dc->CoreLock);
+        ohci_hc_reinit_after_ue(&dc->Hc);
+        while (!IsListEmpty(&dc->DeferredCompletions)) {
+            PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
+            InsertTailList(&ueLocal, le);
+        }
+        WdfSpinLockRelease(dc->CoreLock);
+
+        /* Re-enable the extended interrupt set the driver glue wired up
+         * after ohci_hc_init. HcInterruptEnable is W1S so this OR's the
+         * bits on top of the WDH|MIE that reinit just programmed. */
+        WRITE_REGISTER_ULONG(
+            (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptEnable),
+            OHCI_INT_RHSC | OHCI_INT_UE | OHCI_INT_SO);
+
+        while (!IsListEmpty(&ueLocal)) {
+            PLIST_ENTRY le = RemoveHeadList(&ueLocal);
+            POHCIPCI_URB_CTX uc =
+                CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+            WdfRequestCompleteWithInformation(uc->Request,
+                                              uc->DeferredStatus,
+                                              uc->DeferredInfo);
+        }
     }
 
     /* Re-enable the master interrupt. */

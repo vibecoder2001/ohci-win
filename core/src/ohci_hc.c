@@ -3,6 +3,11 @@
 #include "ohci_hc.h"
 #include "ohci_pool.h"
 #include "ohci_ed.h"
+#include "ohci_urb.h"
+#include "ohci_control.h"
+#include "ohci_bulk.h"
+#include "ohci_interrupt.h"
+#include "ohci_isoc.h"
 
 /* Negative error codes used internally. Kept small and symbolic. */
 #define OHCI_ERR_NOMEM      -1
@@ -142,4 +147,56 @@ int ohci_hc_init(struct ohci_hc *hc,
     w32(hc, REG_HcControl, ctrl);
 
     return 0;
+}
+
+void ohci_hc_reinit_after_ue(struct ohci_hc *hc) {
+    /* 1) Drain in_flight: HC is wedged and will never write DoneHead,
+     *    so URBs are dead. Complete each one — this typically routes
+     *    through the UCX glue's urb->complete callback which stages
+     *    WDFREQUEST completion on a deferred list (no WdfRequestComplete
+     *    inline; that happens in the caller after we return).
+     *    Note: TDs linked from EDs at UE time leak their pool slots;
+     *    a future port could walk each EP's chain and free, but the
+     *    EDs themselves carry stale TailP/HeadP that the next submit
+     *    would need to flush — accept the leak as the simpler invariant. */
+    while (hc->in_flight != NULL) {
+        struct ohci_urb *u = hc->in_flight;
+        hc->in_flight = u->next_pending;
+        u->next_pending = NULL;
+        if (u->status == OHCI_URB_STATUS_PENDING) {
+            u->status = OHCI_URB_STATUS_OTHER;
+        }
+        if (u->complete) u->complete(u);
+    }
+
+    /* 2) HCR. Same bounded-poll shape as ohci_hc_init. If the chip
+     *    refuses to clear HCR we still proceed — the worst case is
+     *    that subsequent register writes get ignored and UCX surfaces
+     *    a controller failure on the next URB attempt. */
+    w32(hc, REG_HcCommandStatus, OHCI_CMD_HCR);
+    barrier(hc);
+    for (int i = 0; i < 1000; i++) {
+        if (!(r32(hc, REG_HcCommandStatus) & OHCI_CMD_HCR)) break;
+    }
+
+    /* 3) Reprogram. HCCA memory + interrupt skeleton are still in DMA
+     *    region (we never freed them); we just re-publish their phys
+     *    addresses. List heads come from the SW-side hc->*_head
+     *    chains preserved across the reset. */
+    uint32_t control_head_phys = hc->control_head ? hc->control_head->ed_phys : 0;
+    uint32_t bulk_head_phys    = hc->bulk_head    ? hc->bulk_head->ed_phys    : 0;
+
+    w32(hc, REG_HcHCCA,            hc->hcca_phys);
+    w32(hc, REG_HcControlHeadED,   control_head_phys);
+    w32(hc, REG_HcBulkHeadED,      bulk_head_phys);
+    w32(hc, REG_HcFmInterval,      (10104u << 16) | 11999u);
+    w32(hc, REG_HcPeriodicStart,   (11999u * 9) / 10);
+    w32(hc, REG_HcInterruptStatus, 0xFFFFFFFFu);
+    w32(hc, REG_HcInterruptEnable, OHCI_INT_WDH | OHCI_INT_MIE);
+
+    uint32_t ctrl = r32(hc, REG_HcControl);
+    ctrl &= ~OHCI_CTRL_HCFS_MASK;
+    ctrl |= OHCI_CTRL_CLE | OHCI_CTRL_BLE | OHCI_CTRL_PLE | OHCI_CTRL_IE | OHCI_CTRL_HCFS_OPER;
+    barrier(hc);
+    w32(hc, REG_HcControl, ctrl);
 }
