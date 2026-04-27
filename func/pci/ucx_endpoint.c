@@ -82,6 +82,7 @@ Environment:
 #include "ohci_drain.h"
 #include "ohci_ed.h"
 #include "ohci_isoc.h"
+#include "isoc_mdl.h"
 
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
@@ -264,6 +265,10 @@ OhciPci_UrbComplete(struct ohci_urb *u)
             }
             turb->Hdr.Status           = USBD_STATUS_SUCCESS;
         }
+        /* Spike: unlink from EP's in-flight list if BuildAndSubmit put us
+         * there. No-op for legacy WdfDmaTransaction-path URBs (Flink stays
+         * NULL until T7 routes everything through BuildAndSubmit). */
+        OhciPci_IsocOnUrbRetire_Locked(uc);
         if (uc->DmaTransaction) {
             NTSTATUS dmaSt;
             (void)WdfDmaTransactionDmaCompletedFinal(uc->DmaTransaction,

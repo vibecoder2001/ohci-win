@@ -284,12 +284,35 @@ OhciPci_IsocBuildAndSubmit_Locked(
 }
 
 /* --------------------------------------------------------------------------
- * Forward stubs — Tasks 4/5/6 each fill in one body. Present here so the
+ * OhciPci_IsocOnUrbRetire_Locked
+ *
+ * Called from OhciPci_UrbComplete's isoch branch once per retiring URB.
+ * Caller already holds CoreLock (UrbComplete fires from the retire DPC).
+ *
+ * Safe to call on URBs that never went through BuildAndSubmit — e.g. legacy
+ * path URBs allocated before T7 wires the spike. The Flink==NULL guard
+ * skips unlinking a list entry that was zero-initialised but never inserted.
+ * -------------------------------------------------------------------------- */
+VOID
+OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
+{
+    if (uc->InFlightEntry.Flink != NULL) {
+        RemoveEntryList(&uc->InFlightEntry);
+        uc->InFlightEntry.Flink = NULL;
+        uc->InFlightEntry.Blink = NULL;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Forward stubs — Tasks 5/6 each fill in one body. Present here so the
  * unit links cleanly when isoc_mdl.h's full API is referenced.
  * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
 {
+    /* No-op: per-URB retire is handled by OhciPci_IsocOnUrbRetire_Locked,
+     * called from OhciPci_UrbComplete's isoch branch. This entry point is
+     * preserved for symmetry with the header. */
     UNREFERENCED_PARAMETER(ep);
 }
 

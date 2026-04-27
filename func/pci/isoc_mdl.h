@@ -21,6 +21,17 @@ OhciPci_IsocBuildAndSubmit_Locked(
     _In_ POHCIPCI_EP_CONTEXT ep,
     _In_ OHCIPCI_URB_CTX    *uc);
 
+/*  Unlink a retiring isoch URB from the per-EP in-flight list. Called from
+ *  OhciPci_UrbComplete's isoch branch once per retiring URB, within the
+ *  retire DPC (CoreLock held by caller).
+ *
+ *  Safe to call on legacy URBs that never went through BuildAndSubmit;
+ *  the Flink==NULL check skips any that were zero-initialised but never
+ *  inserted into IsocInFlightUrbs.
+ */
+VOID
+OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc);
+
 /*  Walk the EP's done-queue ITDs that this module emitted, accumulate
  *  per-PSW status into the owning URB, and when an URB is fully retired
  *  defer its WdfRequestComplete via dc->DeferredCompletions (so the lock
