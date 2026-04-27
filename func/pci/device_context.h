@@ -188,6 +188,13 @@ typedef struct _OHCIPCI_EP_CONTEXT {
      * trace, used to log per-URB cadence delta in µs. Zero on the first
      * retire => suppresses the first delta print. */
     LARGE_INTEGER                  IsocLastTraceQpc;
+
+    /* Per-device membership — back-pointer to the owning UCXUSBDEVICE's
+     * context, plus the LIST_ENTRY hanging us off udc->EndpointList.
+     * DeviceEpEntry.Flink == NULL is the "not on any list" sentinel
+     * (consistent with IsocEpEntry / IsocInFlightUrbs convention). */
+    struct _OHCIPCI_USBDEV_CTX    *Udc;
+    LIST_ENTRY                    DeviceEpEntry;
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_EP_CONTEXT, OhciPci_EpContextGet)
@@ -270,6 +277,13 @@ typedef struct _OHCIPCI_USBDEV_CTX {
     USB_DEVICE_SPEED              Speed;
     UCHAR                         FuncAddr;     /* 0 until EvtUsbDeviceAddress runs */
     struct _OHCIPCI_EP_CONTEXT   *Ep0;          /* set by OhciPci_DefaultEndpointAdd */
+
+    /* Per-device EP membership. Each EP created under this UCXUSBDEVICE
+     * links its DeviceEpEntry into EndpointList at create time, unlinks
+     * at EpContextCleanup. UCX device-level callbacks (Enable/Disable/
+     * Reset) fan out across this list via OhciPci_DeviceWalkEps. */
+    LIST_ENTRY                    EndpointList;
+    WDFSPINLOCK                   EndpointListLock;
 } OHCIPCI_USBDEV_CTX, *POHCIPCI_USBDEV_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_USBDEV_CTX, OhciPci_UsbDevContextGet)

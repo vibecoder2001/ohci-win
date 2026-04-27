@@ -499,6 +499,18 @@ OhciPci_UsbDeviceAdd(
     RtlZeroMemory(udc, sizeof(*udc));
     udc->Speed    = UsbDeviceInfo->DeviceSpeed;
     udc->FuncAddr = 0;
+
+    InitializeListHead(&udc->EndpointList);
+
+    WDF_OBJECT_ATTRIBUTES lockAttrs;
+    WDF_OBJECT_ATTRIBUTES_INIT(&lockAttrs);
+    lockAttrs.ParentObject = usbDevice;
+    NTSTATUS lockSt = WdfSpinLockCreate(&lockAttrs, &udc->EndpointListLock);
+    if (!NT_SUCCESS(lockSt)) {
+        LOG("UsbDeviceAdd: WdfSpinLockCreate -> 0x%08X", lockSt);
+        return lockSt;
+    }
+
     LOG("UsbDevContext attached: speed=%d", (int)udc->Speed);
     return status;
 }
