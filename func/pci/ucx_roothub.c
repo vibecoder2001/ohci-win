@@ -739,6 +739,18 @@ static VOID OhciPciSetPortFeature(UCXROOTHUB UcxRootHub, WDFREQUEST Request)
             WdfRequestComplete(Request, STATUS_SUCCESS);
             return;
     }
+    /* PORT_RESET on a suspended port: USB 2.0 §11.5.1.5 says reset wakes
+     * the port. Real OHCI clears PSS implicitly on PRS->1, but QEMU's
+     * emulation leaves PSS set, which makes the hub driver loop forever
+     * on reset+ClearC_PORT_RESET (status keeps showing PSS=1, hub never
+     * proceeds to SET_ADDRESS). Pre-clear PSS here so post-reset status
+     * matches the spec the hub driver expects. */
+    if (feature == USB_FEATURE_PORT_RESET) {
+        ULONG cur = ReadRhPortStatus(dc, portIdx);
+        if (cur & OHCI_RHPS_PSS) {
+            WriteRhPortStatus(dc, portIdx, OHCI_RHPS_CLR_PSS);
+        }
+    }
     WriteRhPortStatus(dc, portIdx, bit);
     urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
     WdfRequestComplete(Request, STATUS_SUCCESS);
