@@ -108,9 +108,7 @@ Environment:
 #include <usbdi.h>
 #include <usbioctl.h>
 #include "device_context.h"
-
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                  "OhciPci: " fmt "\n", ##__VA_ARGS__)
+#include "ohci_log.h"
 
 /* OHCI register offsets for the root hub descriptor registers. */
 #define REG_HcRhDescriptorA  0x48u

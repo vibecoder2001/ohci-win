@@ -37,9 +37,7 @@ Environment:
 #include <UcxClass.h>
 
 #include "device_context.h"
-
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                  "OhciPci: " fmt "\n", ##__VA_ARGS__)
+#include "ohci_log.h"
 
 /* --------------------------------------------------------------------------
  * UCX controller event callbacks.

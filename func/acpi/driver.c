@@ -24,9 +24,7 @@ Environment:
 #include <wdf.h>
 #include "device_context.h"
 #include "ohci_regs.h"
-
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                  "OhciAcpi: " fmt "\n", ##__VA_ARGS__)
+#include "ohci_log.h"
 
 DRIVER_INITIALIZE                  DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD          EvtDriverDeviceAdd;

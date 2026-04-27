@@ -3,9 +3,7 @@
 #include "device_context.h"
 #include "ohci_drain.h"
 #include "ohci_regs.h"
-
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                  "OhciPci: " fmt "\n", ##__VA_ARGS__)
+#include "ohci_log.h"
 
 #define REG_HcInterruptStatus  0x0C
 #define REG_HcInterruptEnable  0x10

@@ -36,9 +36,7 @@ Environment:
 #include "ohci_ed.h"
 #include "ohci_isoc.h"
 #include "isoc_mdl.h"
-
-#define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-                                  "OhciPci: " fmt "\n", ##__VA_ARGS__)
+#include "ohci_log.h"
 
 /* OHCIPCI_TRANSFER_URB defined in device_context.h. */
 

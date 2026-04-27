@@ -55,6 +55,7 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <WarningLevel>Level4</WarningLevel>
       <DisableSpecificWarnings>4201</DisableSpecificWarnings>
+      <PreprocessorDefinitions>OHCI_LOG_TAG="OhciPci";%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>$(IntDir);..\shared;..\..\core\include;$(DDK_INC_PATH)ucx\1.6;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
