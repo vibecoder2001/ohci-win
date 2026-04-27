@@ -152,6 +152,11 @@ typedef struct _OHCIPCI_EP_CONTEXT {
     /* Spike (MDL-walk) — URBs with ITDs linked into the ED but not yet retired.
      * Drained by OhciPci_IsocRetireEmitted_Locked / cancel / teardown. */
     LIST_ENTRY                     IsocInFlightUrbs;
+
+    /* Spike T8 — KeQueryPerformanceCounter timestamp of the previous
+     * isoc[N] retire trace, used to log per-URB cadence delta in µs.
+     * Zero on the first retire => suppresses the first delta print. */
+    LARGE_INTEGER                  IsocLastTraceQpc;
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_EP_CONTEXT, OhciPci_EpContextGet)

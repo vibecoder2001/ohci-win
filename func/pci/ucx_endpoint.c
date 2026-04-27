@@ -252,10 +252,24 @@ OhciPci_UrbComplete(struct ohci_urb *u)
             {
                 static ULONG s_isocCompletes = 0;
                 ULONG n = ++s_isocCompletes;
+                /* Spike T8: per-URB cadence delta in µs from QPC. First
+                 * retire on a fresh EP has LastTraceQpc==0 -> suppress
+                 * the meaningless huge delta on the first sample. */
+                LARGE_INTEGER freq;
+                LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(&freq);
+                ULONGLONG deltaUs = 0;
+                POHCIPCI_EP_CONTEXT epc = uc->EpCtx;
+                if (epc->IsocLastTraceQpc.QuadPart != 0 && freq.QuadPart != 0) {
+                    deltaUs =
+                        ((ULONGLONG)(nowQpc.QuadPart - epc->IsocLastTraceQpc.QuadPart)
+                         * 1000000ULL) / (ULONGLONG)freq.QuadPart;
+                }
+                epc->IsocLastTraceQpc = nowQpc;
                 if (n <= 8 || (n & 0x1F) == 0) {
                     LOG("isoc[%lu] dir=%s urbLen=%lu totalLen=%lu err=%lu nPkts=%lu "
-                        "cc=%u %u %u %u %u %u %u %u %u %u",
+                        "delta_us=%llu cc=%u %u %u %u %u %u %u %u %u %u",
                         n, isOut ? "OUT" : "IN", urbLen, totalLen, totalErr, nPkts,
+                        deltaUs,
                         u->isoc_pkts[0].cc, u->isoc_pkts[1].cc,
                         u->isoc_pkts[2].cc, u->isoc_pkts[3].cc,
                         u->isoc_pkts[4].cc, u->isoc_pkts[5].cc,
