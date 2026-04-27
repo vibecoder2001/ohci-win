@@ -580,15 +580,37 @@ StubUsbDeviceEndpointsConfigure(
         switch (ep->Kind) {
         case OhciPciEpKindBulk:
             ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
+            ep->Core.Bulk.ed = NULL;
             break;
         case OhciPciEpKindInterrupt:
             ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
+            ep->Core.Interrupt.ed = NULL;
             break;
         case OhciPciEpKindControl:
             ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
+            ep->Core.Control.ed = NULL;
             break;
         }
         WdfSpinLockRelease(dc->CoreLock);
+
+        /* Unlink from owning device's EndpointList so device-level
+         * callbacks (Enable/Disable/Reset) don't walk a destroyed EP.
+         * The UCXENDPOINT itself stays alive until UCX destroys it
+         * later; EpContextCleanup then runs the Flink-NULL fast-path
+         * (we just NULLed it) and skips re-unlinking. NULLing the ed
+         * pointer above is belt-and-suspenders so OhciPci_EpEd returns
+         * NULL even if any EP-level callback fires before UCX deletes
+         * this UCXENDPOINT. */
+        if (ep->Udc != NULL && ep->Udc->EndpointListLock != NULL &&
+            ep->DeviceEpEntry.Flink != NULL)
+        {
+            WdfSpinLockAcquire(ep->Udc->EndpointListLock);
+            if (ep->DeviceEpEntry.Flink != NULL) {
+                RemoveEntryList(&ep->DeviceEpEntry);
+                ep->DeviceEpEntry.Flink = NULL;
+            }
+            WdfSpinLockRelease(ep->Udc->EndpointListLock);
+        }
         LOG("  disabled EP kind=%d", ep->Kind);
     }
 
