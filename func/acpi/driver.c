@@ -71,6 +71,19 @@ NTSTATUS EvtDriverDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit) {
     OhciPci_InitMmioOps(dc);
     LOG("Context attached and mmio_ops wired");
 
+    /* Mark the device as user-disable-able in Device Manager. ACPI-enumerated
+     * USB host controllers default to non-removable, which leaves the
+     * "Disable Device" affordance greyed out. Setting Removable + SurpriseOK
+     * lets the user (or pnputil /disable-device) stop the controller
+     * cleanly without uninstalling the driver. */
+    {
+        WDF_DEVICE_PNP_CAPABILITIES pnpCaps;
+        WDF_DEVICE_PNP_CAPABILITIES_INIT(&pnpCaps);
+        pnpCaps.Removable         = WdfTrue;
+        pnpCaps.SurpriseRemovalOK = WdfTrue;
+        WdfDeviceSetPnpCapabilities(device, &pnpCaps);
+    }
+
     {
         WDF_OBJECT_ATTRIBUTES lockAttrs;
         WDF_OBJECT_ATTRIBUTES_INIT(&lockAttrs);
