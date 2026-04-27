@@ -409,6 +409,41 @@ EvtUsbDeviceReset(
     }
     LOG("UsbDeviceReset — clearing toggles on all non-isoch EPs");
     OhciPci_DeviceWalkEps(udc, DeviceWalk_ResetToggle, NULL);
+
+    /* USB §9.2.6.3: after a port reset, the device defaults to address 0
+     * regardless of any prior SET_ADDRESS. UCX will issue GET_DEVICE_DESCRIPTOR
+     * on EP0 BEFORE re-running EvtUsbDeviceAddress to assign a new address,
+     * so EP0's ED func_addr must be 0 at this point. Without this reset, the
+     * post-port-reset GET_DEVICE_DESCRIPTOR(64) is addressed to the device's
+     * old (now-invalid) address and never gets a response — observed as
+     * post-rescan re-enumeration stalling at the first descriptor read.
+     *
+     * Pause CLE before editing ED.Control (OHCI §6.2.1). Mirrors the dance
+     * in OhciPci_SetAddressWorker. */
+    PDEVICE_CONTEXT dc = g_DeviceContext;
+    if (udc->Ep0 != NULL && dc != NULL) {
+        struct ohci_ed *ed = udc->Ep0->Core.Control.ed;
+        WdfSpinLockAcquire(dc->CoreLock);
+        uint32_t hc_ctrl = dc->MmioOps.read32(dc->MmioOps.context, 0x04);
+        int was_enabled = (hc_ctrl & OHCI_CTRL_CLE) != 0;
+        if (was_enabled) {
+            dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl & ~OHCI_CTRL_CLE);
+            dc->MmioOps.barrier(dc->MmioOps.context);
+            uint32_t f0 = dc->MmioOps.read32(dc->MmioOps.context, 0x3C);
+            for (int i = 0; i < 10000; i++) {
+                if (dc->MmioOps.read32(dc->MmioOps.context, 0x3C) != f0) break;
+            }
+        }
+        ed->Control &= ~0x7Fu;  /* clear FA[6:0] -> address 0 */
+        dc->MmioOps.barrier(dc->MmioOps.context);
+        if (was_enabled) {
+            dc->MmioOps.write32(dc->MmioOps.context, 0x04, hc_ctrl | OHCI_CTRL_CLE);
+        }
+        udc->FuncAddr = 0;
+        WdfSpinLockRelease(dc->CoreLock);
+        LOG("UsbDeviceReset: EP0 funcaddr reset to 0");
+    }
+
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
