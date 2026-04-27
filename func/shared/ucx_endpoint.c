@@ -1566,7 +1566,44 @@ EvtDefaultEpUpdate(
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("DefaultEp Update (MPS change stub — Plan 6 will update OHCI ED)");
+
+    /* UCX calls this after the host has read the first 8 bytes of the
+     * device descriptor and learned the device's actual EP0 MPS from
+     * bMaxPacketSize0. Without rewriting the OHCI ED's MPS field, the
+     * HC keeps issuing IN tokens at the original (too-large) MPS;
+     * devices with bMaxPacketSize0 < 64 then return short packets that
+     * OHCI treats as transfer-complete after the first MPS-sized read,
+     * so descriptor reads truncate at 8 bytes. Logitech mouse: device
+     * descriptor field 7 = 8, our ED stayed at MPS=64, GET_DESCRIPTOR(18)
+     * came back transferred=8 → UCX retried indefinitely. */
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PDEFAULT_ENDPOINT_UPDATE upd =
+        (PDEFAULT_ENDPOINT_UPDATE)rp.Parameters.Others.Arg1;
+    if (upd == NULL) {
+        LOG("DefaultEp Update: missing update packet");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(upd->DefaultEndpoint);
+    if (ep == NULL || ep->Dc == NULL || ep->Core.Control.ed == NULL) {
+        LOG("DefaultEp Update: NULL ep ctx / dc / ed");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+
+    struct ohci_ed *ed = ep->Core.Control.ed;
+    uint16_t curMps = (uint16_t)((ed->Control >> OHCI_ED_MPS_SHIFT) & 0x7FFu);
+    uint16_t newMps = (uint16_t)upd->MaxPacketSize;
+    if (newMps != 0 && newMps != curMps) {
+        LOG("DefaultEp Update: EP0 MPS %u -> %u", curMps, newMps);
+        OhciPci_EditHeadPSafely(ep->Dc, ed,
+                                 OhciPci_HeadPSetMps, &newMps);
+    } else {
+        LOG("DefaultEp Update: EP0 MPS unchanged (%u)", curMps);
+    }
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
