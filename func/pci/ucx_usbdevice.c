@@ -272,7 +272,7 @@ static EVT_UCX_USBDEVICE_DISABLE              EvtUsbDeviceDisable;
 static EVT_UCX_USBDEVICE_RESET                EvtUsbDeviceReset;
 static EVT_UCX_USBDEVICE_ADDRESS              StubUsbDeviceAddress;
 static EVT_UCX_USBDEVICE_UPDATE               EvtUsbDeviceUpdate;
-static EVT_UCX_USBDEVICE_HUB_INFO             StubUsbDeviceHubInfo;
+static EVT_UCX_USBDEVICE_HUB_INFO             EvtUsbDeviceHubInfo;
 static EVT_UCX_USBDEVICE_ENDPOINTS_CONFIGURE  StubUsbDeviceEndpointsConfigure;
 
 static VOID
@@ -513,13 +513,31 @@ EvtUsbDeviceUpdate(
 
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceHubInfo(
+EvtUsbDeviceHubInfo(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceHubInfo (stub)");
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_HUB_INFO info =
+        (PUSBDEVICE_HUB_INFO)rp.Parameters.Others.Arg1;
+    if (info == NULL) {
+        LOG("UsbDeviceHubInfo: missing info struct");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    /* OHCI is FS/LS only — no transaction translators, no ports of our own
+     * to report (UCX manages port topology separately). Always return zeros
+     * for all three fields regardless of whether the queried device is
+     * actually a hub. TTThinkTime=0 means "no TT / not applicable." */
+    info->NumberOfPorts = 0;
+    info->NumberOfTTs   = 0;
+    info->TTThinkTime   = 0;
+    LOG("UsbDeviceHubInfo: NumberOfPorts=0 NumberOfTTs=0 TTThinkTime=0");
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -622,7 +640,7 @@ OhciPci_UsbDeviceAdd(
         EvtUsbDeviceReset,                /* EvtUsbDeviceReset              */
         StubUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
         EvtUsbDeviceUpdate,               /* EvtUsbDeviceUpdate             */
-        StubUsbDeviceHubInfo,             /* EvtUsbDeviceHubInfo            */
+        EvtUsbDeviceHubInfo,              /* EvtUsbDeviceHubInfo            */
         OhciPci_DefaultEndpointAdd,       /* EvtUsbDeviceDefaultEndpointAdd */
         OhciPci_EndpointAdd               /* EvtUsbDeviceEndpointAdd        */
     );
