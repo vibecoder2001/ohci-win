@@ -245,6 +245,17 @@ typedef struct _OHCIPCI_URB_CTX {
     LIST_ENTRY  InFlightEntry;   /* on EP->IsocInFlightUrbs while ITDs linked */
     PVOID       MdlSysVa;        /* cached MmGetSystemAddressForMdlSafe result */
 
+    /* Per-URB timeout (TRANSFER_URB.Timeout, milliseconds). Zero means
+     * "no timeout" — UCX hands a non-zero value for control transfers
+     * with a per-URB deadline. The 1 ms backstop timer
+     * (OhciPci_EvtIsocBackstopTimer) walks hc->in_flight, computes
+     * elapsed = now - SubmitInterruptTime, and cancels the EP if it
+     * passes TimeoutMs. Without this, a device that NAKs forever on a
+     * control transfer leaves UCX with no recovery short of cable
+     * yank — OHCI has no built-in NAK timeout. */
+    ULONG       TimeoutMs;
+    ULONGLONG   SubmitInterruptTime;
+
     /* Page-straddle bounce. When the URB's MDL spans non-contiguous PFNs,
      * OhciPci_IsocBuildAndSubmit_Locked allocates one OHCIPCI_BOUNCE_SLAB
      * and copies the URB through it (OUT) so per-packet phys addresses

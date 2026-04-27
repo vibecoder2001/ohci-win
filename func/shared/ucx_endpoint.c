@@ -487,6 +487,15 @@ OhciPci_BulkProgramDma(
     uc->CoreUrb.direction   = uc->DataDirection;
     uc->CoreUrb.complete    = OhciPci_UrbComplete;
 
+    /* Honour TRANSFER_URB.Timeout. Captured here so the 1 ms backstop
+     * walker can compute elapsed and cancel the EP if the device NAKs
+     * past the deadline — OHCI has no built-in NAK timeout. */
+    {
+        POHCIPCI_TRANSFER_URB turb = (POHCIPCI_TRANSFER_URB)uc->TransferUrb;
+        uc->TimeoutMs = (turb && turb->Timeout > 0) ? turb->Timeout : 0;
+        uc->SubmitInterruptTime = KeQueryInterruptTime();
+    }
+
     WdfSpinLockAcquire(dc->CoreLock);
     int rc = ohci_bulk_submit_sg(&dc->Hc, &ep->Core.Bulk, &uc->CoreUrb,
                                   sg, sgCount);
@@ -686,6 +695,9 @@ OhciPci_HandleInterruptUrb(
     uc->CoreUrb.length       = length;
     uc->CoreUrb.direction    = uc->DataDirection;
     uc->CoreUrb.complete     = OhciPci_UrbComplete;
+
+    uc->TimeoutMs = (urb->Timeout > 0) ? urb->Timeout : 0;
+    uc->SubmitInterruptTime = KeQueryInterruptTime();
 
     int rc = ohci_interrupt_submit(&dc->Hc, &ep->Core.Interrupt, &uc->CoreUrb);
     if (rc != 0) {
@@ -959,13 +971,62 @@ OhciPci_EvtIsocBackstopTimer(WDFTIMER Timer)
     LIST_ENTRY local;
     InitializeListHead(&local);
 
+    /* Bounded set of EDs to cancel after timeout-walk. 8 is plenty —
+     * any single tick rarely sees more than one expiring EP, and
+     * de-duplication below avoids issuing ohci_urb_cancel_for_ed twice
+     * for the same ED when multiple URBs on it have expired. */
+    struct ohci_ed *expired_eds[8];
+    int n_expired = 0;
+
     WdfSpinLockAcquire(dc->CoreLock);
     OhciPci_IsocRefillAll_Locked(dc);
+
+    /* TRANSFER_URB.Timeout watchdog. Walk hc->in_flight; for any URB
+     * whose timeout has passed (uc->TimeoutMs > 0 && elapsed >= ms),
+     * collect its ED for cancel below. We can't call cancel_for_ed
+     * inline because it mutates hc->in_flight under our walk. */
+    {
+        ULONGLONG now = KeQueryInterruptTime();
+        for (struct ohci_urb *u = dc->Hc.in_flight; u != NULL;
+             u = u->next_pending)
+        {
+            if (u->is_isoc) continue;  /* isoch has no per-URB timeout */
+            POHCIPCI_URB_CTX uc =
+                CONTAINING_RECORD(u, OHCIPCI_URB_CTX, CoreUrb);
+            if (uc->TimeoutMs == 0) continue;
+            ULONGLONG elapsedMs =
+                (now - uc->SubmitInterruptTime) / 10000ULL;
+            if (elapsedMs < uc->TimeoutMs) continue;
+
+            BOOLEAN dup = FALSE;
+            for (int i = 0; i < n_expired; i++) {
+                if (expired_eds[i] == u->ed) { dup = TRUE; break; }
+            }
+            if (!dup && n_expired < (int)RTL_NUMBER_OF(expired_eds)) {
+                expired_eds[n_expired++] = u->ed;
+            }
+        }
+    }
+    for (int i = 0; i < n_expired; i++) {
+        ohci_urb_cancel_for_ed(&dc->Hc, expired_eds[i]);
+    }
+
     while (!IsListEmpty(&dc->DeferredCompletions)) {
         PLIST_ENTRY le = RemoveHeadList(&dc->DeferredCompletions);
         InsertTailList(&local, le);
     }
     WdfSpinLockRelease(dc->CoreLock);
+
+    /* Flush HeadP for each cancelled ED so the next submit doesn't
+     * walk freed TDs (cancel sets K + frees TDs but leaves HeadP
+     * stale; the EditHeadPSafely helper acquires CoreLock itself). */
+    for (int i = 0; i < n_expired; i++) {
+        OhciPci_EditHeadPSafely(dc, expired_eds[i],
+                                OhciPci_HeadPFlushToTail, NULL);
+    }
+    if (n_expired > 0) {
+        LOG("Timeout watchdog cancelled %d EP(s)", n_expired);
+    }
 
     while (!IsListEmpty(&local)) {
         PLIST_ENTRY le = RemoveHeadList(&local);
@@ -1286,6 +1347,9 @@ EvtUrbDefault(
     uc->CoreUrb.length      = uc->DataLength;
     uc->CoreUrb.direction   = uc->DataDirection;
     uc->CoreUrb.complete    = OhciPci_UrbComplete;
+
+    uc->TimeoutMs = (urb->Timeout > 0) ? urb->Timeout : 0;
+    uc->SubmitInterruptTime = KeQueryInterruptTime();
 
     int rc = ohci_control_submit(&dc->Hc, &ep->Core.Control, &uc->CoreUrb);
     if (rc != 0) {
