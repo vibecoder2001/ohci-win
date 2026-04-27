@@ -267,35 +267,85 @@ OhciPci_DeviceWalkEps(OHCIPCI_USBDEV_CTX *udc, ohcipci_dev_ep_fn fn, void *ctx)
     WdfSpinLockRelease(udc->EndpointListLock);
 }
 
-static EVT_UCX_USBDEVICE_ENABLE               StubUsbDeviceEnable;
-static EVT_UCX_USBDEVICE_DISABLE              StubUsbDeviceDisable;
+static EVT_UCX_USBDEVICE_ENABLE               EvtUsbDeviceEnable;
+static EVT_UCX_USBDEVICE_DISABLE              EvtUsbDeviceDisable;
 static EVT_UCX_USBDEVICE_RESET                StubUsbDeviceReset;
 static EVT_UCX_USBDEVICE_ADDRESS              StubUsbDeviceAddress;
 static EVT_UCX_USBDEVICE_UPDATE               StubUsbDeviceUpdate;
 static EVT_UCX_USBDEVICE_HUB_INFO             StubUsbDeviceHubInfo;
 static EVT_UCX_USBDEVICE_ENDPOINTS_CONFIGURE  StubUsbDeviceEndpointsConfigure;
 
-_Use_decl_annotations_
 static VOID
-StubUsbDeviceEnable(
-    UCXCONTROLLER UcxController,
-    WDFREQUEST    Request
-    )
+DeviceWalk_StartEp(OHCIPCI_EP_CONTEXT *ep, void *ctx)
 {
-    UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceEnable (stub)");
-    WdfRequestComplete(Request, STATUS_SUCCESS);
+    UNREFERENCED_PARAMETER(ctx);
+    OhciPci_StartEp(ep);
 }
 
 _Use_decl_annotations_
 static VOID
-StubUsbDeviceDisable(
+EvtUsbDeviceEnable(
     UCXCONTROLLER UcxController,
     WDFREQUEST    Request
     )
 {
     UNREFERENCED_PARAMETER(UcxController);
-    LOG("UsbDeviceDisable (stub)");
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_MGMT_HEADER hdr =
+        (PUSBDEVICE_MGMT_HEADER)rp.Parameters.Others.Arg1;
+    if (hdr == NULL) {
+        LOG("UsbDeviceEnable: missing mgmt header");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(hdr->UsbDevice);
+    if (udc == NULL) {
+        LOG("UsbDeviceEnable: NULL device context");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    LOG("UsbDeviceEnable");
+    OhciPci_DeviceWalkEps(udc, DeviceWalk_StartEp, NULL);
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+static VOID
+DeviceWalk_HaltEp(OHCIPCI_EP_CONTEXT *ep, void *ctx)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    OhciPci_HaltEp(ep);
+}
+
+_Use_decl_annotations_
+static VOID
+EvtUsbDeviceDisable(
+    UCXCONTROLLER UcxController,
+    WDFREQUEST    Request
+    )
+{
+    UNREFERENCED_PARAMETER(UcxController);
+
+    WDF_REQUEST_PARAMETERS rp;
+    WDF_REQUEST_PARAMETERS_INIT(&rp);
+    WdfRequestGetParameters(Request, &rp);
+    PUSBDEVICE_MGMT_HEADER hdr =
+        (PUSBDEVICE_MGMT_HEADER)rp.Parameters.Others.Arg1;
+    if (hdr == NULL) {
+        LOG("UsbDeviceDisable: missing mgmt header");
+        WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+    OHCIPCI_USBDEV_CTX *udc = OhciPci_UsbDevContextGet(hdr->UsbDevice);
+    if (udc == NULL) {
+        LOG("UsbDeviceDisable: NULL device context");
+        WdfRequestComplete(Request, STATUS_INVALID_DEVICE_STATE);
+        return;
+    }
+    LOG("UsbDeviceDisable");
+    OhciPci_DeviceWalkEps(udc, DeviceWalk_HaltEp, NULL);
     WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
@@ -497,8 +547,8 @@ OhciPci_UsbDeviceAdd(
     UCX_USBDEVICE_EVENT_CALLBACKS_INIT(
         &cbs,
         StubUsbDeviceEndpointsConfigure,  /* EvtUsbDeviceEndpointsConfigure */
-        StubUsbDeviceEnable,              /* EvtUsbDeviceEnable             */
-        StubUsbDeviceDisable,             /* EvtUsbDeviceDisable            */
+        EvtUsbDeviceEnable,               /* EvtUsbDeviceEnable             */
+        EvtUsbDeviceDisable,              /* EvtUsbDeviceDisable            */
         StubUsbDeviceReset,               /* EvtUsbDeviceReset              */
         StubUsbDeviceAddress,             /* EvtUsbDeviceAddress            */
         StubUsbDeviceUpdate,              /* EvtUsbDeviceUpdate             */
