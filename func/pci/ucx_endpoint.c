@@ -1275,6 +1275,18 @@ VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx)
     ed->HeadP &= ~(uint32_t)(OHCI_ED_HEADP_H | OHCI_ED_HEADP_C);
 }
 
+/* HeadP-edit callback: force HeadP = TailP & ~0xF. Used after URB cancel
+ * to flush stale TD pointers — ohci_urb_cancel_for_ed removes URBs from
+ * the in-flight list and frees their TDs, but does not advance HeadP, so
+ * HeadP may still point at a freed/reused TD. Resetting HeadP to TailP
+ * yields an empty queue from the HC's perspective; the next submit
+ * appends at TailP and HC starts cleanly. Also clears H and C. */
+VOID OhciPci_HeadPFlushToTail(struct ohci_ed *ed, void *ctx)
+{
+    UNREFERENCED_PARAMETER(ctx);
+    ed->HeadP = ed->TailP & ~(uint32_t)0xF;
+}
+
 /* HeadP-edit callback for OhciPci_EditHeadPSafely. ctx is a pointer to a
  * uint16_t carrying the new MaxPacketSize. Rewrites the MPS field
  * (OHCI §4.2.1, bits OHCI_ED_MPS_SHIFT+10..OHCI_ED_MPS_SHIFT in ed->Control). */
@@ -1333,6 +1345,8 @@ OhciPci_CancelEpInFlight(OHCIPCI_EP_CONTEXT *ep)
         InsertTailList(&local, le);
     }
     WdfSpinLockRelease(dc->CoreLock);
+
+    OhciPci_EditHeadPSafely(dc, ed, OhciPci_HeadPFlushToTail, NULL);
 
     while (!IsListEmpty(&local)) {
         PLIST_ENTRY le = RemoveHeadList(&local);

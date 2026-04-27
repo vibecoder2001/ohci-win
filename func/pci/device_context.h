@@ -295,6 +295,7 @@ typedef VOID (*ohcipci_headp_edit_fn)(struct ohci_ed *ed, void *ctx);
 VOID OhciPci_StartEp(OHCIPCI_EP_CONTEXT *ep);
 VOID OhciPci_HaltEp(OHCIPCI_EP_CONTEXT *ep);
 VOID OhciPci_HeadPClearHC(struct ohci_ed *ed, void *ctx);
+VOID OhciPci_HeadPFlushToTail(struct ohci_ed *ed, void *ctx);
 VOID OhciPci_HeadPSetMps(struct ohci_ed *ed, void *ctx);
 VOID OhciPci_EditHeadPSafely(PDEVICE_CONTEXT dc, struct ohci_ed *ed,
                               ohcipci_headp_edit_fn edit, void *ctx);
