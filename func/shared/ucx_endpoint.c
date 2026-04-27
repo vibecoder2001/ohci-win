@@ -1239,6 +1239,26 @@ EvtUrbDefault(
     WdfSpinLockRelease(dc->CoreLock);
     LOG("ohci_control_submit OK (setup_phys=0x%08X data_phys=0x%08X len=%u dir=%u)",
         uc->SetupBouncePhys, uc->DataBouncePhys, uc->DataLength, uc->DataDirection);
+    /* Diagnostic: snapshot OHCI register state immediately after submit so
+     * a stuck schedule (HC not Operational, control list disabled, CLF not
+     * latched, ED halted, etc.) is visible from the boot log. */
+    {
+        PUCHAR mmio = (PUCHAR)dc->MmioBase;
+        ULONG hcControl     = READ_REGISTER_ULONG((PULONG)(mmio + 0x04));
+        ULONG hcCmdStatus   = READ_REGISTER_ULONG((PULONG)(mmio + 0x08));
+        ULONG hcIntStatus   = READ_REGISTER_ULONG((PULONG)(mmio + 0x0C));
+        ULONG hcIntEnable   = READ_REGISTER_ULONG((PULONG)(mmio + 0x10));
+        ULONG hcFmNumber    = READ_REGISTER_ULONG((PULONG)(mmio + 0x3C));
+        ULONG hcCtlHeadED   = READ_REGISTER_ULONG((PULONG)(mmio + 0x20));
+        ULONG hcCtlCurED    = READ_REGISTER_ULONG((PULONG)(mmio + 0x24));
+        struct ohci_ed *ed  = ep->Core.Control.ed;
+        LOG("post-submit: HcControl=0x%08X CmdStat=0x%08X IntSt=0x%08X "
+            "IntEn=0x%08X FmNum=0x%04X CtlHead=0x%08X CtlCur=0x%08X",
+            hcControl, hcCmdStatus, hcIntStatus, hcIntEnable,
+            hcFmNumber & 0xFFFF, hcCtlHeadED, hcCtlCurED);
+        LOG("post-submit ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
+            ed->Control, ed->TailP, ed->HeadP, ed->NextED);
+    }
     /* Completion is asynchronous — OhciPci_UrbComplete will call
      * WdfRequestCompleteWithInformation when the OHCI hardware is done. */
 }
