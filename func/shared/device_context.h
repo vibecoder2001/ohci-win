@@ -325,6 +325,14 @@ NTSTATUS OhciPci_UcxInitDeviceInit(PWDFDEVICE_INIT DeviceInit);
 NTSTATUS OhciPci_UcxControllerCreate(PDEVICE_CONTEXT dc);
 NTSTATUS OhciPci_CreateDefaultQueue(PDEVICE_CONTEXT dc);
 
+/* Bus-glue hook: each function driver (func/pci/, func/acpi/, ...) supplies
+ * its own definition. Called by OhciPci_UcxControllerCreate in shared code
+ * to populate the UCX_CONTROLLER_CONFIG with bus-specific identification
+ * (PCI VID/DID/REV via BUS_INTERFACE_STANDARD, ACPI _HID/_CID, etc.).
+ * May be a no-op; shared code does not require any field to be set. */
+VOID Ohci_FillUcxControllerIdent(PDEVICE_CONTEXT dc,
+                                  PUCX_CONTROLLER_CONFIG cfg);
+
 /* Defined in ucx_roothub.c — UCX 1.6 root hub registration. */
 NTSTATUS OhciPci_RootHubCreate(PDEVICE_CONTEXT dc, UCXCONTROLLER controller);
 

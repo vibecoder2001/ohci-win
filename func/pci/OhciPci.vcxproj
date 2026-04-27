@@ -66,6 +66,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="pci_ident.c" />
     <ClCompile Include="..\shared\mmio.c" />
     <ClCompile Include="..\shared\dma.c" />
     <ClCompile Include="..\shared\isoc_mdl.c" />

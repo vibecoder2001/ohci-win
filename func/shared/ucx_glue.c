@@ -281,50 +281,11 @@ OhciPci_UcxControllerCreate(
     UCX_CONTROLLER_CONFIG cfg;
     UCX_CONTROLLER_CONFIG_INIT(&cfg, "OhciPci");
 
-    /*
-     * Read this device's PCI IDs and B/D/F via the BUS_INTERFACE_STANDARD
-     * the PCI bus driver exposes, then set ParentBusType=Pci. Without this
-     * UCX defaults to ParentBusTypeCustom + bogus VID/DID (LONG_MAX) which
-     * makes UCX's PCI-controller bring-up sequence fail and loop on Reset.
-     */
-    BUS_INTERFACE_STANDARD bus = {0};
-    PDEVICE_OBJECT pdo = WdfDeviceWdmGetPhysicalDevice(dc->Device);
-    if (pdo) {
-        KEVENT ev;
-        IO_STATUS_BLOCK iosb;
-        KeInitializeEvent(&ev, NotificationEvent, FALSE);
-        PIRP irp = IoBuildSynchronousFsdRequest(IRP_MJ_PNP, pdo,
-                                                NULL, 0, NULL, &ev, &iosb);
-        if (irp) {
-            PIO_STACK_LOCATION s = IoGetNextIrpStackLocation(irp);
-            s->MajorFunction = IRP_MJ_PNP;
-            s->MinorFunction = IRP_MN_QUERY_INTERFACE;
-            s->Parameters.QueryInterface.InterfaceType    = &GUID_BUS_INTERFACE_STANDARD;
-            s->Parameters.QueryInterface.Size             = sizeof(bus);
-            s->Parameters.QueryInterface.Version          = 1;
-            s->Parameters.QueryInterface.Interface        = (PINTERFACE)&bus;
-            s->Parameters.QueryInterface.InterfaceSpecificData = NULL;
-            irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
-            NTSTATUS qiSt = IoCallDriver(pdo, irp);
-            if (qiSt == STATUS_PENDING) {
-                KeWaitForSingleObject(&ev, Executive, KernelMode, FALSE, NULL);
-                qiSt = iosb.Status;
-            }
-            if (NT_SUCCESS(qiSt) && bus.GetBusData) {
-                ULONG vidDid = 0;
-                bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &vidDid, 0, sizeof(vidDid));
-                USHORT vid = (USHORT)(vidDid & 0xFFFF);
-                USHORT did = (USHORT)(vidDid >> 16);
-                UCHAR rev = 0;
-                bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &rev, 0x08, sizeof(rev));
-                LOG("PCI VID=0x%04X DID=0x%04X REV=0x%02X", vid, did, rev);
-                UCX_CONTROLLER_CONFIG_SET_PCI_INFO(&cfg, vid, did, rev, 0, 0, 0);
-                if (bus.InterfaceDereference) bus.InterfaceDereference(bus.Context);
-            } else {
-                LOG("BUS_INTERFACE_STANDARD query failed: 0x%08X", qiSt);
-            }
-        }
-    }
+    /* Bus-specific identification (PCI VID/DID/REV, ACPI _HID, ...) comes
+     * from the bus-glue function driver (func/pci/, func/acpi/, ...).
+     * Without this UCX defaults to ParentBusTypeCustom + bogus VID/DID
+     * (LONG_MAX) which makes UCX's bring-up sequence loop on Reset. */
+    Ohci_FillUcxControllerIdent(dc, &cfg);
 
     cfg.EvtControllerUsbDeviceAdd                                      = OhciPci_UsbDeviceAdd;
     cfg.EvtControllerQueryUsbCapability                                = EvtControllerQueryUsbCapability;
