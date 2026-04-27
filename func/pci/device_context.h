@@ -13,6 +13,38 @@
 #include "ohci_isoc.h"
 #include "ohci_urb.h"
 
+/* TRANSFER_URB layout, copied from the dwusb reference (Driver.h). The struct
+ * is a UCX-private contract not exported in any public WDK header; UCX puts a
+ * pointer to it in Parameters.Others.Arg1 of every request enqueued to a
+ * per-EP WDFQUEUE. SetupPacket[8] lives at u.SetupPacket for control transfers.
+ * Lives here so isoc_mdl.c and ucx_endpoint.c share one definition. */
+typedef struct _OHCIPCI_UCX_URB_DATA {
+    PVOID Reserved[8];
+} OHCIPCI_UCX_URB_DATA;
+
+typedef struct _OHCIPCI_TRANSFER_URB {
+    struct _URB_HEADER Hdr;
+    PVOID UsbdPipeHandle;
+    ULONG TransferFlags;
+    ULONG TransferBufferLength;
+    PVOID TransferBuffer;
+    PMDL  TransferBufferMDL;
+    union {
+        ULONG Timeout;
+        PVOID ReservedMBNull;
+    };
+    OHCIPCI_UCX_URB_DATA UrbData;
+    union {
+        struct {
+            ULONG StartFrame;
+            ULONG NumberOfPackets;
+            ULONG ErrorCount;
+            USBD_ISO_PACKET_DESCRIPTOR IsoPacket[1];
+        } Isoch;
+        UCHAR SetupPacket[8];
+    } u;
+} OHCIPCI_TRANSFER_URB, *POHCIPCI_TRANSFER_URB;
+
 /* Bounce buffer pool sized for Plan 5 enumeration workload:
  * 64 slabs × 4 KB = 256 KB of the DMA region reserved. */
 #define OHCIPCI_BOUNCE_SLAB_COUNT  64
@@ -50,11 +82,10 @@ typedef struct _DEVICE_CONTEXT {
     KINTERRUPT_MODE          InterruptMode;
     WDFINTERRUPT             Interrupt;
 
-    /* DMA enabler + common buffer (Task 3). */
+    /* DMA enabler + common buffer (Task 3). Isoch no longer uses a
+     * separate WDFDMAENABLER — the MDL-walk path in func/pci/isoc_mdl.c
+     * walks PFNs directly and bounces only when they're non-contiguous. */
     WDFDMAENABLER            DmaEnabler;
-    /* Separate enabler for isoch with WdfDmaProfilePacket so HAL bounces
-     * page-fragmented audio buffers into a contiguous chunk (Plan 8). */
-    WDFDMAENABLER            IsocDmaEnabler;
     WDFCOMMONBUFFER          DmaBuffer;
 
     /* Wired into core lib (Tasks 2/3/5). */

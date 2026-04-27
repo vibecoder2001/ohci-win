@@ -31,21 +31,6 @@ NTSTATUS OhciPci_AllocateDma(PDEVICE_CONTEXT dc) {
     WdfDmaEnablerSetMaximumScatterGatherElements(dc->DmaEnabler,
                                                  OHCI_BULK_MAX_SG_PAGES / 2);
 
-    /* Plan 8: separate DMA enabler for isoch with WdfDmaProfilePacket so
-     * HAL bounces the caller's audio buffer into a single physically-
-     * contiguous chunk before invoking EvtProgramDma. usbaudio.sys hands
-     * us page-fragmented buffers (cross page boundary at offset 1472 of a
-     * 1920-byte URB) which the SG profile would surface as 2 disjoint
-     * elements — packet 7 then straddles the cut and IsocProgramDma
-     * rejects the URB. Packet profile sidesteps this entirely; cap is
-     * 4 KB which covers UAC1 audio (10 ms @ 48k stereo 16-bit = 1920 B,
-     * 20 ms = 3840 B). */
-    WDF_DMA_ENABLER_CONFIG isocCfg;
-    WDF_DMA_ENABLER_CONFIG_INIT(&isocCfg, WdfDmaProfilePacket, 4096);
-    status = WdfDmaEnablerCreate(dc->Device, &isocCfg,
-                                 WDF_NO_OBJECT_ATTRIBUTES, &dc->IsocDmaEnabler);
-    if (!NT_SUCCESS(status)) return status;
-
     status = WdfCommonBufferCreate(dc->DmaEnabler, OHCIPCI_DMA_BUFFER_SIZE,
                                    WDF_NO_OBJECT_ATTRIBUTES, &dc->DmaBuffer);
     if (!NT_SUCCESS(status)) return status;

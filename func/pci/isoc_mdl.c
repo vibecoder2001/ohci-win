@@ -38,42 +38,11 @@ Environment:
 #define LOG(fmt, ...) DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
                                   "OhciPci: " fmt "\n", ##__VA_ARGS__)
 
-/* Mirrors the typedef in ucx_endpoint.c. UCX puts a pointer to this layout
- * in Parameters.Others.Arg1 of every URB request enqueued to a per-EP
- * WDFQUEUE; the contract is UCX-private so we duplicate the struct here. */
-typedef struct _OHCIPCI_UCX_URB_DATA {
-    PVOID Reserved[8];
-} OHCIPCI_UCX_URB_DATA;
-
-typedef struct _OHCIPCI_TRANSFER_URB {
-    struct _URB_HEADER Hdr;
-    PVOID UsbdPipeHandle;
-    ULONG TransferFlags;
-    ULONG TransferBufferLength;
-    PVOID TransferBuffer;
-    PMDL  TransferBufferMDL;
-    union {
-        ULONG Timeout;
-        PVOID ReservedMBNull;
-    };
-    OHCIPCI_UCX_URB_DATA UrbData;
-    union {
-        struct {
-            ULONG StartFrame;
-            ULONG NumberOfPackets;
-            ULONG ErrorCount;
-            USBD_ISO_PACKET_DESCRIPTOR IsoPacket[1];
-        } Isoch;
-        UCHAR SetupPacket[8];
-    } u;
-} OHCIPCI_TRANSFER_URB, *POHCIPCI_TRANSFER_URB;
+/* OHCIPCI_TRANSFER_URB defined in device_context.h. */
 
 /* --------------------------------------------------------------------------
  * Failure helper — stage the URB on dc->DeferredCompletions exactly once.
- * Mirrors the failure half of OhciPci_IsocProgramDmaFail in ucx_endpoint.c
- * but does NOT touch uc->DmaTransaction (the spike leaves it allocated but
- * unused). uc->OurMdl is left for HandleIsocUrb cleanup, same as the
- * reference's success path.
+ * uc->OurMdl is left for OhciPci_UrbComplete / EpContextCleanup to reclaim.
  * -------------------------------------------------------------------------- */
 static VOID
 OhciPci_IsocBuildFail_Locked(OHCIPCI_URB_CTX *uc, NTSTATUS status)
