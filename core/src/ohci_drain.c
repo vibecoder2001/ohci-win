@@ -126,7 +126,12 @@ void ohci_drain_done(struct ohci_hc *hc) {
     uint32_t istat = hc->ops.read32(hc->ops.context, 0x0C);
     if (!(istat & OHCI_INT_WDH)) return;
 
-    uint32_t done_head = hc->hcca->DoneHead;
+    /* OHCI §4.4.4: HC writes the chain pointer with bit 0 set when at
+     * least one queued TD's DelayInterrupt has expired. §5.2.5.4 says
+     * the HCD must ignore bits 3:0. Mask here so virt_from_phys gets a
+     * 16-byte-aligned pointer regardless of which HC implementation we
+     * land on (some clones never set bit 0; spec-compliant ones do). */
+    uint32_t done_head = hc->hcca->DoneHead & ~0xFu;
     hc->hcca->DoneHead = 0;
     hc->ops.write32(hc->ops.context, 0x0C, OHCI_INT_WDH);
 

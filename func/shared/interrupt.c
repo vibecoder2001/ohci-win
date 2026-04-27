@@ -88,6 +88,25 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
             OHCI_INT_RHSC);
     }
 
+    /* SO (Scheduling Overrun) and UE (Unrecoverable Error) are W1C
+     * status bits; if we leave them set, the ISR keeps re-claiming the
+     * IRQ (istat & ie & ~MIE stays non-zero) and we loop. Log+ack so a
+     * single occurrence is visible without livelocking the CPU. */
+    if (istat & OHCI_INT_SO) {
+        LOG("SO (Scheduling Overrun) — periodic schedule didn't fit in frame");
+        WRITE_REGISTER_ULONG(
+            (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus),
+            OHCI_INT_SO);
+    }
+    if (istat & OHCI_INT_UE) {
+        LOG("UE (Unrecoverable Error) — HC needs reset; acknowledging to break IRQ loop");
+        WRITE_REGISTER_ULONG(
+            (PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptStatus),
+            OHCI_INT_UE);
+        /* Real recovery requires HCR + re-init; we just log for now and
+         * let UCX surface a controller failure if URBs start timing out. */
+    }
+
     /* Re-enable the master interrupt. */
     if (dc->MmioBase) {
         WRITE_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + REG_HcInterruptEnable),
