@@ -279,6 +279,11 @@ static VOID
 DeviceWalk_StartEp(OHCIPCI_EP_CONTEXT *ep, void *ctx)
 {
     UNREFERENCED_PARAMETER(ctx);
+    /* Skip EP0 (Control). UCX uses EP0 for management traffic during
+     * Enable/Disable transitions and expects it always live; HaltEp
+     * never sets K on it (see DeviceWalk_HaltEp), so there's nothing
+     * for StartEp to clear. */
+    if (ep->Kind == OhciPciEpKindControl) return;
     OhciPci_StartEp(ep);
 }
 
@@ -316,6 +321,15 @@ static VOID
 DeviceWalk_HaltEp(OHCIPCI_EP_CONTEXT *ep, void *ctx)
 {
     UNREFERENCED_PARAMETER(ctx);
+    /* Skip EP0 (Control). UCX continues to issue control traffic to a
+     * "disabled" device for teardown purposes (SET_INTERFACE(alt=0),
+     * unconfigure, status queries). Halting EP0 wedges those URBs on
+     * a K-bit-set ED, holding UCX's request pipeline open and starving
+     * other devices' callbacks — observed as the audio device + sibling
+     * keyboard/tablet all going dark when audio is disabled in
+     * Device Manager. Disable's intent is "stop functional EPs", not
+     * "kill the management channel". */
+    if (ep->Kind == OhciPciEpKindControl) return;
     OhciPci_HaltEp(ep);
 }
 
