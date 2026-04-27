@@ -173,8 +173,10 @@ OhciPci_IsocBuildAndSubmit_Locked(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         /* OUT: copy URB bytes into bounce now. IN: leave bounce uninitialised;
-         * UrbComplete copies bounce -> MDL on retire. Only OUT is wired
-         * today (audio sink) — the IN copy-back path is a TODO. */
+         * OhciPci_IsocOnUrbRetire_Locked copies bounce -> user MDL on
+         * retire. Both directions live behind the bounce path because
+         * usbaudio.sys URB MDLs always fragment across non-contiguous
+         * PFNs (see feedback_usbaudio_urb_pfn_fragmentation). */
         if (uc->DataDirection == OHCI_URB_DIR_OUT) {
             if (uc->MdlSysVa == NULL) {
                 uc->MdlSysVa = MmGetSystemAddressForMdlSafe(mdl,
@@ -337,8 +339,38 @@ OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
         uc->InFlightEntry.Blink = NULL;
     }
 
+    /* IN copy-back. usbaudio.sys URB MDLs come from paged-pool and routinely
+     * fragment across non-adjacent physical pages, so BuildAndSubmit takes
+     * the bounce path on every microphone URB. The HC wrote captured audio
+     * into the bounce slab; copy it back to the user MDL before freeing
+     * the bounce — without this the user buffer stays whatever it was at
+     * submit time (zero on a fresh allocation) and the input stream is
+     * silent.
+     *
+     * Per-packet IsoPacket[i].Length writeback already happened in
+     * OhciPci_UrbComplete above (PSW.Size is well-defined for IN per
+     * OHCI §4.3.2.4). We just need the bytes to land in user memory. */
+    if (uc->IsocBounceVa &&
+        uc->DataDirection == OHCI_URB_DIR_IN &&
+        uc->UserMdl != NULL &&
+        uc->DataLength > 0)
+    {
+        if (uc->MdlSysVa == NULL) {
+            uc->MdlSysVa = MmGetSystemAddressForMdlSafe(uc->UserMdl,
+                                                        NormalPagePriority);
+        }
+        if (uc->MdlSysVa != NULL) {
+            RtlCopyMemory(uc->MdlSysVa, uc->IsocBounceVa, uc->DataLength);
+        } else {
+            /* Low-resources MDL map failed. Drop the captured audio rather
+             * than landing it at a garbage VA. usbaudio sees a zero-length
+             * frame which it tolerates as a transient glitch — preferable
+             * to a wild kernel write or memory corruption. */
+            LOG("IsocOnUrbRetire: IN copy-back skipped — MDL map failed");
+        }
+    }
+
     /* Free the page-straddle bounce slab if BuildAndSubmit allocated one.
-     * IN copy-back is a TODO — only OUT (audio sink) is implemented today.
      * Setting Va=NULL after free is required because UrbComplete and the
      * teardown helper both consult IsocBounceVa as the "owns a bounce"
      * sentinel, and the URB context can outlive the slab in the bounce

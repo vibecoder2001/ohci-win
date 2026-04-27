@@ -187,8 +187,15 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
         .control_ed_count   = 16,
         .bulk_ed_count      = 16,
         .interrupt_ed_count = 16,
-        .isoc_ed_count      = 4,
-        .itd_pool_size      = 32,
+        /* Headset = 1 OUT + 1 IN isoch EP simultaneously. itd_pool_size=32
+         * was sized for QEMU's OUT-only audio device and exhausts on a
+         * real two-direction stream: per EP we reserve ~16 ITDs of
+         * lookahead (OHCIPCI_ISOC_REFILL_HIGH frames) plus a placeholder
+         * plus in-flight URB ITDs, so two EPs need ~80 slots in steady
+         * state. 128 gives generous cushion. isoc_ed_count bumped in
+         * step for defensive headroom on alt-setting churn. */
+        .isoc_ed_count      = 8,
+        .itd_pool_size      = 128,
     };
     int rc = ohci_hc_init(&dc->Hc, &dc->MmioOps, &dc->DmaRegion, &hccfg);
     LOG("ohci_hc_init -> %d", rc);

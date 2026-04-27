@@ -205,7 +205,24 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                     default:                          pktStatus = USBD_STATUS_SUCCESS;            break;
                     }
                 } else {
-                    pktStatus = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                    /* IN: DataUnderrun (cc=9) means "device sent fewer bytes
+                     * than the buffer capacity" — that's the normal short-
+                     * packet case for USB audio mic where each (micro)frame's
+                     * payload is the actual sample count, not always the
+                     * endpoint's mps. The bytes ARE valid and PSW.Size is
+                     * correct. Reporting USBD_STATUS_DATA_UNDERRUN per packet
+                     * inflates IsoPacket[].Status / ErrorCount and usbaudio
+                     * drops every URB → silent microphone. Inbox usbohci.sys
+                     * maps DataUnderrun→SUCCESS for IN. */
+                    switch (u->isoc_pkts[i].cc) {
+                    case OHCI_CC_NOERROR:
+                    case OHCI_CC_DATAUNDERRUN:
+                        pktStatus = USBD_STATUS_SUCCESS;
+                        break;
+                    default:
+                        pktStatus = OhciPci_CcToUsbd(u->isoc_pkts[i].cc);
+                        break;
+                    }
                 }
                 turb->u.Isoch.IsoPacket[i].Status = pktStatus;
                 totalLen += pktLen;
