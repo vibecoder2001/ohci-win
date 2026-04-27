@@ -184,18 +184,24 @@ int ohci_bulk_submit_sg(struct ohci_hc *hc,
     ep->tail_placeholder      = new_ph;
     ep->tail_placeholder_phys = new_ph_phys;
 
-    /* Defensive: a prior Cancel/Purge may have set ED.K=1 to halt the EP.
-     * UCX is supposed to call Start before resubmitting, but in observed
-     * VM traces (mass-storage CBW path) Start is occasionally skipped.
-     * Clear K here so the HC actually walks the ED. Also clear H (halt
-     * from a STALL'd TD); we leave the toggle (C) alone here because the
-     * caller is responsible for issuing CLEAR_FEATURE(HALT) on the wire
-     * before retrying — only the CLEAR_FEATURE intercept knows it's
-     * safe to reset the device-side toggle to DATA0. */
-    ep->ed->Control &= ~OHCI_ED_K;
-    ep->ed->HeadP   &= ~(uint32_t)OHCI_ED_HEADP_H;
+    /* Publish chain to HC. OHCI §6.4.4 / §5.2.7.2: HeadP/TailP must not
+     * be modified while the HC may be walking the ED. Set K=1 first so
+     * the HC's next pass skips this ED, then rewrite HeadP (clear H from
+     * any prior STALL) and TailP, then drop K. The control submit path
+     * (see ohci_control.c) does the same dance — we used to do the
+     * HeadP write outside the bracket here on the assumption that a
+     * prior cancel/purge had already set K=1, but that's only true for
+     * the STALL-recovery path. A normal bulk submit runs with K=0 and
+     * the un-bracketed HeadP write races the HC. Keep the toggle bit
+     * (C) intact: bulk endpoints inherit toggle from the ED across
+     * URBs, and the caller issues CLEAR_FEATURE(HALT) on the wire
+     * before retrying after a STALL. */
+    ep->ed->Control |= OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
+    ep->ed->HeadP &= ~(uint32_t)OHCI_ED_HEADP_H;
     ep->ed->TailP = new_ph_phys;
+    hc->ops.barrier(hc->ops.context);
+    ep->ed->Control &= ~OHCI_ED_K;
     hc->ops.barrier(hc->ops.context);
     hc->ops.write32(hc->ops.context, 0x08, OHCI_CMD_BLF);
 
