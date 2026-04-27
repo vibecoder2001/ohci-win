@@ -68,6 +68,7 @@
     <ClCompile Include="driver.c" />
     <ClCompile Include="mmio.c" />
     <ClCompile Include="dma.c" />
+    <ClCompile Include="isoc_mdl.c" />
     <ClCompile Include="interrupt.c" />
     <ClCompile Include="ucx_glue.c" />
     <ClCompile Include="bounce.c" />

@@ -148,6 +148,10 @@ typedef struct _OHCIPCI_EP_CONTEXT {
     LIST_ENTRY                     IsocQueuedUrbs;   /* OHCIPCI_URB_CTX::QueueEntry */
     WDFSPINLOCK                    IsocQueueLock;
     LIST_ENTRY                     IsocEpEntry;     /* on dc->IsocEps */
+
+    /* Spike (MDL-walk) — URBs with ITDs linked into the ED but not yet retired.
+     * Drained by OhciPci_IsocRetireEmitted_Locked / cancel / teardown. */
+    LIST_ENTRY                     IsocInFlightUrbs;
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_EP_CONTEXT, OhciPci_EpContextGet)
@@ -187,6 +191,10 @@ typedef struct _OHCIPCI_URB_CTX {
      * synchronously; the refill DPC drains entries when the ED chain has
      * room (lead < OHCIPCI_ISOC_REFILL_HIGH frames ahead of HcFmNumber). */
     LIST_ENTRY                   QueueEntry;
+
+    /* Spike (MDL-walk) bookkeeping. */
+    LIST_ENTRY  InFlightEntry;   /* on EP->IsocInFlightUrbs while ITDs linked */
+    PVOID       MdlSysVa;        /* cached MmGetSystemAddressForMdlSafe result */
 } OHCIPCI_URB_CTX, *POHCIPCI_URB_CTX;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(OHCIPCI_URB_CTX, OhciPci_UrbCtxGet)
@@ -274,6 +282,10 @@ void OhciPci_IsocRefillAll_Locked(PDEVICE_CONTEXT dc);
 
 /* WDFTIMER callback for the periodic backstop. Defined in ucx_endpoint.c. */
 EVT_WDF_TIMER OhciPci_EvtIsocBackstopTimer;
+
+/* Defined in ucx_endpoint.c — completion callback installed on CoreUrb. */
+struct ohci_urb;
+VOID OhciPci_UrbComplete(struct ohci_urb *u);
 
 /* Defined in bounce.c — per-URB bounce buffer slab pool. */
 NTSTATUS OhciPci_BounceInit(PDEVICE_CONTEXT dc);

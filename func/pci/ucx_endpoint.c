@@ -175,7 +175,7 @@ OhciPci_CcToUsbd(uint8_t cc)
     }
 }
 
-static VOID
+VOID
 OhciPci_UrbComplete(struct ohci_urb *u)
 {
     OHCIPCI_URB_CTX *uc =
@@ -2117,6 +2117,7 @@ OhciPci_EndpointAdd(
              * silence). IsocQueueLock is mandatory — HandleIsocUrb
              * relies on it. */
             InitializeListHead(&ep->IsocQueuedUrbs);
+            InitializeListHead(&ep->IsocInFlightUrbs);
             /* IsocEpEntry.Flink stays NULL (RtlZeroMemory above) until
              * we splice onto dc->IsocEps below; the cleanup callback uses
              * "Flink == NULL" as the "not on any list" sentinel. */
