@@ -1258,6 +1258,23 @@ EvtUrbDefault(
             hcFmNumber & 0xFFFF, hcCtlHeadED, hcCtlCurED);
         LOG("post-submit ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
             ed->Control, ed->TailP, ed->HeadP, ed->NextED);
+        /* Walk the TD chain HeadP..TailP from CPU side and log raw dwords —
+         * if HC stalls on a TD, comparing what we wrote vs what HC reads
+         * will tell us whether the descriptors are reaching DRAM at all. */
+        uint32_t headPhys = ed->HeadP & ~0xFu;
+        uint32_t tailPhys = ed->TailP & ~0xFu;
+        for (int i = 0; i < 4 && headPhys != 0 && headPhys != tailPhys; i++) {
+            if (headPhys < dc->DmaRegion.phys_base ||
+                headPhys >= dc->DmaRegion.phys_base + dc->DmaRegion.size) {
+                LOG("  TD@0x%08X: out of DMA region — bogus pointer", headPhys);
+                break;
+            }
+            ULONG off = headPhys - dc->DmaRegion.phys_base;
+            volatile ULONG *td = (volatile ULONG *)((PUCHAR)dc->DmaRegion.base + off);
+            LOG("  TD@0x%08X: cw=0x%08X CBP=0x%08X NextTD=0x%08X BE=0x%08X",
+                headPhys, td[0], td[1], td[2], td[3]);
+            headPhys = td[2] & ~0xFu;  /* NextTD */
+        }
     }
     /* Completion is asynchronous — OhciPci_UrbComplete will call
      * WdfRequestCompleteWithInformation when the OHCI hardware is done. */
