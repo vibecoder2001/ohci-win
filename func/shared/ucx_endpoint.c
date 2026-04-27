@@ -297,10 +297,15 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                      : STATUS_DEVICE_DATA_ERROR;
     }
     ULONG_PTR info = (ULONG_PTR)u->transferred;
-    if (u->status != OHCI_URB_STATUS_OK) {
-        LOG("UrbComplete: core_status=%d transferred=%u dir=%u",
-            u->status, u->transferred, uc->DataDirection);
-    }
+    /* Always log control completions while diagnosing enumeration. The
+     * copyback-failed case used to be silent (status got overridden to
+     * STATUS_DEVICE_DATA_ERROR but core_status stayed OK), which masks
+     * the failure mode that makes UCX retry enumeration with successive
+     * addresses — exactly what we see for the Logitech mouse. */
+    LOG("UrbComplete: core_status=%d transferred=%u dir=%u copyBackFailed=%u "
+        "len=%u userVa=%p userMdl=%p",
+        u->status, u->transferred, uc->DataDirection,
+        (unsigned)copyBackFailed, uc->DataLength, uc->UserVa, uc->UserMdl);
 
     /* Write the result back into the TRANSFER_URB. UCX reads
      * Hdr.Status + TransferBufferLength to learn how the transfer went;
