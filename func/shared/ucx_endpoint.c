@@ -297,15 +297,16 @@ OhciPci_UrbComplete(struct ohci_urb *u)
                      : STATUS_DEVICE_DATA_ERROR;
     }
     ULONG_PTR info = (ULONG_PTR)u->transferred;
-    /* Always log control completions while diagnosing enumeration. The
-     * copyback-failed case used to be silent (status got overridden to
-     * STATUS_DEVICE_DATA_ERROR but core_status stayed OK), which masks
-     * the failure mode that makes UCX retry enumeration with successive
-     * addresses — exactly what we see for the Logitech mouse. */
-    LOG("UrbComplete: core_status=%d transferred=%u dir=%u copyBackFailed=%u "
-        "len=%u userVa=%p userMdl=%p",
-        u->status, u->transferred, uc->DataDirection,
-        (unsigned)copyBackFailed, uc->DataLength, uc->UserVa, uc->UserMdl);
+    /* Log only failure paths. core_status != OK covers wire errors;
+     * copyBackFailed covers low-resources MDL-map failures (gets
+     * silently overridden to STATUS_DEVICE_DATA_ERROR). Both surface
+     * as "UCX retries enumeration" symptoms when something's wrong. */
+    if (u->status != OHCI_URB_STATUS_OK || copyBackFailed) {
+        LOG("UrbComplete: core_status=%d transferred=%u dir=%u "
+            "copyBackFailed=%u len=%u",
+            u->status, u->transferred, uc->DataDirection,
+            (unsigned)copyBackFailed, uc->DataLength);
+    }
 
     /* Write the result back into the TRANSFER_URB. UCX reads
      * Hdr.Status + TransferBufferLength to learn how the transfer went;
@@ -1279,60 +1280,6 @@ EvtUrbDefault(
         return;
     }
     WdfSpinLockRelease(dc->CoreLock);
-    LOG("ohci_control_submit OK (setup_phys=0x%08X data_phys=0x%08X len=%u dir=%u)",
-        uc->SetupBouncePhys, uc->DataBouncePhys, uc->DataLength, uc->DataDirection);
-    /* Diagnostic: snapshot OHCI register state immediately after submit so
-     * a stuck schedule (HC not Operational, control list disabled, CLF not
-     * latched, ED halted, etc.) is visible from the boot log. */
-    {
-        PUCHAR mmio = (PUCHAR)dc->MmioBase;
-        ULONG hcControl     = READ_REGISTER_ULONG((PULONG)(mmio + 0x04));
-        ULONG hcCmdStatus   = READ_REGISTER_ULONG((PULONG)(mmio + 0x08));
-        ULONG hcIntStatus   = READ_REGISTER_ULONG((PULONG)(mmio + 0x0C));
-        ULONG hcIntEnable   = READ_REGISTER_ULONG((PULONG)(mmio + 0x10));
-        ULONG hcFmNumber    = READ_REGISTER_ULONG((PULONG)(mmio + 0x3C));
-        ULONG hcCtlHeadED   = READ_REGISTER_ULONG((PULONG)(mmio + 0x20));
-        ULONG hcCtlCurED    = READ_REGISTER_ULONG((PULONG)(mmio + 0x24));
-        ULONG hcFmInterval  = READ_REGISTER_ULONG((PULONG)(mmio + 0x34));
-        ULONG hcPerStart    = READ_REGISTER_ULONG((PULONG)(mmio + 0x40));
-        ULONG hcHccaReg     = READ_REGISTER_ULONG((PULONG)(mmio + 0x18));
-        struct ohci_ed *ed  = ep->Core.Control.ed;
-        LOG("post-submit: HcControl=0x%08X CmdStat=0x%08X IntSt=0x%08X "
-            "IntEn=0x%08X FmNum=0x%04X CtlHead=0x%08X CtlCur=0x%08X",
-            hcControl, hcCmdStatus, hcIntStatus, hcIntEnable,
-            hcFmNumber & 0xFFFF, hcCtlHeadED, hcCtlCurED);
-        LOG("post-submit: HcFmInterval=0x%08X HcPeriodicStart=0x%08X HcHCCA=0x%08X",
-            hcFmInterval, hcPerStart, hcHccaReg);
-        /* HCCA.FrameNumber is written by HC every SOF. If it lags
-         * HcFmNumber, the HC's DMA-write path to memory is broken; if
-         * it matches, writes work and only TD/ED reads are suspect. */
-        if (dc->Hc.hcca) {
-            uint16_t hccaFn  = dc->Hc.hcca->FrameNumber;
-            uint16_t hccaPad = dc->Hc.hcca->PadFrameNumber;
-            uint32_t hccaDh  = dc->Hc.hcca->DoneHead;
-            LOG("post-submit HCCA: FrameNumber=0x%04X Pad=0x%04X DoneHead=0x%08X (HcFmNum=0x%04X)",
-                hccaFn, hccaPad, hccaDh, hcFmNumber & 0xFFFF);
-        }
-        LOG("post-submit ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
-            ed->Control, ed->TailP, ed->HeadP, ed->NextED);
-        /* Walk the TD chain HeadP..TailP from CPU side and log raw dwords —
-         * if HC stalls on a TD, comparing what we wrote vs what HC reads
-         * will tell us whether the descriptors are reaching DRAM at all. */
-        uint32_t headPhys = ed->HeadP & ~0xFu;
-        uint32_t tailPhys = ed->TailP & ~0xFu;
-        for (int i = 0; i < 4 && headPhys != 0 && headPhys != tailPhys; i++) {
-            if (headPhys < dc->DmaRegion.phys_base ||
-                headPhys >= dc->DmaRegion.phys_base + dc->DmaRegion.size) {
-                LOG("  TD@0x%08X: out of DMA region — bogus pointer", headPhys);
-                break;
-            }
-            ULONG off = headPhys - dc->DmaRegion.phys_base;
-            volatile ULONG *td = (volatile ULONG *)((PUCHAR)dc->DmaRegion.base + off);
-            LOG("  TD@0x%08X: cw=0x%08X CBP=0x%08X NextTD=0x%08X BE=0x%08X",
-                headPhys, td[0], td[1], td[2], td[3]);
-            headPhys = td[2] & ~0xFu;  /* NextTD */
-        }
-    }
     /* Completion is asynchronous — OhciPci_UrbComplete will call
      * WdfRequestCompleteWithInformation when the OHCI hardware is done. */
 }
@@ -1483,31 +1430,7 @@ EvtDefaultEpPurge(
 {
     UNREFERENCED_PARAMETER(UcxController);
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
-    PDEVICE_CONTEXT dc = ep->Dc;
     LOG("DefaultEp Purge");
-    /* Snapshot HC state at Purge time so we can compare with the
-     * post-submit dump and tell whether HC made any progress between
-     * submit and the unplug-driven Purge. */
-    if (dc && dc->MmioBase) {
-        PUCHAR mmio = (PUCHAR)dc->MmioBase;
-        ULONG hcControl   = READ_REGISTER_ULONG((PULONG)(mmio + 0x04));
-        ULONG hcCmdStat   = READ_REGISTER_ULONG((PULONG)(mmio + 0x08));
-        ULONG hcIntStat   = READ_REGISTER_ULONG((PULONG)(mmio + 0x0C));
-        ULONG hcFmNumber  = READ_REGISTER_ULONG((PULONG)(mmio + 0x3C));
-        ULONG hcCtlHead   = READ_REGISTER_ULONG((PULONG)(mmio + 0x20));
-        ULONG hcCtlCur    = READ_REGISTER_ULONG((PULONG)(mmio + 0x24));
-        struct ohci_ed *ed = ep->Core.Control.ed;
-        LOG("Purge HC: HcCtl=0x%08X CmdStat=0x%08X IntSt=0x%08X FmNum=0x%04X "
-            "CtlHead=0x%08X CtlCur=0x%08X",
-            hcControl, hcCmdStat, hcIntStat, hcFmNumber & 0xFFFF,
-            hcCtlHead, hcCtlCur);
-        LOG("Purge ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
-            ed->Control, ed->TailP, ed->HeadP, ed->NextED);
-        if (dc->Hc.hcca) {
-            LOG("Purge HCCA: FrameNumber=0x%04X DoneHead=0x%08X",
-                dc->Hc.hcca->FrameNumber, dc->Hc.hcca->DoneHead);
-        }
-    }
     if (ep->UrbQueue != NULL) {
         WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
     }
