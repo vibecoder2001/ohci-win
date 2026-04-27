@@ -215,8 +215,8 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
     LOG("HcControl after init = 0x%08X (expect HCFS=10 + CLE+BLE+PLE+IE)", ctrl);
 
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x10),
-                         OHCI_INT_RHSC);
-    LOG("RHSC interrupt enabled");
+                         OHCI_INT_RHSC | OHCI_INT_UE | OHCI_INT_SO);
+    LOG("RHSC + UE + SO interrupts enabled (WDH/MIE were set by hc_init)");
 
     NTSTATUS bcStatus = OhciPci_BounceInit(dc);
     LOG("OhciPci_BounceInit -> 0x%08X", bcStatus);

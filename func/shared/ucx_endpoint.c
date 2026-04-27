@@ -1441,7 +1441,31 @@ EvtDefaultEpPurge(
 {
     UNREFERENCED_PARAMETER(UcxController);
     OHCIPCI_EP_CONTEXT *ep = OhciPci_EpContextGet(UcxEndpoint);
+    PDEVICE_CONTEXT dc = ep->Dc;
     LOG("DefaultEp Purge");
+    /* Snapshot HC state at Purge time so we can compare with the
+     * post-submit dump and tell whether HC made any progress between
+     * submit and the unplug-driven Purge. */
+    if (dc && dc->MmioBase) {
+        PUCHAR mmio = (PUCHAR)dc->MmioBase;
+        ULONG hcControl   = READ_REGISTER_ULONG((PULONG)(mmio + 0x04));
+        ULONG hcCmdStat   = READ_REGISTER_ULONG((PULONG)(mmio + 0x08));
+        ULONG hcIntStat   = READ_REGISTER_ULONG((PULONG)(mmio + 0x0C));
+        ULONG hcFmNumber  = READ_REGISTER_ULONG((PULONG)(mmio + 0x3C));
+        ULONG hcCtlHead   = READ_REGISTER_ULONG((PULONG)(mmio + 0x20));
+        ULONG hcCtlCur    = READ_REGISTER_ULONG((PULONG)(mmio + 0x24));
+        struct ohci_ed *ed = ep->Core.Control.ed;
+        LOG("Purge HC: HcCtl=0x%08X CmdStat=0x%08X IntSt=0x%08X FmNum=0x%04X "
+            "CtlHead=0x%08X CtlCur=0x%08X",
+            hcControl, hcCmdStat, hcIntStat, hcFmNumber & 0xFFFF,
+            hcCtlHead, hcCtlCur);
+        LOG("Purge ED: Control=0x%08X TailP=0x%08X HeadP=0x%08X NextED=0x%08X",
+            ed->Control, ed->TailP, ed->HeadP, ed->NextED);
+        if (dc->Hc.hcca) {
+            LOG("Purge HCCA: FrameNumber=0x%04X DoneHead=0x%08X",
+                dc->Hc.hcca->FrameNumber, dc->Hc.hcca->DoneHead);
+        }
+    }
     if (ep->UrbQueue != NULL) {
         WdfIoQueuePurge(ep->UrbQueue, WDF_NO_EVENT_CALLBACK, WDF_NO_CONTEXT);
     }

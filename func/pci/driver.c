@@ -205,8 +205,8 @@ NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device,
      * HcInterruptEnable is W1S: writing 1 sets the bit, 0 leaves it alone.
      * The WDH|MIE bits already set by ohci_hc_init are preserved. */
     WRITE_REGISTER_ULONG((PULONG)((PUCHAR)dc->MmioBase + 0x10 /* HcInterruptEnable */),
-                         OHCI_INT_RHSC);
-    LOG("RHSC interrupt enabled");
+                         OHCI_INT_RHSC | OHCI_INT_UE | OHCI_INT_SO);
+    LOG("RHSC + UE + SO interrupts enabled (WDH/MIE were set by hc_init)");
 
     NTSTATUS bcStatus = OhciPci_BounceInit(dc);
     LOG("OhciPci_BounceInit -> 0x%08X", bcStatus);
