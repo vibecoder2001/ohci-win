@@ -27,8 +27,12 @@ $projectFull = (Resolve-Path $Project).Path
 # For EWDK scripts (SetupBuildEnv.cmd / LaunchBuildEnv.cmd) we pass no args;
 # msbuild's /p:Platform drives the output arch.
 # host_arch is the build machine's arch, not the target arch. Assume x64 host.
+# winsdk.bat does a case-sensitive compare against 'arm64'/'x64', so pass
+# lowercase to VsDevCmd; msbuild still wants the cased ProjectConfiguration
+# name (ARM64/x64) on /p:Platform, which we leave unchanged below.
+$archLower = $Arch.ToLower()
 $envInvoke = if ($envScript -like '*VsDevCmd.bat') {
-    "call `"$envScript`" -arch=$Arch -host_arch=x64 -no_logo"
+    "call `"$envScript`" -arch=$archLower -host_arch=x64 -no_logo"
 } else {
     "call `"$envScript`""
 }

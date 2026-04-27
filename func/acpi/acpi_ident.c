@@ -42,6 +42,6 @@ Ohci_FillUcxControllerIdent(
     UNREFERENCED_PARAMETER(dc);
     UCX_CONTROLLER_CONFIG_SET_ACPI_INFO(cfg,
                                          "RKCP",       /* VendorId  */
-                                         "OHCI3588",   /* DeviceId  */
+                                         "0001",       /* DeviceId  */
                                          "00");        /* RevisionId */
 }
