@@ -183,6 +183,30 @@ void ohci_drain_done(struct ohci_hc *hc) {
         if (u) {
             if (u->status == OHCI_URB_STATUS_PENDING) u->status = s;
             if (u->complete) u->complete(u);
+        } else if (du && !du->is_isoc && cc != OHCI_CC_NOERROR) {
+            /* OHCI §6.4.4: when a non-isoc TD reports a hard error, HC
+             * halts the ED at this TD and queues only THIS TD to DoneHead;
+             * subsequent TDs in the chain (e.g. STATUS in a SETUP/DATA/
+             * STATUS control transfer) never retire. Without this branch
+             * the URB sits in hc->in_flight forever — UCX never sees the
+             * STALL and enumeration freezes. Symptom: Logitech mouse
+             * STALLing DEVICE_QUALIFIER (0x06) hangs the bus.
+             *
+             * Complete the URB on the failing data TD and remove it from
+             * in_flight. Surviving TDs (the unretired tail and any later
+             * data TDs) leak their pool slots; the next ohci_control_submit
+             * reuses the placeholder slot via the K-toggle bracket and
+             * the orphans get reclaimed when the ED itself is destroyed. */
+            struct ohci_urb *prev = NULL;
+            for (struct ohci_urb *iter = hc->in_flight; iter; iter = iter->next_pending) {
+                if (iter == du) {
+                    if (prev) prev->next_pending = du->next_pending;
+                    else      hc->in_flight       = du->next_pending;
+                    break;
+                }
+                prev = iter;
+            }
+            if (du->complete) du->complete(du);
         }
 
         /* Pool dispatch keys on physical address range, not URB ownership,
