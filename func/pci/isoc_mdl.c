@@ -98,8 +98,9 @@ OhciPci_IsocBuildAndSubmit_Locked(
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Cache user VA for diagnostics / future packet inspection. NULL is
-     * fine — only used by the optional LOG, never dereferenced blindly. */
+    /* Cache the system VA once. The OUT bounce path below dereferences it
+     * via RtlCopyMemory; that path NULL-checks before deref. Other readers
+     * (diagnostic LOGs, future packet inspection) are also NULL-tolerant. */
     if (uc->MdlSysVa == NULL) {
         uc->MdlSysVa = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
     }
@@ -122,13 +123,40 @@ OhciPci_IsocBuildAndSubmit_Locked(
      * bounce slab base lives below 4 GB so bouncing also resolves >4 GB. */
     BOOLEAN fragmented = FALSE;
     for (ULONG p = 0; p < mdlPageCount; p++) {
-        if (pfns[p] >= 0x100000ull) {
-            fragmented = TRUE;   /* >4 GB — bounce regardless */
+        if (pfns[p] >= 0xFFFFFull) {
+            /* PFN 0xFFFFF puts the last byte at exactly 4 GB and any window
+             * arithmetic past it wraps uint32_t; treat it as out-of-range
+             * the same as anything strictly above 4 GB. */
+            fragmented = TRUE;
             break;
         }
         if (p > 0 && pfns[p] != pfns[p - 1] + 1) {
             fragmented = TRUE;
             break;
+        }
+    }
+
+    /* Pre-validate per-packet offsets and lengths before allocating a
+     * bounce slab. Bounces are scarce (64×4 KB pool); rejecting a malformed
+     * URB on cheap arithmetic avoids burning a slab we'd just free in
+     * BuildFail. */
+    for (ULONG i = 0; i < nPkts; i++) {
+        ULONG pktOff = turb->u.Isoch.IsoPacket[i].Offset;
+        ULONG pktEnd = (i + 1 < nPkts)
+                        ? turb->u.Isoch.IsoPacket[i+1].Offset
+                        : urbLen;
+        if (pktEnd < pktOff || pktEnd > urbLen) {
+            LOG("IsocBuildAndSubmit: pkt %lu off/end out of range "
+                "(off=%lu end=%lu urbLen=%lu)", i, pktOff, pktEnd, urbLen);
+            OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
+            return STATUS_INVALID_PARAMETER;
+        }
+        /* PSW size is 12 bits — single-slot cap. */
+        if ((pktEnd - pktOff) > 0xFFFu) {
+            LOG("IsocBuildAndSubmit: pkt %lu len=%lu exceeds 0xFFF",
+                i, pktEnd - pktOff);
+            OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
+            return STATUS_INVALID_PARAMETER;
         }
     }
 
@@ -170,24 +198,14 @@ OhciPci_IsocBuildAndSubmit_Locked(
     typedef struct { uint32_t phys; uint16_t len; } isoc_pkt_t;
     isoc_pkt_t pkt[OHCI_URB_MAX_ISOC_PACKETS];
 
+    /* Fill phys/len. Offset/length validation already happened in the
+     * pre-scan above, so this loop assumes well-formed inputs. */
     for (ULONG i = 0; i < nPkts; i++) {
         ULONG pktOff = turb->u.Isoch.IsoPacket[i].Offset;
         ULONG pktEnd = (i + 1 < nPkts)
                         ? turb->u.Isoch.IsoPacket[i+1].Offset
                         : urbLen;
-        if (pktEnd < pktOff || pktEnd > urbLen) {
-            LOG("IsocBuildAndSubmit: pkt %lu off/end out of range "
-                "(off=%lu end=%lu urbLen=%lu)", i, pktOff, pktEnd, urbLen);
-            OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-            return STATUS_INVALID_PARAMETER;
-        }
         ULONG pktLen = pktEnd - pktOff;
-        /* PSW size is 12 bits — single-slot cap. */
-        if (pktLen > 0xFFFu) {
-            LOG("IsocBuildAndSubmit: pkt %lu len=%lu exceeds 0xFFF", i, pktLen);
-            OhciPci_IsocBuildFail_Locked(uc, STATUS_INVALID_PARAMETER);
-            return STATUS_INVALID_PARAMETER;
-        }
 
         if (fragmented) {
             /* Bounce path: per-packet phys is just bounce_phys + pkt_off.
@@ -250,8 +268,9 @@ OhciPci_IsocBuildAndSubmit_Locked(
             if (nxtPhys != expectNext) break;
             uint32_t nxtLen = pkt[i + windowCount].len;
             if (nxtLen == 0) {
-                winLen     += 0;
-                expectNext  = nxtPhys;
+                /* Zero-length packet: consumes a window slot but contributes
+                 * no bytes; expectNext also stays put for contiguity. */
+                expectNext = nxtPhys;
                 windowCount++;
                 continue;
             }
@@ -284,8 +303,13 @@ OhciPci_IsocBuildAndSubmit_Locked(
             OhciPci_IsocBuildFail_Locked(uc, STATUS_INSUFFICIENT_RESOURCES);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
+        /* Partial submit: trim isoc_pkt_count down to what actually got
+         * linked into the ED. Otherwise the drain code waits forever for
+         * ITDs that were never emitted -> URB never retires, never unlinks
+         * from IsocInFlightUrbs, bounce slab leaks, audio stream stalls. */
         LOG("IsocBuildAndSubmit: partial submit (%lu of %lu packets queued)",
             i, nPkts);
+        uc->CoreUrb.isoc_pkt_count = (uint8_t)i;
     }
 
     /* Track in-flight so retire/cancel/teardown can find this URB.
@@ -331,15 +355,6 @@ OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
     }
 }
 
-VOID
-OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
-{
-    /* No-op: per-URB retire is handled by OhciPci_IsocOnUrbRetire_Locked,
-     * called from OhciPci_UrbComplete's isoch branch. This entry point is
-     * preserved for symmetry with the header. */
-    UNREFERENCED_PARAMETER(ep);
-}
-
 /* --------------------------------------------------------------------------
  * Cancel callback — intentionally a no-op.
  *
@@ -348,7 +363,7 @@ OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
  * cancellation isn't required for the usbaudio stop/restart cycle:
  * usbaudio.sys "stops" by issuing SET_INTERFACE(alt=0), which triggers
  * UcxEndpointPurge -> WDF queue purge (for URBs not yet handed to
- * BuildAndSubmit) plus OhciPci_IsocEpTeardown_Locked (for URBs with
+ * BuildAndSubmit) plus OhciPci_IsocEpTeardown (for URBs with
  * ITDs already linked into the ED). Those two paths cover stop/restart.
  *
  * If interruptible per-URB cancel is needed later, fill in here: pause
@@ -380,15 +395,22 @@ OhciPci_IsocCancelEmitted(_In_ WDFREQUEST Request)
  * lock, then complete outside the lock — same shape as the IsocQueuedUrbs
  * drain in OhciPci_EpContextCleanup.
  *
- * Naming note: this function is named *_Locked for symmetry with the rest
- * of the API but actually acquires CoreLock itself, since it runs at
- * PASSIVE from cleanup. Callers must NOT hold CoreLock.
+ * Callers must NOT hold CoreLock — this function acquires it itself.
  * -------------------------------------------------------------------------- */
 VOID
-OhciPci_IsocEpTeardown_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
+OhciPci_IsocEpTeardown(_In_ POHCIPCI_EP_CONTEXT ep)
 {
     PDEVICE_CONTEXT dc = ep->Dc;
     if (dc == NULL || dc->CoreLock == NULL) return;
+
+    /* Skip teardown if IsocInFlightUrbs was never initialised — happens
+     * when EP create set Kind=Isoc but ohci_isoc_endpoint_create (or any
+     * later step) failed before the InitializeListHead block ran. UCX
+     * then rolls back via WdfObjectDelete and EpContextCleanup fires on
+     * an EP whose isoch lists are still RtlZeroMemory's NULL/NULL state.
+     * IsListEmpty/RemoveHeadList on that bugchecks. EndpointAdd now
+     * pre-initialises the lists, but keep this guard as a backstop. */
+    if (ep->IsocInFlightUrbs.Flink == NULL) return;
 
     LIST_ENTRY local;
     InitializeListHead(&local);

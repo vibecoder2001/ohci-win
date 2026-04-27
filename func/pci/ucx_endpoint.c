@@ -1807,6 +1807,15 @@ OhciPci_EndpointAdd(
             bInterval, ep->Core.Interrupt.poll_interval_frames, rc);
     } else { /* attrs == 0x01 - Isochronous */
         ep->Kind = OhciPciEpKindIsoc;
+        /* Initialise the per-EP isoch lists BEFORE the create call.
+         * Setting Kind=Isoc means EpContextCleanup may run IsocEpTeardown
+         * if anything below this point fails (UCX rolls back via
+         * WdfObjectDelete on a non-success NTSTATUS return). Teardown
+         * walks IsocInFlightUrbs / IsocQueuedUrbs — those must be valid
+         * empty lists, not RtlZeroMemory's NULL/NULL state, or
+         * RemoveHeadList bugchecks dereferencing NULL Flink/Blink. */
+        InitializeListHead(&ep->IsocQueuedUrbs);
+        InitializeListHead(&ep->IsocInFlightUrbs);
         struct ohci_isoc_endpoint_config cfg;
         cfg.func_addr       = funcAddr;
         cfg.ep_num          = epNum;
@@ -1827,8 +1836,6 @@ OhciPci_EndpointAdd(
              * non-fatal (caller URBs still work, just no underrun
              * silence). IsocQueueLock is mandatory — HandleIsocUrb
              * relies on it. */
-            InitializeListHead(&ep->IsocQueuedUrbs);
-            InitializeListHead(&ep->IsocInFlightUrbs);
             /* IsocEpEntry.Flink stays NULL (RtlZeroMemory above) until
              * we splice onto dc->IsocEps below; the cleanup callback uses
              * "Flink == NULL" as the "not on any list" sentinel. */
