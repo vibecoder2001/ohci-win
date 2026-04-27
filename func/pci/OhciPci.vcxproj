@@ -55,7 +55,7 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <WarningLevel>Level4</WarningLevel>
       <DisableSpecificWarnings>4201</DisableSpecificWarnings>
-      <AdditionalIncludeDirectories>$(IntDir);..\..\core\include;$(DDK_INC_PATH)ucx\1.6;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(IntDir);..\shared;..\..\core\include;$(DDK_INC_PATH)ucx\1.6;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <AdditionalDependencies>$(DDK_LIB_PATH)ucx\1.6\ucxstub.lib;%(AdditionalDependencies)</AdditionalDependencies>
@@ -66,15 +66,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="driver.c" />
-    <ClCompile Include="mmio.c" />
-    <ClCompile Include="dma.c" />
-    <ClCompile Include="isoc_mdl.c" />
-    <ClCompile Include="interrupt.c" />
-    <ClCompile Include="ucx_glue.c" />
-    <ClCompile Include="bounce.c" />
-    <ClCompile Include="ucx_roothub.c" />
-    <ClCompile Include="ucx_usbdevice.c" />
-    <ClCompile Include="ucx_endpoint.c" />
+    <ClCompile Include="..\shared\mmio.c" />
+    <ClCompile Include="..\shared\dma.c" />
+    <ClCompile Include="..\shared\isoc_mdl.c" />
+    <ClCompile Include="..\shared\interrupt.c" />
+    <ClCompile Include="..\shared\ucx_glue.c" />
+    <ClCompile Include="..\shared\bounce.c" />
+    <ClCompile Include="..\shared\ucx_roothub.c" />
+    <ClCompile Include="..\shared\ucx_usbdevice.c" />
+    <ClCompile Include="..\shared\ucx_endpoint.c" />
     <ClCompile Include="..\..\core\src\ohci_core.c" />
     <ClCompile Include="..\..\core\src\ohci_dma.c" />
     <ClCompile Include="..\..\core\src\ohci_hc.c" />
@@ -86,7 +86,8 @@
     <ClCompile Include="..\..\core\src\ohci_isoc.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="device_context.h" />
+    <ClInclude Include="..\shared\device_context.h" />
+    <ClInclude Include="..\shared\isoc_mdl.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="OhciPci.inx" />

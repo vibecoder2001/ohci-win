@@ -23,6 +23,9 @@ Low and Full speed devices; no iso, no remote wakeup.
 ## Layout
 
 - `core/` — `OhciCore.lib`, buildable as both kernel static lib and usermode
+- `func/shared/` — bus-agnostic OHCI/UCX glue (DMA, MMIO, ISR/DPC, UCX
+  controller/root-hub/usb-device/endpoint callbacks, isoc) shared by
+  every bus-specific function driver below
 - `func/acpi/` — ACPI function driver (ARM64 / RK3588)
 - `func/pci/` — PCI function driver (x86 QEMU)
 - `inf/` — driver INFs and catalog

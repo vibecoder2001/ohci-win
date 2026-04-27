@@ -20,8 +20,9 @@ version: `bcdedit /set testsigning on`, install the test cert, then
 
 ## Architecture
 
-This driver is a thin kernel adapter. The transfer logic lives in
-`core/`. The driver:
+This driver is a thin kernel adapter. The bus-agnostic OHCI/UCX glue
+lives in `func/shared/` (compiled directly into this vcxproj via
+`..\shared\*.c`); the transfer logic lives in `core/`. The driver:
 
 1. Parses PCI BAR + interrupt resources into a `DEVICE_CONTEXT`
 2. Allocates a DMA-coherent buffer via `WDFCOMMONBUFFER`
