@@ -180,13 +180,13 @@ typedef struct _OHCIPCI_EP_CONTEXT {
     WDFSPINLOCK                    IsocQueueLock;
     LIST_ENTRY                     IsocEpEntry;     /* on dc->IsocEps */
 
-    /* Spike (MDL-walk) — URBs with ITDs linked into the ED but not yet retired.
-     * Drained by OhciPci_IsocRetireEmitted_Locked / cancel / teardown. */
+    /* MDL-walk path — URBs with ITDs linked into the ED but not yet retired.
+     * Drained by OhciPci_IsocOnUrbRetire_Locked / EP teardown. */
     LIST_ENTRY                     IsocInFlightUrbs;
 
-    /* Spike T8 — KeQueryPerformanceCounter timestamp of the previous
-     * isoc[N] retire trace, used to log per-URB cadence delta in µs.
-     * Zero on the first retire => suppresses the first delta print. */
+    /* KeQueryPerformanceCounter timestamp of the previous isoc[N] retire
+     * trace, used to log per-URB cadence delta in µs. Zero on the first
+     * retire => suppresses the first delta print. */
     LARGE_INTEGER                  IsocLastTraceQpc;
 } OHCIPCI_EP_CONTEXT, *POHCIPCI_EP_CONTEXT;
 
@@ -228,15 +228,15 @@ typedef struct _OHCIPCI_URB_CTX {
      * room (lead < OHCIPCI_ISOC_REFILL_HIGH frames ahead of HcFmNumber). */
     LIST_ENTRY                   QueueEntry;
 
-    /* Spike (MDL-walk) bookkeeping. */
+    /* Isoch MDL-walk bookkeeping. */
     LIST_ENTRY  InFlightEntry;   /* on EP->IsocInFlightUrbs while ITDs linked */
     PVOID       MdlSysVa;        /* cached MmGetSystemAddressForMdlSafe result */
 
-    /* Spike (page-straddle bounce). When the URB's MDL spans non-contiguous
-     * PFNs, BuildAndSubmit allocates one OHCIPCI_BOUNCE_SLAB and copies the
-     * URB through it (OUT) so per-packet phys addresses come from a single
-     * contiguous physical run. Freed on retire / cancel / teardown.
-     * NULL when the URB's PFNs were already contiguous. */
+    /* Page-straddle bounce. When the URB's MDL spans non-contiguous PFNs,
+     * OhciPci_IsocBuildAndSubmit_Locked allocates one OHCIPCI_BOUNCE_SLAB
+     * and copies the URB through it (OUT) so per-packet phys addresses
+     * come from a single contiguous physical run. Freed on retire and on
+     * EP teardown. NULL when the URB's PFNs were already contiguous. */
     PVOID       IsocBounceVa;
     uint32_t    IsocBouncePhys;
 } OHCIPCI_URB_CTX, *POHCIPCI_URB_CTX;

@@ -44,3 +44,9 @@ compile_commands.json
 
 # Transient VM / debug logs
 *.log
+
+# Per-machine Claude Code settings
+.claude/
+
+# WDK test-signing scratch dir
+Testing/

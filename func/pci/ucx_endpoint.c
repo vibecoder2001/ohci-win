@@ -224,9 +224,9 @@ OhciPci_UrbComplete(struct ohci_urb *u)
             {
                 static ULONG s_isocCompletes = 0;
                 ULONG n = ++s_isocCompletes;
-                /* Spike T8: per-URB cadence delta in µs from QPC. First
-                 * retire on a fresh EP has LastTraceQpc==0 -> suppress
-                 * the meaningless huge delta on the first sample. */
+                /* Per-URB cadence delta in µs from QPC. First retire on
+                 * a fresh EP has LastTraceQpc==0 -> suppress the
+                 * meaningless huge delta on the first sample. */
                 LARGE_INTEGER freq;
                 LARGE_INTEGER nowQpc = KeQueryPerformanceCounter(&freq);
                 ULONGLONG deltaUs = 0;
@@ -756,9 +756,9 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
         }
     }
 
-    /* Spike: drain any URBs the MDL-walk path linked into the ED but didn't
-     * see retire (defensive — OHCI core's destroy normally drains them via
-     * the per-URB complete callback). */
+    /* Drain any URBs the MDL-walk path linked into the ED but didn't
+     * see retire (defensive — OHCI core's destroy normally drains them
+     * via the per-URB complete callback). */
     OhciPci_IsocEpTeardown_Locked(ep);
 }
 
@@ -805,9 +805,9 @@ OhciPci_IsocRefillOne_Locked(POHCIPCI_EP_CONTEXT ep)
             break;
         }
 
-        /* Spike (T7): walk the MDL and emit ITDs directly. CoreLock stays
-         * held across the call. On failure BuildAndSubmit stages the URB
-         * on dc->DeferredCompletions itself. */
+        /* Walk the MDL and emit ITDs directly. CoreLock stays held across
+         * the call. On failure BuildAndSubmit stages the URB on
+         * dc->DeferredCompletions itself. */
         NTSTATUS s = OhciPci_IsocBuildAndSubmit_Locked(ep, uc);
         (void)s;   /* failure already routed onto DeferredCompletions */
 
@@ -952,13 +952,12 @@ OhciPci_HandleIsocUrb(
     uc->UserMdl       = bufMdl;       /* may be ourMdl if caller had no MDL */
     uc->UserVa        = bufVa;
 
-    /* Spike: no WdfDmaTransaction. The MDL-walk path
+    /* Isoch uses no WdfDmaTransaction. The MDL-walk path
      * (OhciPci_IsocBuildAndSubmit_Locked) emits ITDs against the user MDL
-     * directly. uc->DmaTransaction stays NULL (RtlZeroMemory cleared it),
-     * so OhciPci_UrbComplete's `if (uc->DmaTransaction)` block — which
-     * would otherwise call WdfDmaTransactionDmaCompletedFinal on a
-     * Created-state txn and bug-check WDF_VIOLATION 0x10D sub 8 — is
-     * skipped cleanly.
+     * directly. uc->DmaTransaction stays NULL on the isoch path; the
+     * (now-removed) `if (uc->DmaTransaction)` branch in OhciPci_UrbComplete
+     * therefore never fired for isoch and would have bug-checked
+     * WDF_VIOLATION 0x10D sub 8 if it had.
      *
      * Queue the URB onto the EP's pending list. The refill walker drives
      * OhciPci_IsocBuildAndSubmit_Locked when the ED chain has headroom
@@ -1679,13 +1678,11 @@ OhciPci_EndpointAdd(
      * Sequential dispatch for Control/Bulk/Interrupt — the existing WDF
      * DMA transaction lifecycle assumes one Execute outstanding per EP.
      *
-     * Spike (T7): Parallel for Isoch. The previous Sequential setting
-     * forced a 1:1 submit/complete cadence that ran ~50% real-time.
-     * Parallel was previously unsafe because the isoch DMA enabler used
-     * WdfDmaProfilePacket (single channel) and a 2nd concurrent
-     * WdfDmaTransactionExecute would bug-check WDF_VIOLATION 0x10D sub 8.
-     * The MDL-walk path (OhciPci_IsocBuildAndSubmit_Locked) bypasses
-     * WdfDmaTransaction entirely, so depth-N is safe again. */
+     * Parallel for Isoch — the MDL-walk path
+     * (OhciPci_IsocBuildAndSubmit_Locked) emits ITDs without going through
+     * WdfDmaTransaction, so depth >= 2 doesn't trip the single-channel
+     * constraint of WdfDmaProfilePacket that previously forced Sequential
+     * dispatch. Pipelined submission keeps the ~10 ms isoch cadence. */
     WDF_IO_QUEUE_CONFIG qCfg;
     WDF_IO_QUEUE_CONFIG_INIT(&qCfg,
         (attrs == 0x01) ? WdfIoQueueDispatchParallel

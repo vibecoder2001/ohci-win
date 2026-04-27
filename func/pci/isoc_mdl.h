@@ -1,7 +1,8 @@
 /*  isoc_mdl.h — MDL-walk ITD builder for OHCI isochronous OUT.
  *
- *  Spike replacement for the WdfDmaTransaction-based isoc DMA path.
- *  All functions named *_Locked require dc->CoreLock held by the caller.
+ *  All functions named *_Locked require dc->CoreLock held by the caller
+ *  (except OhciPci_IsocEpTeardown_Locked, which acquires CoreLock itself
+ *  because it runs at PASSIVE from EP cleanup).
  */
 #pragma once
 

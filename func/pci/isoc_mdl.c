@@ -6,12 +6,14 @@ Module Name:
 
 Abstract:
 
-    Spike (MDL-walk) replacement for the WdfDmaTransaction-based isochronous
-    OUT path. Task 3 of the OHCI isoch MDL-walk spike — implements only
-    OhciPci_IsocBuildAndSubmit_Locked; the other three functions in
-    isoc_mdl.h get bodies in T4 (retire), T5 (cancel), and T6 (teardown).
+    MDL-walk submitter for the OHCI isochronous OUT path. Walks each URB's
+    MDL via MmGetMdlPfnArray, packs per-packet phys addresses into ITD
+    windows, and links them into the EP's ED — bypassing the WDF DMA
+    framework so that depth >= 2 URB pipelining doesn't trip the single-
+    channel constraint of WdfDmaProfilePacket.
 
-    NOT YET WIRED INTO ANY CALLER. Build only.
+    When the URB's pages aren't physically contiguous, a per-URB bounce
+    slab from OhciPci_BounceAlloc holds the contiguous copy.
 
 Environment:
 
@@ -145,8 +147,8 @@ OhciPci_IsocBuildAndSubmit_Locked(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         /* OUT: copy URB bytes into bounce now. IN: leave bounce uninitialised;
-         * UrbComplete copies bounce -> MDL on retire. (Spike is OUT-only —
-         * IN copy-back left as a stub, see retire path.) */
+         * UrbComplete copies bounce -> MDL on retire. Only OUT is wired
+         * today (audio sink) — the IN copy-back path is a TODO. */
         if (uc->DataDirection == OHCI_URB_DIR_OUT) {
             if (uc->MdlSysVa == NULL) {
                 uc->MdlSysVa = MmGetSystemAddressForMdlSafe(mdl,
@@ -286,8 +288,9 @@ OhciPci_IsocBuildAndSubmit_Locked(
             i, nPkts);
     }
 
-    /* Track in-flight so retire/cancel/teardown can find this URB. T5
-     * (cancel) wires WdfRequestMarkCancelable; T3 leaves it off. */
+    /* Track in-flight so retire/cancel/teardown can find this URB.
+     * WdfRequestMarkCancelable intentionally not called — see the
+     * cancel-callback comment below for why. */
     InsertTailList(&ep->IsocInFlightUrbs, &uc->InFlightEntry);
 
     return STATUS_SUCCESS;
@@ -299,9 +302,9 @@ OhciPci_IsocBuildAndSubmit_Locked(
  * Called from OhciPci_UrbComplete's isoch branch once per retiring URB.
  * Caller already holds CoreLock (UrbComplete fires from the retire DPC).
  *
- * Safe to call on URBs that never went through BuildAndSubmit — e.g. legacy
- * path URBs allocated before T7 wires the spike. The Flink==NULL guard
- * skips unlinking a list entry that was zero-initialised but never inserted.
+ * Safe to call on URBs that never went through BuildAndSubmit — e.g. URBs
+ * whose InFlightEntry is still zero-initialised. The Flink==NULL guard
+ * skips unlinking a list entry that was never inserted.
  * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
@@ -313,7 +316,7 @@ OhciPci_IsocOnUrbRetire_Locked(_In_ OHCIPCI_URB_CTX *uc)
     }
 
     /* Free the page-straddle bounce slab if BuildAndSubmit allocated one.
-     * IN copy-back is left as a TODO — spike is OUT-only (audio sink).
+     * IN copy-back is a TODO — only OUT (audio sink) is implemented today.
      * Setting Va=NULL after free is required because UrbComplete and the
      * teardown helper both consult IsocBounceVa as the "owns a bounce"
      * sentinel, and the URB context can outlive the slab in the bounce
@@ -338,18 +341,18 @@ OhciPci_IsocRetireEmitted_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
 }
 
 /* --------------------------------------------------------------------------
- * Cancel callback — intentionally a no-op for the spike.
+ * Cancel callback — intentionally a no-op.
  *
  * OhciPci_IsocBuildAndSubmit_Locked deliberately does NOT call
  * WdfRequestMarkCancelable, so WDF never invokes this callback. Per-URB
- * cancellation isn't required by the spike GO criterion (start->stop->start
- * of a usbaudio stream): usbaudio.sys "stops" by issuing SET_INTERFACE(alt=0),
- * which triggers UcxEndpointPurge -> WDF queue purge (for URBs not yet
- * handed to BuildAndSubmit) plus OhciPci_IsocEpTeardown_Locked (T6, for URBs
- * with ITDs already linked into the ED). Those two paths cover stop/restart.
+ * cancellation isn't required for the usbaudio stop/restart cycle:
+ * usbaudio.sys "stops" by issuing SET_INTERFACE(alt=0), which triggers
+ * UcxEndpointPurge -> WDF queue purge (for URBs not yet handed to
+ * BuildAndSubmit) plus OhciPci_IsocEpTeardown_Locked (for URBs with
+ * ITDs already linked into the ED). Those two paths cover stop/restart.
  *
- * If a future plan needs interruptible per-URB cancel, fill in here:
- * pause via OhciPci_EditHeadPSafely, wait one SOF, unlink the URB's ITDs,
+ * If interruptible per-URB cancel is needed later, fill in here: pause
+ * via OhciPci_EditHeadPSafely, wait one SOF, unlink the URB's ITDs,
  * complete USBD_STATUS_CANCELED, then clear Skip if more work remains.
  * -------------------------------------------------------------------------- */
 VOID
@@ -359,12 +362,12 @@ OhciPci_IsocCancelEmitted(_In_ WDFREQUEST Request)
 }
 
 /* --------------------------------------------------------------------------
- * EP teardown — drains URBs the spike is tracking. Runs at PASSIVE from
- * OhciPci_EpContextCleanup, AFTER the EP has been unlinked from
- * dc->IsocEps so the refill walker no longer touches us. The refill DPC
- * is therefore not racing the IsocQueuedUrbs drain (caller already covers
- * that); we only need to additionally drain IsocInFlightUrbs (URBs whose
- * ITDs were linked into the ED via BuildAndSubmit).
+ * EP teardown — drains URBs whose ITDs were linked into the ED via
+ * BuildAndSubmit. Runs at PASSIVE from OhciPci_EpContextCleanup, AFTER
+ * the EP has been unlinked from dc->IsocEps so the refill walker no
+ * longer touches us. The refill DPC is therefore not racing the
+ * IsocQueuedUrbs drain (the caller already handles that); we only need
+ * to additionally drain IsocInFlightUrbs.
  *
  * By the time this fires, the OHCI core's destroy_endpoint should already
  * have walked the ED and fired each URB's `complete` callback, draining
@@ -378,8 +381,8 @@ OhciPci_IsocCancelEmitted(_In_ WDFREQUEST Request)
  * drain in OhciPci_EpContextCleanup.
  *
  * Naming note: this function is named *_Locked for symmetry with the rest
- * of the spike's API but actually acquires CoreLock itself, since it runs
- * at PASSIVE from cleanup. Callers must NOT hold CoreLock.
+ * of the API but actually acquires CoreLock itself, since it runs at
+ * PASSIVE from cleanup. Callers must NOT hold CoreLock.
  * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocEpTeardown_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
