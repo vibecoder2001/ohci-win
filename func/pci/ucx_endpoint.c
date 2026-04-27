@@ -1071,6 +1071,11 @@ OhciPci_EpContextCleanup(WDFOBJECT Object)
             WdfRequestComplete(uc->Request, STATUS_CANCELLED);
         }
     }
+
+    /* Spike: drain any URBs the MDL-walk path linked into the ED but didn't
+     * see retire (defensive — OHCI core's destroy normally drains them via
+     * the per-URB complete callback). */
+    OhciPci_IsocEpTeardown_Locked(ep);
 }
 
 /* --------------------------------------------------------------------------

@@ -333,9 +333,54 @@ OhciPci_IsocCancelEmitted(_In_ WDFREQUEST Request)
     UNREFERENCED_PARAMETER(Request);
 }
 
-/* T6 fills in OhciPci_IsocEpTeardown_Locked. */
+/* --------------------------------------------------------------------------
+ * EP teardown — drains URBs the spike is tracking. Runs at PASSIVE from
+ * OhciPci_EpContextCleanup, AFTER the EP has been unlinked from
+ * dc->IsocEps so the refill walker no longer touches us. The refill DPC
+ * is therefore not racing the IsocQueuedUrbs drain (caller already covers
+ * that); we only need to additionally drain IsocInFlightUrbs (URBs whose
+ * ITDs were linked into the ED via BuildAndSubmit).
+ *
+ * By the time this fires, the OHCI core's destroy_endpoint should already
+ * have walked the ED and fired each URB's `complete` callback, draining
+ * IsocInFlightUrbs through OhciPci_IsocOnUrbRetire_Locked. The list-empty
+ * fast-path is the expected case; the explicit drain here is a safety net
+ * for partial/aborted teardowns.
+ *
+ * CoreLock is taken briefly because UrbComplete (and BuildAndSubmit) hold
+ * it when mutating IsocInFlightUrbs. Splice into a local list under the
+ * lock, then complete outside the lock — same shape as the IsocQueuedUrbs
+ * drain in OhciPci_EpContextCleanup.
+ *
+ * Naming note: this function is named *_Locked for symmetry with the rest
+ * of the spike's API but actually acquires CoreLock itself, since it runs
+ * at PASSIVE from cleanup. Callers must NOT hold CoreLock.
+ * -------------------------------------------------------------------------- */
 VOID
 OhciPci_IsocEpTeardown_Locked(_In_ POHCIPCI_EP_CONTEXT ep)
 {
-    UNREFERENCED_PARAMETER(ep);
+    PDEVICE_CONTEXT dc = ep->Dc;
+    if (dc == NULL || dc->CoreLock == NULL) return;
+
+    LIST_ENTRY local;
+    InitializeListHead(&local);
+
+    WdfSpinLockAcquire(dc->CoreLock);
+    while (!IsListEmpty(&ep->IsocInFlightUrbs)) {
+        PLIST_ENTRY le = RemoveHeadList(&ep->IsocInFlightUrbs);
+        OHCIPCI_URB_CTX *uc =
+            CONTAINING_RECORD(le, OHCIPCI_URB_CTX, InFlightEntry);
+        uc->InFlightEntry.Flink = NULL;
+        uc->InFlightEntry.Blink = NULL;
+        InsertTailList(&local, le);
+    }
+    WdfSpinLockRelease(dc->CoreLock);
+
+    while (!IsListEmpty(&local)) {
+        PLIST_ENTRY le = RemoveHeadList(&local);
+        OHCIPCI_URB_CTX *uc =
+            CONTAINING_RECORD(le, OHCIPCI_URB_CTX, InFlightEntry);
+        if (uc->OurMdl) { IoFreeMdl(uc->OurMdl); uc->OurMdl = NULL; }
+        WdfRequestComplete(uc->Request, STATUS_CANCELLED);
+    }
 }
