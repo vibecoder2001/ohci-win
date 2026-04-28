@@ -1,0 +1,122 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  tier1-tests:
+    name: Tier-1 host tests (CMake)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -S .
+
+      - name: Build
+        run: cmake --build build --config Debug
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Debug --output-on-failure
+
+  driver:
+    name: Driver ${{ matrix.project }} ${{ matrix.platform }} ${{ matrix.config }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: func/acpi/OhciAcpi.vcxproj
+            platform: ARM64
+            config: Release
+            artifact: OhciAcpi-ARM64-Release
+          - project: func/acpi/OhciAcpi.vcxproj
+            platform: ARM64
+            config: Debug
+            artifact: OhciAcpi-ARM64-Debug
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Windows SDK 10.0.26100
+        shell: pwsh
+        run: |
+          $url  = 'https://go.microsoft.com/fwlink/?linkid=2272610'
+          $exe  = "$env:RUNNER_TEMP\sdksetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $features = @(
+            'OptionId.WindowsSoftwareDevelopmentKit',
+            'OptionId.WindowsDesktopDebuggers',
+            'OptionId.AvrfExternal',
+            'OptionId.NetFxSoftwareDevelopmentKit',
+            'OptionId.SigningTools',
+            'OptionId.UWPManaged',
+            'OptionId.UWPCPP',
+            'OptionId.UWPLocalized'
+          ) -join ' '
+          $p = Start-Process -FilePath $exe -ArgumentList "/features $features /q /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "SDK install failed: exit $($p.ExitCode)"
+          }
+
+      - name: Install Windows Driver Kit 10.0.26100
+        shell: pwsh
+        run: |
+          $url = 'https://go.microsoft.com/fwlink/?linkid=2272234'
+          $exe = "$env:RUNNER_TEMP\wdksetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $p = Start-Process -FilePath $exe -ArgumentList '/features + /q /norestart' -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "WDK install failed: exit $($p.ExitCode)"
+          }
+
+      - name: Install WDK Visual Studio extension
+        shell: pwsh
+        run: |
+          $vsix = Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022' `
+                                -Filter 'Windows Driver Kit*.vsix' -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if (-not $vsix) {
+            throw 'WDK VSIX not found under C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022'
+          }
+          $vsixInst = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' `
+                                    -Filter VSIXInstaller.exe -Recurse -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          if (-not $vsixInst) { throw 'VSIXInstaller.exe not found' }
+          $p = Start-Process -FilePath $vsixInst.FullName `
+                             -ArgumentList "/quiet /admin `"$($vsix.FullName)`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 1001) {
+            throw "VSIX install failed: exit $($p.ExitCode)"
+          }
+
+      - name: Build ${{ matrix.project }}
+        shell: pwsh
+        run: |
+          msbuild ${{ matrix.project }} `
+            /p:Configuration=${{ matrix.config }} `
+            /p:Platform=${{ matrix.platform }} `
+            /nologo /m
+
+      - name: Stage build outputs
+        shell: pwsh
+        run: |
+          $proj = Split-Path -Parent '${{ matrix.project }}'
+          $out  = Join-Path $proj '${{ matrix.platform }}\${{ matrix.config }}'
+          if (-not (Test-Path $out)) { throw "build output dir not found: $out" }
+          $stage = "$env:RUNNER_TEMP\stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Recurse -Force "$out\*" $stage
+          Get-ChildItem $stage -Recurse | Select-Object FullName, Length | Format-Table -Auto
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/stage
+          if-no-files-found: error
