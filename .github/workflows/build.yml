@@ -60,19 +60,29 @@ jobs:
             throw "WDK install failed: exit $($p.ExitCode)"
           }
 
-      - name: Install WDK Visual Studio extension
+      - name: Install WDK Visual Studio extension (if shipped separately)
         shell: pwsh
         run: |
-          $vsix = Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022' `
-                                -Filter 'Windows Driver Kit*.vsix' -Recurse -ErrorAction SilentlyContinue |
+          # Recent WDK 10.0.26100 setups register the VS2022 toolset directly
+          # — the VSIX is only present on older layouts. Search the kit tree
+          # broadly and skip the install step when nothing matches, instead of
+          # failing on a missing file.
+          $vsix = Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10' `
+                                -Filter '*.vsix' -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -match 'Driver' } |
                   Select-Object -First 1
           if (-not $vsix) {
-            throw 'WDK VSIX not found under C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022'
+            Write-Host 'No WDK VSIX found — assuming wdksetup already registered the toolset.'
+            return
           }
+          Write-Host "Found WDK VSIX: $($vsix.FullName)"
           $vsixInst = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\2022' `
                                     -Filter VSIXInstaller.exe -Recurse -ErrorAction SilentlyContinue |
                       Select-Object -First 1
-          if (-not $vsixInst) { throw 'VSIXInstaller.exe not found' }
+          if (-not $vsixInst) {
+            Write-Host 'VSIXInstaller.exe not found — skipping VSIX install.'
+            return
+          }
           $p = Start-Process -FilePath $vsixInst.FullName `
                              -ArgumentList "/quiet /admin `"$($vsix.FullName)`"" -Wait -PassThru
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 1001) {
