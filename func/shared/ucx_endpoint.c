@@ -522,6 +522,10 @@ OhciPci_HandleBulkUrb(
      * memsets the struct, so submitting after destroy NULL-derefs
      * tail_placeholder. */
     if (ep->Core.Bulk.ed == NULL || ep->Core.Bulk.tail_placeholder == NULL) {
+        LOG("HandleBulkUrb: EP destroyed (devAddr=%u ed=%p tail=%p) — failing URB",
+            ep->Udc ? ep->Udc->FuncAddr : 0,
+            ep->Core.Bulk.ed,
+            ep->Core.Bulk.tail_placeholder);
         urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
         return;
@@ -640,6 +644,10 @@ OhciPci_HandleInterruptUrb(
 
     /* Reject submissions to a destroyed core EP. */
     if (ep->Core.Interrupt.ed == NULL || ep->Core.Interrupt.tail_placeholder == NULL) {
+        LOG("HandleInterruptUrb: EP destroyed (devAddr=%u ed=%p tail=%p) — failing URB",
+            ep->Udc ? ep->Udc->FuncAddr : 0,
+            ep->Core.Interrupt.ed,
+            ep->Core.Interrupt.tail_placeholder);
         urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
         return;
@@ -1210,6 +1218,10 @@ EvtUrbDefault(
      * stale URBs in the per-EP queue with no valid hardware state to
      * submit against. Without this guard, we'd NULL-deref tail_placeholder. */
     if (ep->Core.Control.ed == NULL) {
+        LOG("EvtUrbDefault: EP destroyed (kind=%d devAddr=%u fn=0x%X) — failing URB",
+            ep->Kind,
+            ep->Udc ? ep->Udc->FuncAddr : 0,
+            urb->Hdr.Function);
         urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
         WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
         return;

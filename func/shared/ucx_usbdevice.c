@@ -698,18 +698,27 @@ EvtUsbDeviceEndpointsConfigure(
             if (ep->Core.Bulk.ed != NULL) {
                 ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
                 ep->Core.Bulk.ed = NULL;
+            } else {
+                LOG("EndpointsConfigure: Bulk EP already destroyed (devAddr=%u) — skipping",
+                    ep->Udc ? ep->Udc->FuncAddr : 0);
             }
             break;
         case OhciPciEpKindInterrupt:
             if (ep->Core.Interrupt.ed != NULL) {
                 ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
                 ep->Core.Interrupt.ed = NULL;
+            } else {
+                LOG("EndpointsConfigure: Interrupt EP already destroyed (devAddr=%u) — skipping",
+                    ep->Udc ? ep->Udc->FuncAddr : 0);
             }
             break;
         case OhciPciEpKindControl:
             if (ep->Core.Control.ed != NULL) {
                 ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
                 ep->Core.Control.ed = NULL;
+            } else {
+                LOG("EndpointsConfigure: Control EP already destroyed (devAddr=%u) — skipping",
+                    ep->Udc ? ep->Udc->FuncAddr : 0);
             }
             break;
         }
