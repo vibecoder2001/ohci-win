@@ -687,18 +687,30 @@ EvtUsbDeviceEndpointsConfigure(
         PDEVICE_CONTEXT dc = ep->Dc;
         if (dc == NULL) continue;
         WdfSpinLockAcquire(dc->CoreLock);
+        /* Guard against double-destroy. UCX may dispatch
+         * EndpointsConfigure with overlapping disable sets, or the EP
+         * may already have been destroyed by EpContextCleanup if the
+         * UCXENDPOINT lifetime ended first. ohci_*_endpoint_destroy
+         * dereferences ep->ed unconditionally on its first line, so a
+         * second invocation NULL-faults. */
         switch (ep->Kind) {
         case OhciPciEpKindBulk:
-            ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
-            ep->Core.Bulk.ed = NULL;
+            if (ep->Core.Bulk.ed != NULL) {
+                ohci_bulk_endpoint_destroy(&dc->Hc, &ep->Core.Bulk);
+                ep->Core.Bulk.ed = NULL;
+            }
             break;
         case OhciPciEpKindInterrupt:
-            ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
-            ep->Core.Interrupt.ed = NULL;
+            if (ep->Core.Interrupt.ed != NULL) {
+                ohci_interrupt_endpoint_destroy(&dc->Hc, &ep->Core.Interrupt);
+                ep->Core.Interrupt.ed = NULL;
+            }
             break;
         case OhciPciEpKindControl:
-            ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
-            ep->Core.Control.ed = NULL;
+            if (ep->Core.Control.ed != NULL) {
+                ohci_control_endpoint_destroy(&dc->Hc, &ep->Core.Control);
+                ep->Core.Control.ed = NULL;
+            }
             break;
         }
         WdfSpinLockRelease(dc->CoreLock);

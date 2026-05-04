@@ -474,6 +474,30 @@ OhciPci_BulkProgramDma(
     return TRUE;
 }
 
+/* Forward declaration — defined alongside EP teardown paths further down. */
+static VOID OhciPci_CancelEpInFlight(OHCIPCI_EP_CONTEXT *ep);
+
+/* Per-request cancel routine. WDF invokes this when a function driver
+ * calls IoCancelIrp on a URB sitting on our hardware queue. HIDCLASS in
+ * particular fires this on its ping-pong interrupt IRPs during HID
+ * device removal — without honoring it, HidpFdoRemoveDevice's
+ * CancelAllPingPongIrps wait never clears and the entire PnP remove
+ * transaction stalls until the device is physically unplugged. Cancel
+ * every URB on the EP's ED in one shot via OhciPci_CancelEpInFlight;
+ * URB complete callbacks fire and complete the WDFREQUESTs through the
+ * deferred-completion path. */
+static EVT_WDF_REQUEST_CANCEL OhciPci_EvtRequestCancel;
+_Use_decl_annotations_
+static VOID
+OhciPci_EvtRequestCancel(WDFREQUEST Request)
+{
+    WDFQUEUE queue = WdfRequestGetIoQueue(Request);
+    if (queue == NULL) return;
+    OHCIPCI_QUEUE_CTX *qc = OhciPci_QueueCtxGet(queue);
+    if (qc == NULL || qc->EpCtx == NULL) return;
+    OhciPci_CancelEpInFlight(qc->EpCtx);
+}
+
 /* --------------------------------------------------------------------------
  * OhciPci_HandleBulkUrb
  *
@@ -492,6 +516,16 @@ OhciPci_HandleBulkUrb(
     PVOID   bufVa  = urb->TransferBuffer;
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
+
+    /* Reject submissions to a destroyed core EP (see EvtUrbDefault top-
+     * level guard for the same rationale). ohci_*_endpoint_destroy
+     * memsets the struct, so submitting after destroy NULL-derefs
+     * tail_placeholder. */
+    if (ep->Core.Bulk.ed == NULL || ep->Core.Bulk.tail_placeholder == NULL) {
+        urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
+        return;
+    }
 
     if (length == 0) {
         urb->TransferBufferLength = 0;
@@ -604,6 +638,13 @@ OhciPci_HandleInterruptUrb(
     PMDL    bufMdl = urb->TransferBufferMDL;
     BOOLEAN isIn   = !!(urb->TransferFlags & USBD_TRANSFER_DIRECTION_IN);
 
+    /* Reject submissions to a destroyed core EP. */
+    if (ep->Core.Interrupt.ed == NULL || ep->Core.Interrupt.tail_placeholder == NULL) {
+        urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
+        return;
+    }
+
     if (length == 0 || length > OHCIPCI_BOUNCE_SLAB_BYTES) {
         urb->TransferBufferLength = 0;
         urb->Hdr.Status = USBD_STATUS_INVALID_PARAMETER;
@@ -673,6 +714,16 @@ OhciPci_HandleInterruptUrb(
         return;
     }
     WdfSpinLockRelease(dc->CoreLock);
+
+    /* Mark the request cancelable so HIDCLASS's IoCancelIrp on ping-pong
+     * IRPs unwinds the URB instead of stalling forever. If the IRP was
+     * canceled in the brief window between submit and Mark,
+     * WdfRequestMarkCancelableEx returns STATUS_CANCELLED and we drive
+     * the cancel manually. */
+    NTSTATUS markSt = WdfRequestMarkCancelableEx(Request, OhciPci_EvtRequestCancel);
+    if (markSt == STATUS_CANCELLED) {
+        OhciPci_CancelEpInFlight(ep);
+    }
     /* Async completion via OhciPci_UrbComplete. */
 }
 
@@ -1007,6 +1058,7 @@ OhciPci_EvtIsocBackstopTimer(WDFTIMER Timer)
         PLIST_ENTRY le = RemoveHeadList(&local);
         POHCIPCI_URB_CTX uc =
             CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        (void)WdfRequestUnmarkCancelable(uc->Request);
         WdfRequestCompleteWithInformation(uc->Request,
                                            uc->DeferredStatus,
                                            uc->DeferredInfo);
@@ -1108,6 +1160,7 @@ OhciPci_HandleIsocUrb(
         PLIST_ENTRY le = RemoveHeadList(&local);
         POHCIPCI_URB_CTX duc =
             CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        (void)WdfRequestUnmarkCancelable(duc->Request);
         WdfRequestCompleteWithInformation(duc->Request,
                                            duc->DeferredStatus,
                                            duc->DeferredInfo);
@@ -1146,6 +1199,19 @@ EvtUrbDefault(
     if (urb == NULL) {
         LOG("EvtUrbDefault: NULL TRANSFER_URB in Arg1");
         WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+        return;
+    }
+
+    /* Reject URBs targeted at a destroyed core EP. The four kinds of
+     * core EP all have their `ed` pointer at the same union offset, so
+     * `ep->Core.Control.ed` reads it regardless of Kind. UCX may have
+     * dispatched EvtUsbDeviceEndpointsConfigure(disable) which calls
+     * ohci_*_endpoint_destroy → memset of the core EP struct, leaving
+     * stale URBs in the per-EP queue with no valid hardware state to
+     * submit against. Without this guard, we'd NULL-deref tail_placeholder. */
+    if (ep->Core.Control.ed == NULL) {
+        urb->Hdr.Status = USBD_STATUS_DEVICE_GONE;
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_CONNECTED);
         return;
     }
 
@@ -1454,6 +1520,7 @@ OhciPci_CancelEpInFlight(OHCIPCI_EP_CONTEXT *ep)
         PLIST_ENTRY le = RemoveHeadList(&local);
         POHCIPCI_URB_CTX uc =
             CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+        (void)WdfRequestUnmarkCancelable(uc->Request);
         WdfRequestCompleteWithInformation(uc->Request,
                                           uc->DeferredStatus,
                                           uc->DeferredInfo);

@@ -73,6 +73,7 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
             PLIST_ENTRY le = RemoveHeadList(&local);
             POHCIPCI_URB_CTX uc =
                 CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+            (void)WdfRequestUnmarkCancelable(uc->Request);
             WdfRequestCompleteWithInformation(uc->Request,
                                               uc->DeferredStatus,
                                               uc->DeferredInfo);
@@ -134,6 +135,7 @@ static VOID EvtDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject) {
             PLIST_ENTRY le = RemoveHeadList(&ueLocal);
             POHCIPCI_URB_CTX uc =
                 CONTAINING_RECORD(le, OHCIPCI_URB_CTX, DeferredEntry);
+            (void)WdfRequestUnmarkCancelable(uc->Request);
             WdfRequestCompleteWithInformation(uc->Request,
                                               uc->DeferredStatus,
                                               uc->DeferredInfo);
